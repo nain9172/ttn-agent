@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 from datetime import datetime
 
-from config import OUTPUT_DIR, LOG_FILE
+from config import OUTPUT_DIR, LOG_FILE, PROJECT_ROOT
 from utils.variant_parser import parse_variant
 from utils.evo2_predictor import Evo2Predictor
 from utils.pubmed_search import PubMedSearcher
@@ -83,11 +83,25 @@ def main():
         pubmed_results = pubmed_searcher.search(variant_info)
         logger.info(f"Found {len(pubmed_results)} PubMed articles")
         
-        # Step 4: Generate Protein Schematic
+        # Step 4: Generate Protein Schematic (with integrated transcript intervals)
         logger.info("Step 4: Generating protein schematic...")
         image_gen = ImageGenerator()
-        image_path = image_gen.generate_titin_schematic(variant_info)
+        
+        # Check for transcript intervals file
+        xlsx_file = PROJECT_ROOT / "transcript_interval.xlsx"
+        xlsx_path = str(xlsx_file) if xlsx_file.exists() else None
+        
+        if xlsx_path:
+            logger.info(f"Using transcript intervals from: {xlsx_file}")
+        else:
+            logger.info("Transcript intervals file not found, using default visualization")
+        
+        image_path = image_gen.generate_titin_schematic(variant_info, xlsx_path)
         logger.info(f"Generated image: {image_path}")
+        
+        # Step 4.5: Generate separate Transcript Intervals Diagram (optional)
+        transcript_intervals_path = None
+        # Removed separate transcript intervals generation as it's now integrated
         
         # Step 5: Generate HTML Report
         logger.info("Step 5: Generating HTML report...")

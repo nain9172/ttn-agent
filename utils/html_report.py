@@ -30,7 +30,8 @@ class HTMLReportGenerator:
         evo2_result: Optional[Dict],
         pubmed_results: List[Dict],
         image_path: Path,
-        output_path: Path
+        output_path: Path = None,
+        transcript_intervals_path: Optional[Path] = None
     ) -> Path:
         """
         Generate complete HTML report
@@ -39,8 +40,9 @@ class HTMLReportGenerator:
             variant_info: Variant information
             evo2_result: Evo2 prediction results
             pubmed_results: PubMed search results
-            image_path: Path to generated protein schematic
+            image_path: Path to generated protein schematic (now includes transcript intervals)
             output_path: Output HTML file path
+            transcript_intervals_path: Deprecated, kept for backward compatibility
         
         Returns:
             Path to generated HTML report
@@ -518,9 +520,10 @@ class HTMLReportGenerator:
         
         return f"""
         <section class="section">
-            <h2>🔬 Protein Domain Localization</h2>
-            <p>The figure below shows the location of variant {variant_info['variant_id']} 
-               across different TTN transcript isoforms and protein domains.</p>
+            <h2>🔬 Protein Domain Localization & Transcript Intervals</h2>
+            <p>The figure below shows the TTN protein domain structure (Z-disk, I-band, A-band, M-band) 
+               and the genomic intervals for different transcript isoforms, with variant {variant_info['variant_id']} 
+               position marked.</p>
             
             <div class="image-container">
                 <img src="data:image/png;base64,{image_base64}" 
@@ -528,8 +531,34 @@ class HTMLReportGenerator:
             </div>
             
             <div class="alert alert-info">
-                <strong>Note:</strong> The variant position is estimated based on genomic coordinates. 
-                The exact protein position may vary between transcript isoforms due to alternative splicing.
+                <strong>Note:</strong> The top panel shows the protein domain structure. 
+                Each subsequent row shows the genomic intervals (colored blocks) for a specific transcript isoform.
+                The red arrow indicates the variant position across all views. All visualizations are aligned 
+                by genomic coordinates on chromosome 2 (negative strand).
+            </div>
+        </section>
+        """
+    
+    def _generate_transcript_intervals_section(self, transcript_intervals_base64: str, variant_info: Dict) -> str:
+        """Generate transcript intervals section"""
+        if not transcript_intervals_base64:
+            return ""
+        
+        return f"""
+        <section class="section">
+            <h2>🧬 Transcript Intervals (Genomic Coordinates)</h2>
+            <p>The figure below shows the genomic intervals for different TTN transcript isoforms, 
+               with the variant {variant_info['variant_id']} position marked.</p>
+            
+            <div class="image-container">
+                <img src="data:image/png;base64,{transcript_intervals_base64}" 
+                     alt="TTN Transcript Intervals">
+            </div>
+            
+            <div class="alert alert-info">
+                <strong>Note:</strong> Each colored block represents a genomic interval (exon or exonic region) 
+                for the transcript. The intervals are shown on the genomic coordinate scale (chr2), 
+                with the TTN gene located on the negative strand.
             </div>
         </section>
         """
