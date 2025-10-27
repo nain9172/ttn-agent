@@ -26,7 +26,11 @@ EVO2_WINDOW_SIZE = 8192
 PATHOGENIC_THRESHOLD = 0.0  # delta_score < 0 = pathogenic
 
 # Reference genome
-REFERENCE_GENOME_PATH = DATA_DIR / "GCF_000001405.40_GRCh38.p14_genomic.fna"
+# Full genome: DATA_DIR / "GCF_000001405.40_GRCh38.p14_genomic.fna"
+# TTN-specific sequence (chr2:178807423-178525989, negative strand)
+REFERENCE_GENOME_PATH = DATA_DIR / "sequence.fasta"
+TTN_SEQUENCE_START = 178807423  # Genomic coordinate of first base in sequence.fasta
+TTN_SEQUENCE_END = 178525989    # Genomic coordinate of last base in sequence.fasta
 
 # PubMed API Configuration
 PUBMED_EMAIL = os.getenv("PUBMED_EMAIL", "ryan910702@gmail.com")

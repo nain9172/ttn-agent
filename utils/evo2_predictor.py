@@ -12,7 +12,9 @@ from config import (
     EVO2_MODEL,
     EVO2_WINDOW_SIZE,
     PATHOGENIC_THRESHOLD,
-    REFERENCE_GENOME_PATH
+    REFERENCE_GENOME_PATH,
+    TTN_SEQUENCE_START,
+    TTN_SEQUENCE_END
 )
 
 logger = logging.getLogger(__name__)
@@ -23,8 +25,10 @@ class Evo2Predictor:
     
     def __init__(self):
         self.model = None
-        self.seq_chr2 = None
+        self.seq_ttn = None  # TTN reference sequence
         self.window_size = EVO2_WINDOW_SIZE
+        self.ttn_start = TTN_SEQUENCE_START
+        self.ttn_end = TTN_SEQUENCE_END
         
     def _load_model(self):
         """Load Evo2 model (lazy loading)"""
@@ -37,32 +41,39 @@ class Evo2Predictor:
         logger.info("Evo2 model loaded successfully")
     
     def _load_reference_sequence(self):
-        """Load chromosome 2 reference sequence"""
-        if self.seq_chr2 is not None:
+        """Load TTN reference sequence"""
+        if self.seq_ttn is not None:
             return
         
         if not REFERENCE_GENOME_PATH.exists():
             raise FileNotFoundError(
-                f"Reference genome not found at {REFERENCE_GENOME_PATH}. "
-                "Please download GRCh38 reference genome from:\n"
-                "https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/001/405/"
-                "GCF_000001405.40_GRCh38.p14/GCF_000001405.40_GRCh38.p14_genomic.fna.gz"
+                f"Reference sequence not found at {REFERENCE_GENOME_PATH}. "
+                "Please ensure sequence.fasta is present in the data directory."
             )
         
         try:
             from Bio import SeqIO
-            logger.info("Loading reference sequence for chromosome 2...")
+            logger.info("Loading TTN reference sequence...")
             
             with open(REFERENCE_GENOME_PATH, "rt") as handle:
                 for record in SeqIO.parse(handle, "fasta"):
-                    header = record.description.lower()
-                    if 'chromosome 2' in header or record.id.startswith('NC_000002'):
-                        self.seq_chr2 = str(record.seq)
-                        logger.info(f"Reference sequence loaded: {len(self.seq_chr2)} bp")
-                        break
+                    self.seq_ttn = str(record.seq)
+                    logger.info(
+                        f"TTN reference sequence loaded: {len(self.seq_ttn)} bp "
+                        f"(chr2:{self.ttn_start}-{self.ttn_end})"
+                    )
+                    break
             
-            if self.seq_chr2 is None:
-                raise ValueError("Chromosome 2 sequence not found in reference genome")
+            if self.seq_ttn is None:
+                raise ValueError("TTN sequence not found in reference file")
+            
+            # Verify sequence length matches expected TTN region
+            expected_length = self.ttn_start - self.ttn_end + 1
+            if len(self.seq_ttn) != expected_length:
+                logger.warning(
+                    f"Sequence length mismatch: got {len(self.seq_ttn)} bp, "
+                    f"expected {expected_length} bp"
+                )
                 
         except Exception as e:
             logger.error(f"Failed to load reference sequence: {e}")
@@ -75,32 +86,52 @@ class Evo2Predictor:
         alt: str
     ) -> Tuple[Optional[str], Optional[str]]:
         """
-        Parse reference and variant sequences from genome
+        Parse reference and variant sequences from TTN sequence
         
         Args:
-            pos: Genomic position (1-based)
+            pos: Genomic position (1-based, chr2 coordinates)
             ref: Reference base
             alt: Alternate base
         
         Returns:
             Tuple of (ref_seq, var_seq) or (None, None) if invalid
         """
-        p = pos - 1  # Convert to 0-indexed
+        # Check if position is within TTN region
+        if pos > self.ttn_start or pos < self.ttn_end:
+            logger.error(
+                f"Position {pos} is outside TTN region "
+                f"({self.ttn_start}-{self.ttn_end})"
+            )
+            return None, None
         
-        ref_seq_start = max(0, p - self.window_size // 2)
-        ref_seq_end = min(len(self.seq_chr2), p + self.window_size // 2)
-        ref_seq = self.seq_chr2[ref_seq_start:ref_seq_end]
+        # Convert genomic position to sequence index
+        # TTN is on negative strand: position 178807423 = index 0
+        # sequence.fasta is already reverse complemented (indicated by 'c' in header)
+        seq_index = self.ttn_start - pos
         
-        snv_pos_in_ref = p - ref_seq_start
+        if seq_index < 0 or seq_index >= len(self.seq_ttn):
+            logger.error(
+                f"Calculated sequence index {seq_index} out of bounds "
+                f"(sequence length: {len(self.seq_ttn)})"
+            )
+            return None, None
+        
+        # Extract window around the variant position
+        window_half = self.window_size // 2
+        ref_seq_start = max(0, seq_index - window_half)
+        ref_seq_end = min(len(self.seq_ttn), seq_index + window_half)
+        ref_seq = self.seq_ttn[ref_seq_start:ref_seq_end]
+        
+        snv_pos_in_ref = seq_index - ref_seq_start
         
         if snv_pos_in_ref < 0 or snv_pos_in_ref >= len(ref_seq):
-            logger.error(f"SNV position {p} out of bounds")
+            logger.error(f"SNV position out of bounds in extracted sequence")
             return None, None
         
         # Validate reference base
-        if ref_seq[snv_pos_in_ref] != ref:
+        if ref_seq[snv_pos_in_ref].upper() != ref.upper():
             logger.warning(
-                f"Reference mismatch at position {pos}: "
+                f"Reference mismatch at position {pos} (index {seq_index}): "
                 f"expected {ref}, got {ref_seq[snv_pos_in_ref]}"
             )
             return None, None
@@ -111,6 +142,11 @@ class Evo2Predictor:
         if len(var_seq) != len(ref_seq):
             logger.error("Variant and reference sequences have different lengths")
             return None, None
+        
+        logger.info(
+            f"Extracted sequence window: genomic pos {pos} -> "
+            f"seq index {seq_index}, window size {len(ref_seq)} bp"
+        )
         
         return ref_seq, var_seq
     
