@@ -201,37 +201,22 @@ class ImageGenerator:
             # Calculate width
             width = end_norm - start_norm
             
-            if width > 0.001:  # Only draw if visible
-                # Use different colors
-                color = interval_colors[i % len(interval_colors)]
-                
-                # Draw interval rectangle
-                rect = FancyBboxPatch(
-                    (start_norm, y_pos - height/2),
-                    width,
-                    height,
-                    boxstyle="round,pad=0.002",
-                    edgecolor='black',
-                    facecolor=color,
-                    alpha=0.8,
-                    linewidth=1.2,
-                    zorder=3
-                )
-                ax.add_patch(rect)
-                
-                # Add interval number label if wide enough
-                if width > 0.04:
-                    ax.text(
-                        start_norm + width/2,
-                        y_pos,
-                        f'{i+1}',
-                        ha='center',
-                        va='center',
-                        fontsize=7,
-                        fontweight='bold',
-                        color='white',
-                        zorder=4
-                    )
+            # Use different colors
+            color = interval_colors[i % len(interval_colors)]
+            
+            # Draw interval rectangle
+            rect = FancyBboxPatch(
+                (start_norm, y_pos - height/2),
+                width,
+                height,
+                boxstyle="round,pad=0.002",
+                edgecolor='black',
+                facecolor=color,
+                alpha=0.8,
+                linewidth=1.2,
+                zorder=3
+            )
+            ax.add_patch(rect)
         
         # Mark variant position
         variant_norm = self._normalize_genomic_position(variant_pos)
@@ -253,18 +238,6 @@ class ImageGenerator:
             zorder=10,
             edgecolors='black',
             linewidth=1.5
-        )
-        
-        # Add interval count info (右側)
-        ax.text(
-            1.03,
-            0.5,
-            f'{len(intervals)} intervals',
-            ha='left',
-            va='center',
-            fontsize=8,
-            color='darkgreen',
-            bbox=dict(boxstyle='round,pad=0.3', facecolor='lightgreen', edgecolor='green', alpha=0.7)
         )
     
     def _plot_domain_overview(self, ax, variant_pos):
