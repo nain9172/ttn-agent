@@ -12,6 +12,7 @@ from datetime import datetime
 from config import OUTPUT_DIR, LOG_FILE, PROJECT_ROOT
 from utils.variant_parser import parse_variant
 from utils.evo2_predictor import Evo2Predictor
+from utils.clinvar_parser import ClinVarParser
 from utils.pubmed_search import PubMedSearcher
 from utils.image_generator import ImageGenerator
 from utils.html_report import HTMLReportGenerator
@@ -67,24 +68,45 @@ def main():
         variant_info = parse_variant(args.variant)
         logger.info(f"Parsed variant: {variant_info}")
         
-        # Step 2: Evo2 Prediction
+        # Step 2: Parse ClinVar Information
+        logger.info("Step 2: Parsing ClinVar information...")
+        clinvar_parser = ClinVarParser()
+        clinvar_info = clinvar_parser.parse_variant(variant_info)
+        if clinvar_info and clinvar_info.get('pmid_list'):
+            logger.info(f"Found {len(clinvar_info['pmid_list'])} PubMed IDs from ClinVar")
+            logger.info(f"Variant impact: {clinvar_info.get('variant_impact')}")
+            logger.info(f"Clinical significance: {clinvar_info.get('clinical_significance')}")
+        else:
+            logger.warning("No ClinVar information found (this is okay, will use standard PubMed search)")
+            clinvar_info = None
+        
+        # Step 3: Evo2 Prediction
         evo2_result = None
         if not args.skip_evo2:
-            logger.info("Step 2: Running Evo2 prediction...")
+            logger.info("Step 3: Running Evo2 prediction...")
             predictor = Evo2Predictor()
             evo2_result = predictor.predict(variant_info)
             logger.info(f"Evo2 prediction complete: {evo2_result}")
         else:
-            logger.info("Step 2: Skipped Evo2 prediction")
+            logger.info("Step 3: Skipped Evo2 prediction")
         
-        # Step 3: PubMed Search
-        logger.info("Step 3: Searching PubMed...")
+        # Step 4: PubMed Search
+        logger.info("Step 4: Searching PubMed...")
         pubmed_searcher = PubMedSearcher()
-        pubmed_results = pubmed_searcher.search(variant_info)
-        logger.info(f"Found {len(pubmed_results)} PubMed articles")
+        pubmed_results = []
         
-        # Step 4: Generate Protein Schematic (with integrated transcript intervals)
-        logger.info("Step 4: Generating protein schematic...")
+        # 只使用 ClinVar 提供的 PMIDs，不進行廣泛搜索
+        if clinvar_info and clinvar_info.get('pmid_list'):
+            pmid_list = clinvar_info.get('pmid_list')
+            logger.info(f"使用 ClinVar 提供的 {len(pmid_list)} 個精確 PubMed IDs")
+            pubmed_results = pubmed_searcher.search(variant_info, pmid_list=pmid_list)
+            logger.info(f"成功獲取 {len(pubmed_results)} 篇 ClinVar 相關文獻")
+        else:
+            logger.warning("⚠️  ClinVar 未提供 PubMed IDs，報告將不包含文獻（避免不相關文章）")
+            logger.info("如需查看文獻，請確認該變異在 ClinVar 資料庫中有記錄")
+        
+        # Step 5: Generate Protein Schematic (with integrated transcript intervals)
+        logger.info("Step 5: Generating protein schematic...")
         image_gen = ImageGenerator()
         
         # Check for transcript intervals file
@@ -99,12 +121,12 @@ def main():
         image_path = image_gen.generate_titin_schematic(variant_info, xlsx_path)
         logger.info(f"Generated image: {image_path}")
         
-        # Step 4.5: Generate separate Transcript Intervals Diagram (optional)
+        # Step 5.5: Generate separate Transcript Intervals Diagram (optional)
         transcript_intervals_path = None
         # Removed separate transcript intervals generation as it's now integrated
         
-        # Step 5: Generate HTML Report
-        logger.info("Step 5: Generating HTML report...")
+        # Step 6: Generate HTML Report
+        logger.info("Step 6: Generating HTML report...")
         report_gen = HTMLReportGenerator()
         
         # Determine output path
@@ -119,7 +141,8 @@ def main():
             evo2_result=evo2_result,
             pubmed_results=pubmed_results,
             image_path=image_path,
-            output_path=output_path
+            output_path=output_path,
+            clinvar_info=clinvar_info
         )
         
         logger.info(f"✅ Report generated successfully: {report_path}")

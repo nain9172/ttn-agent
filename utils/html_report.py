@@ -31,7 +31,8 @@ class HTMLReportGenerator:
         pubmed_results: List[Dict],
         image_path: Path,
         output_path: Path = None,
-        transcript_intervals_path: Optional[Path] = None
+        transcript_intervals_path: Optional[Path] = None,
+        clinvar_info: Optional[Dict] = None
     ) -> Path:
         """
         Generate complete HTML report
@@ -43,6 +44,7 @@ class HTMLReportGenerator:
             image_path: Path to generated protein schematic (now includes transcript intervals)
             output_path: Output HTML file path
             transcript_intervals_path: Deprecated, kept for backward compatibility
+            clinvar_info: ClinVar information including conditions and variant impact
         
         Returns:
             Path to generated HTML report
@@ -57,7 +59,8 @@ class HTMLReportGenerator:
             variant_info,
             evo2_result,
             pubmed_results,
-            image_base64
+            image_base64,
+            clinvar_info
         )
         
         # Write to file
@@ -83,7 +86,8 @@ class HTMLReportGenerator:
         variant_info: Dict,
         evo2_result: Optional[Dict],
         pubmed_results: List[Dict],
-        image_base64: str
+        image_base64: str,
+        clinvar_info: Optional[Dict] = None
     ) -> str:
         """Generate complete HTML content"""
         
@@ -103,7 +107,7 @@ class HTMLReportGenerator:
         {self._generate_summary_section(variant_info, evo2_result)}
         {self._generate_evo2_section(evo2_result)}
         {self._generate_image_section(image_base64, variant_info)}
-        {self._generate_pubmed_section(pubmed_results)}
+        {self._generate_pubmed_section(pubmed_results, clinvar_info)}
         {self._generate_footer()}
     </div>
     
@@ -357,6 +361,36 @@ class HTMLReportGenerator:
             color: white;
         }}
         
+        .badge-pathogenic {{
+            background: #c0392b;
+            color: white;
+        }}
+        
+        .badge-likely-pathogenic {{
+            background: #e74c3c;
+            color: white;
+        }}
+        
+        .badge-uncertain {{
+            background: #95a5a6;
+            color: white;
+        }}
+        
+        .badge-likely-benign {{
+            background: #27ae60;
+            color: white;
+        }}
+        
+        .badge-benign {{
+            background: #1e8449;
+            color: white;
+        }}
+        
+        .badge-default {{
+            background: #7f8c8d;
+            color: white;
+        }}
+        
         footer {{
             background: #f8f9fa;
             padding: 20px;
@@ -563,15 +597,29 @@ class HTMLReportGenerator:
         </section>
         """
     
-    def _generate_pubmed_section(self, pubmed_results: List[Dict]) -> str:
+    def _generate_pubmed_section(self, pubmed_results: List[Dict], clinvar_info: Optional[Dict] = None) -> str:
         """Generate PubMed literature section"""
         if not pubmed_results:
             return """
             <section class="section">
                 <h2>📚 Literature Review (PubMed)</h2>
-                <div class="alert">No relevant articles found in PubMed.</div>
+                <div class="alert alert-info">
+                    <strong>ℹ️ 無 PubMed 文獻</strong>
+                    <p>本報告僅包含 ClinVar 提供的精確文獻。該變異在 ClinVar 中未關聯任何 PubMed 文章。</p>
+                    <p style="margin-top: 10px;">這可能表示：</p>
+                    <ul style="margin-left: 20px;">
+                        <li>該變異為新發現的變異</li>
+                        <li>該變異尚未被詳細研究</li>
+                        <li>相關文獻未被 ClinVar 收錄</li>
+                    </ul>
+                </div>
             </section>
             """
+        
+        # Add summary statistics for ages if available
+        age_summary = ""
+        if clinvar_info:
+            age_summary = self._generate_age_summary(pubmed_results)
         
         articles_html = ""
         for idx, article in enumerate(pubmed_results, 1):
@@ -612,9 +660,137 @@ class HTMLReportGenerator:
         <section class="section">
             <h2>📚 Literature Review (PubMed)</h2>
             <p>Found {len(pubmed_results)} relevant articles in PubMed:</p>
+            {age_summary}
             {articles_html}
         </section>
         """
+    
+    def _generate_age_summary(self, pubmed_results: List[Dict]) -> str:
+        """Generate age distribution summary"""
+        age_categories = {}
+        for article in pubmed_results:
+            age_onset = article.get('age_onset', 'Not specified')
+            if age_onset != 'Not specified':
+                age_categories[age_onset] = age_categories.get(age_onset, 0) + 1
+        
+        if not age_categories:
+            return ""
+        
+        categories_html = ""
+        for age, count in sorted(age_categories.items(), key=lambda x: x[1], reverse=True):
+            categories_html += f"""
+                <div style="padding: 8px; background: #f8f9fa; border-radius: 4px; margin: 5px 0;">
+                    <strong>{age}:</strong> {count} article(s)
+                </div>
+            """
+        
+        return f"""
+        <div class="alert alert-info" style="margin: 15px 0;">
+            <strong>📊 年齡分布統計 (Age Distribution Summary):</strong>
+            <div style="margin-top: 10px;">
+                {categories_html}
+            </div>
+        </div>
+        """
+    
+    def _generate_clinvar_section(self, clinvar_info: Dict, pubmed_results: List[Dict] = None) -> str:
+        """Generate ClinVar information section"""
+        if not clinvar_info:
+            return ""
+        
+        # Format conditions
+        conditions_html = ""
+        if clinvar_info.get('conditions'):
+            for condition in clinvar_info['conditions']:
+                conditions_html += f'<li>{condition}</li>'
+        else:
+            conditions_html = '<li>Not specified</li>'
+        
+        # Format variant impact
+        impact_badge = self._get_impact_badge(clinvar_info.get('variant_impact', 'Not specified'))
+        
+        # Format clinical significance
+        significance = clinvar_info.get('clinical_significance', 'Not specified')
+        significance_class = self._get_significance_class(significance)
+        
+        # PubMed IDs from ClinVar - 使用實際獲取的文章 PMID（與 Literature Review 一致）
+        pmid_info = ""
+        if pubmed_results:
+            # 從 pubmed_results 中提取 PMID（這些是實際獲取到的文章）
+            actual_pmids = [article['pmid'] for article in pubmed_results]
+            pmid_count = len(actual_pmids)
+            pmids_formatted = ', '.join([f'<a href="https://pubmed.ncbi.nlm.nih.gov/{pmid}/" target="_blank">{pmid}</a>' 
+                                        for pmid in actual_pmids[:10]])
+            if pmid_count > 10:
+                pmids_formatted += f' ... and {pmid_count - 10} more'
+            pmid_info = f"""
+            <div class="info-row">
+                <div class="info-label">PubMed IDs (已獲取的文章):</div>
+                <div class="info-value">{pmid_count} articles ({pmids_formatted})</div>
+            </div>
+            """
+        
+        return f"""
+        <section class="section">
+            <h2>🔬 ClinVar Information</h2>
+            
+            <div class="info-grid" style="margin-top: 20px;">
+                <div class="info-row">
+                    <div class="info-label">臨床意義 (Clinical Significance):</div>
+                    <div class="info-value">
+                        <span class="badge badge-{significance_class}">{significance}</span>
+                    </div>
+                </div>
+                
+                <div class="info-row">
+                    <div class="info-label">審查狀態 (Review Status):</div>
+                    <div class="info-value">{clinvar_info.get('review_status', 'Not specified')}</div>
+                </div>
+                
+                <div class="info-row">
+                    <div class="info-label">變異影響 (Variant Impact):</div>
+                    <div class="info-value">{impact_badge}</div>
+                </div>
+                
+                {pmid_info}
+            </div>
+            
+            <div style="margin-top: 20px;">
+                <h3 style="font-size: 1.1em; margin-bottom: 10px;">相關疾病 (Associated Conditions):</h3>
+                <ul style="margin-left: 20px; line-height: 1.8;">
+                    {conditions_html}
+                </ul>
+            </div>
+        </section>
+        """
+    
+    def _get_impact_badge(self, impact: str) -> str:
+        """Get HTML badge for variant impact"""
+        impact_lower = impact.lower()
+        if 'cardiac' in impact_lower and 'skeletal' in impact_lower:
+            return '<span class="badge badge-both">Cardiac & Skeletal</span>'
+        elif 'cardiac' in impact_lower:
+            return '<span class="badge badge-cardiac">Cardiac</span>'
+        elif 'skeletal' in impact_lower:
+            return '<span class="badge badge-skeletal">Skeletal Muscle</span>'
+        else:
+            return f'<span class="badge">{impact}</span>'
+    
+    def _get_significance_class(self, significance: str) -> str:
+        """Get CSS class for clinical significance"""
+        sig_lower = significance.lower()
+        if 'pathogenic' in sig_lower and 'likely' not in sig_lower:
+            return 'pathogenic'
+        elif 'likely pathogenic' in sig_lower:
+            return 'likely-pathogenic'
+        elif 'benign' in sig_lower and 'likely' not in sig_lower:
+            return 'benign'
+        elif 'likely benign' in sig_lower:
+            return 'likely-benign'
+        elif 'uncertain' in sig_lower:
+            return 'uncertain'
+        else:
+            return 'default'
     
     def _get_phenotype_badge(self, phenotype: str) -> str:
         """Get HTML badge for phenotype"""

@@ -87,7 +87,7 @@ python main.py 2-178527628-C-T --skip-evo2
 
 ### Custom output location
 ```bash
-conda activate ai && python main.py 2-178527628-C-T --output my_report.html
+conda activate ai && python main.py 2-178529960-G-T --output my_report.html
 ```
 
 ### Set PubMed credentials
@@ -101,7 +101,27 @@ Or edit `config.py`:
 PUBMED_EMAIL = "your_email@example.com"
 PUBMED_API_KEY = "your_api_key"  # Optional
 ```
+cd /home/ryan910702/ttn_agent && python3 -c "
+from utils.variant_parser import parse_variant
+from utils.clinvar_parser import ClinVarParser
 
+# 測試兩個不同的變異
+variants = ['2-178529960-G-T', '2-178527121-T-C']
+
+parser = ClinVarParser()
+
+for var_str in variants:
+    print(f'\n測試變異: {var_str}')
+    print('='*60)
+    variant_info = parse_variant(var_str)
+    result = parser.parse_variant(variant_info)
+    
+    if result and result.get('pmid_list'):
+        print(f'  找到 {len(result[\"pmid_list\"])} 個 PMIDs')
+        print(f'  影響類型: {result[\"variant_impact\"]}')
+    else:
+        print('  未找到 ClinVar 數據')
+"
 ## 🔧 Troubleshooting
 
 ### Out of Memory

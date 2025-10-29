@@ -14,6 +14,7 @@ import logging
 from main import setup_logging
 from utils.variant_parser import parse_variant
 from utils.evo2_predictor import Evo2Predictor
+from utils.clinvar_parser import ClinVarParser
 from utils.pubmed_search import PubMedSearcher
 from utils.image_generator import ImageGenerator
 from utils.html_report import HTMLReportGenerator
@@ -63,6 +64,7 @@ def process_batch(
     logger = logging.getLogger(__name__)
     
     # Initialize components (reuse for efficiency)
+    clinvar_parser = ClinVarParser()
     evo2_predictor = None if skip_evo2 else Evo2Predictor()
     pubmed_searcher = PubMedSearcher()
     image_generator = ImageGenerator()
@@ -88,6 +90,14 @@ def process_batch(
             # Parse variant
             variant_info = parse_variant(variant_str)
             
+            # Parse ClinVar information
+            logger.info("Parsing ClinVar information...")
+            clinvar_info = clinvar_parser.parse_variant(variant_info)
+            if clinvar_info and clinvar_info.get('pmid_list'):
+                logger.info(f"Found {len(clinvar_info['pmid_list'])} PubMed IDs from ClinVar")
+            else:
+                clinvar_info = None
+            
             # Evo2 prediction
             evo2_result = None
             if not skip_evo2:
@@ -100,9 +110,17 @@ def process_batch(
                     else:
                         results['benign'] += 1
             
-            # PubMed search
+            # PubMed search (只使用 ClinVar PMIDs，不進行廣泛搜索)
             logger.info("Searching PubMed...")
-            pubmed_results = pubmed_searcher.search(variant_info)
+            pubmed_results = []
+            
+            if clinvar_info and clinvar_info.get('pmid_list'):
+                pmid_list = clinvar_info.get('pmid_list')
+                logger.info(f"使用 ClinVar 提供的 {len(pmid_list)} 個精確 PubMed IDs")
+                pubmed_results = pubmed_searcher.search(variant_info, pmid_list=pmid_list)
+                logger.info(f"成功獲取 {len(pubmed_results)} 篇 ClinVar 相關文獻")
+            else:
+                logger.warning(f"⚠️  變異 {variant_str}: ClinVar 未提供 PubMed IDs，跳過文獻搜索")
             
             # Generate image
             logger.info("Generating protein schematic...")
@@ -116,7 +134,8 @@ def process_batch(
                 evo2_result=evo2_result,
                 pubmed_results=pubmed_results,
                 image_path=image_path,
-                output_path=report_path
+                output_path=report_path,
+                clinvar_info=clinvar_info
             )
             
             results['successful'] += 1

@@ -20,7 +20,8 @@ wheels/
 .installed.cfg
 *.egg
 MANIFEST
-
+.fasta
+*.fasta
 # Virtual environments
 venv/
 env/
@@ -54,6 +55,9 @@ Thumbs.db
 *.fna
 .png
 *.png
+
+# NCBI Entrez DTD files (auto-downloaded)
+*.dtd
 # Data files (optional - uncomment if you don't want to track data)
 # data/
 # outputs/

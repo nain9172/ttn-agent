@@ -5,6 +5,7 @@ Searches PubMed for variant-related literature
 
 import logging
 import time
+import re
 from typing import Dict, List
 
 try:
@@ -33,17 +34,28 @@ if Entrez:
 class PubMedSearcher:
     """PubMed literature searcher"""
     
+    # 鹼基互補配對（TTN 基因位於負鏈）
+    COMPLEMENT = {
+        'A': 'T', 'T': 'A',
+        'G': 'C', 'C': 'G'
+    }
+    
     def __init__(self):
         self.max_results = PUBMED_MAX_RESULTS
         if not Entrez:
             logger.warning("Biopython not available - PubMed search disabled")
     
-    def search(self, variant_info: Dict[str, str]) -> List[Dict]:
+    def _get_complement_base(self, base: str) -> str:
+        """獲取互補鹼基（用於負鏈基因）"""
+        return self.COMPLEMENT.get(base.upper(), base)
+    
+    def search(self, variant_info: Dict[str, str], pmid_list: List[str] = None) -> List[Dict]:
         """
         Search PubMed for variant-related articles
         
         Args:
             variant_info: Variant information dictionary
+            pmid_list: Optional list of PubMed IDs to fetch directly (from ClinVar)
         
         Returns:
             List of article dictionaries with extracted information
@@ -55,23 +67,27 @@ class PubMedSearcher:
         logger.info("Searching PubMed...")
         results = []
         
-        # Build search query
-        query = self._build_query(variant_info)
-        logger.info(f"Search query: {query}")
-        
         try:
-            # Search PubMed
-            handle = Entrez.esearch(
-                db="pubmed",
-                term=query,
-                retmax=self.max_results,
-                sort="relevance"
-            )
-            search_results = Entrez.read(handle)
-            handle.close()
-            
-            pmid_list = search_results["IdList"]
-            logger.info(f"Found {len(pmid_list)} articles")
+            # If PMID list provided, use it directly
+            if pmid_list:
+                logger.info(f"使用提供的 {len(pmid_list)} 個 PubMed IDs: {pmid_list}")
+            else:
+                # Build search query
+                query = self._build_query(variant_info)
+                logger.info(f"Search query: {query}")
+                
+                # Search PubMed
+                handle = Entrez.esearch(
+                    db="pubmed",
+                    term=query,
+                    retmax=self.max_results,
+                    sort="relevance"
+                )
+                search_results = Entrez.read(handle)
+                handle.close()
+                
+                pmid_list = search_results["IdList"]
+                logger.info(f"Found {len(pmid_list)} articles")
             
             if not pmid_list:
                 return results
@@ -105,23 +121,72 @@ class PubMedSearcher:
         return results
     
     def _build_query(self, variant_info: Dict[str, str]) -> str:
-        """Build PubMed search query"""
-        # Base query with TTN
-        query_parts = [
-            "TTN[Gene]",
-            "titin",
-            "cardiomyopathy",
-            "myopathy"
+        """
+        Build PubMed search query - 使用負鏈轉換的變異坐標
+        
+        策略：優先搜索包含該變異的文章，回退到廣泛的 TTN 相關搜索
+        """
+        # TTN 基因位於負鏈，需要轉換坐標和鹼基
+        original_pos = variant_info['pos']
+        original_ref = variant_info['ref'].upper()
+        original_alt = variant_info['alt'].upper()
+        
+        # 負鏈轉換
+        negative_strand_pos = original_pos - 1
+        negative_strand_ref = self._get_complement_base(original_ref)
+        negative_strand_alt = self._get_complement_base(original_alt)
+        
+        # 構建變異相關的搜索詞（多種可能的格式）
+        variant_terms = [
+            # ClinVar 格式
+            f"NC_000002.12:{negative_strand_pos}:{negative_strand_ref}:{negative_strand_alt}",
+            # 簡化格式
+            f"{variant_info['chrom']}:{negative_strand_pos}:{negative_strand_ref}:{negative_strand_alt}",
+            # 帶箭頭格式
+            f"{negative_strand_pos} {negative_strand_ref}>{negative_strand_alt}",
+            # 原始坐標（也可能被使用）
+            f"{original_pos} {original_ref}>{original_alt}",
+            f"chr{variant_info['chrom']}:{original_pos}",
         ]
         
-        # Add position info
-        query_parts.append(f"chr{variant_info['chrom']}:{variant_info['pos']}")
+        # 構建查詢
+        variant_query = " OR ".join([f'"{term}"' for term in variant_terms])
         
-        # Combine with OR
-        query = " OR ".join(query_parts)
+        # 主要搜索：變異特定 + TTN 基因
+        specific_query = f"({variant_query}) AND TTN[Gene]"
         
-        # Limit to last 10 years for relevance
-        query += " AND (\"2014\"[PDAT] : \"3000\"[PDAT])"
+        # 廣泛搜索：TTN 基因 + 相關疾病（作為後備）
+        broad_query = (
+            "TTN[Gene] AND "
+            "("
+            "cardiomyopathy OR "
+            "myopathy OR "
+            "muscular dystrophy OR "
+            "titin OR "
+            "titinopathy OR "
+            "\"limb-girdle\" OR "
+            "LGMD OR "
+            "DCM OR "
+            "\"dilated cardiomyopathy\" OR "
+            "\"tibial muscular dystrophy\" OR "
+            "centronuclear OR "
+            "\"hereditary myopathy\" OR "
+            "sarcomere OR "
+            "\"M-line\" OR "
+            "\"Z-disk\""
+            ")"
+        )
+        
+        # 組合查詢：優先變異特定，如果沒有結果則使用廣泛搜索
+        query = f"({specific_query}) OR ({broad_query})"
+        
+        # 放寬時間限制，包含更多經典文獻
+        query += " AND (\"2000\"[PDAT] : \"3000\"[PDAT])"
+        
+        logger.debug(f"構建的 PubMed 查詢（負鏈轉換）:")
+        logger.debug(f"  原始變異: chr{variant_info['chrom']}:{original_pos}:{original_ref}>{original_alt}")
+        logger.debug(f"  負鏈轉換: {negative_strand_pos}:{negative_strand_ref}>{negative_strand_alt}")
+        logger.debug(f"  查詢: {query[:200]}...")
         
         return query
     
@@ -223,12 +288,20 @@ class PubMedSearcher:
         """Extract age of onset from text"""
         text = text.lower()
         
+        # 嘗試提取具體年齡數字
+        age_numbers = self._extract_age_numbers(text)
+        if age_numbers:
+            return age_numbers
+        
+        # 使用關鍵詞匹配
         age_patterns = {
-            "Congenital": ["congenital", "birth", "neonatal"],
-            "Infantile": ["infant", "infancy"],
-            "Childhood": ["childhood", "pediatric", "juvenile"],
-            "Adult-onset": ["adult onset", "adulthood"],
-            "Late-onset": ["late onset", "elderly"]
+            "Congenital": ["congenital", "birth", "neonatal", "prenatal"],
+            "Infantile (0-2 years)": ["infant", "infancy", "neonatal period"],
+            "Early childhood (2-6 years)": ["early childhood", "preschool"],
+            "Childhood (6-12 years)": ["childhood", "pediatric", "juvenile", "school age"],
+            "Adolescent (12-18 years)": ["adolescent", "teenage", "teen"],
+            "Adult-onset (18-60 years)": ["adult onset", "adulthood", "young adult"],
+            "Late-onset (>60 years)": ["late onset", "elderly", "geriatric", "older adult"]
         }
         
         for age, keywords in age_patterns.items():
@@ -237,3 +310,40 @@ class PubMedSearcher:
                     return age
         
         return "Not specified"
+    
+    def _extract_age_numbers(self, text: str) -> str:
+        """Extract specific age numbers from text"""
+        # 匹配各種年齡表達方式
+        patterns = [
+            r'(\d+)[\s-]*(year|yr|y)[\s-]*old',
+            r'age[s]?\s+(\d+)[\s-]*(to|-)[\s-]*(\d+)',
+            r'at\s+age\s+(\d+)',
+            r'(\d+)[\s-]*month[\s-]*old',
+            r'mean\s+age[:\s]+(\d+\.?\d*)',
+            r'median\s+age[:\s]+(\d+\.?\d*)',
+        ]
+        
+        ages = []
+        for pattern in patterns:
+            matches = re.finditer(pattern, text, re.I)
+            for match in matches:
+                try:
+                    if 'month' in pattern:
+                        # 轉換月齡為年齡
+                        months = int(match.group(1))
+                        ages.append(f"{months} months ({months/12:.1f} years)")
+                    elif 'to' in pattern or '-' in pattern:
+                        # 年齡範圍
+                        age1 = match.group(1)
+                        age2 = match.group(3)
+                        ages.append(f"{age1}-{age2} years")
+                    else:
+                        age = match.group(1)
+                        ages.append(f"{age} years")
+                except (IndexError, ValueError):
+                    continue
+        
+        if ages:
+            return "; ".join(ages[:3])  # 最多返回3個年齡資訊
+        
+        return ""

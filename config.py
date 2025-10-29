@@ -35,7 +35,7 @@ TTN_SEQUENCE_END = 178525989    # Genomic coordinate of last base in sequence.fa
 # PubMed API Configuration
 PUBMED_EMAIL = os.getenv("PUBMED_EMAIL", "ryan910702@gmail.com")
 PUBMED_API_KEY = os.getenv("PUBMED_API_KEY", '987512860b8bf8e96a09d672b03ff32e2c08')
-PUBMED_MAX_RESULTS = 20
+PUBMED_MAX_RESULTS = 50  # 增加到 50 以涵蓋更多相關文獻
 
 # TTN Gene Information
 TTN_GENE_INFO = {
