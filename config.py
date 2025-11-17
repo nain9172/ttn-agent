@@ -5,7 +5,7 @@ Contains constants, API keys, and file paths
 
 from pathlib import Path
 import os
-
+CUDA_VISIBLE_DEVICES=1
 # Project paths
 PROJECT_ROOT = Path(__file__).parent
 OUTPUT_DIR = PROJECT_ROOT / "outputs"
@@ -36,6 +36,24 @@ TTN_SEQUENCE_END = 178525989    # Genomic coordinate of last base in sequence.fa
 PUBMED_EMAIL = os.getenv("PUBMED_EMAIL", "ryan910702@gmail.com")
 PUBMED_API_KEY = os.getenv("PUBMED_API_KEY", '987512860b8bf8e96a09d672b03ff32e2c08')
 PUBMED_MAX_RESULTS = 50  # 增加到 50 以涵蓋更多相關文獻
+ENABLE_FULL_TEXT_FETCH = True  # 是否嘗試獲取全文
+MAX_TEXT_LENGTH = 8000  # LLM 分析的最大文本長度
+# Local LLM Configuration
+# Backend options: "ollama", "transformers", "vllm"
+# 推薦使用 vLLM 以充分利用雙 4090 GPU
+LOCAL_LLM_BACKEND = os.getenv("LOCAL_LLM_BACKEND", "vllm")
+
+# Model selection:
+# - Llama-3.2-3B: 快速但提取準確度較低（不推薦）
+# - Llama-3.1-8B-Instruct: 推薦！較好的指令理解和資訊提取能力
+# - Llama-3.1-70B-Instruct: 最佳效果但需要更多記憶體
+LOCAL_LLM_MODEL = os.getenv("LOCAL_LLM_MODEL", "meta-llama/Llama-3.2-3B")
+
+# Number of GPUs to use (2 for dual 4090)
+LOCAL_LLM_TENSOR_PARALLEL = int(os.getenv("LOCAL_LLM_TENSOR_PARALLEL", "2"))
+
+# Enable/disable local clinical extraction
+ENABLE_LOCAL_CLINICAL_EXTRACTION = os.getenv("ENABLE_LOCAL_CLINICAL_EXTRACTION", "true").lower() == "true"
 
 # TTN Gene Information
 TTN_GENE_INFO = {

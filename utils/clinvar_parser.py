@@ -86,12 +86,26 @@ class ClinVarParser:
         
         try:
             # 使用 E-utilities 搜索 ClinVar
-            return self._search_clinvar_api(variant_info)
+            result = self._search_clinvar_api(variant_info)
+            if result:
+                return result
         
         except Exception as e:
             logger.warning(f"ClinVar API 查詢失敗: {e}")
-            logger.info("將使用標準 PubMed 搜索")
-            return None
+        
+        # API 失敗或未找到結果時，嘗試使用網頁抓取方法
+        if SCRAPING_AVAILABLE:
+            logger.info("嘗試使用網頁抓取方法查詢 ClinVar...")
+            try:
+                result = self._search_clinvar_by_web(variant_info)
+                if result:
+                    logger.info("網頁抓取成功獲取 ClinVar 資訊")
+                    return result
+            except Exception as web_e:
+                logger.warning(f"網頁抓取也失敗: {web_e}")
+        
+        logger.info("將使用標準 PubMed 搜索")
+        return None
     
     def _search_clinvar_api(self, variant_info: Dict[str, str]) -> Optional[Dict]:
         """使用 NCBI E-utilities API 精確搜索 ClinVar"""
@@ -145,7 +159,7 @@ class ClinVarParser:
                     logger.debug(f"  未找到結果，嘗試下一個格式")
                     continue
                 
-                logger.info(f"✅ 找到 {len(id_list)} 個 ClinVar 記錄")
+                logger.info(f"找到 {len(id_list)} 個 ClinVar 記錄")
                 
                 # 使用第一個記錄（通常是最相關的）
                 clinvar_id = id_list[0]
@@ -163,9 +177,9 @@ class ClinVarParser:
                     if result:
                         # 只要能解析出結果就返回，不管是否有 PubMed IDs
                         if result.get('pmid_list'):
-                            logger.info(f"✅ 成功從 ClinVar 提取資訊（含 {len(result['pmid_list'])} 個 PubMed IDs）")
+                            logger.info(f"成功從 ClinVar 提取資訊（含 {len(result['pmid_list'])} 個 PubMed IDs）")
                         else:
-                            logger.info(f"✅ 成功從 ClinVar 提取資訊（但該記錄無關聯的 PubMed 文章）")
+                            logger.info(f"成功從 ClinVar 提取資訊（但該記錄無關聯的 PubMed 文章）")
                         return result
                     else:
                         logger.debug(f"  無法解析 ClinVar 記錄 {clinvar_id}")
@@ -265,7 +279,7 @@ class ClinVarParser:
                 alt_found = any(pattern in text_content for pattern in alt_patterns)
             
             if position_found and ref_found and alt_found:
-                logger.info(f"  ✅ 變異匹配: pos={pos}, ref={ref}, alt={alt}")
+                logger.info(f"  變異匹配: pos={pos}, ref={ref}, alt={alt}")
                 return True
             else:
                 # 如果負鏈坐標不匹配，也嘗試原始坐標（有些記錄可能使用正鏈）
@@ -302,7 +316,7 @@ class ClinVarParser:
                         break
                 
                 if position_found_orig and ref_found_orig and alt_found_orig:
-                    logger.info(f"  ✅ 變異匹配（原始坐標）: pos={pos_original}, ref={ref_original}, alt={alt_original}")
+                    logger.info(f"  變異匹配（原始坐標）: pos={pos_original}, ref={ref_original}, alt={alt_original}")
                     return True
                 else:
                     logger.debug(f"  原始坐標也不匹配")
@@ -354,9 +368,90 @@ class ClinVarParser:
             result['variant_impact'] = self._determine_impact_type(result['conditions'])
             
             # 嘗試從 ClinVar 記錄獲取相關的 PubMed IDs
-            # 方法 1: 使用 elink API（主要方法）
-            try:
-                if id_list:
+            # 優先使用網頁抓取方法
+            if SCRAPING_AVAILABLE and id_list:
+                try:
+                    logger.info("優先使用網頁抓取方法獲取 PubMed IDs...")
+                    scraped_pmids = self._scrape_pmids_from_clinvar_page(id_list[0])
+                    if scraped_pmids:
+                        result['pmid_list'] = scraped_pmids
+                        logger.info(f"從網頁抓取到 {len(scraped_pmids)} 個 PubMed IDs")
+                    else:
+                        logger.info(f"網頁抓取未找到 PubMed IDs，嘗試 elink API 作為備用...")
+                        # 如果網頁抓取沒有結果，嘗試 elink API 作為備用
+                        if Entrez:
+                            try:
+                                time.sleep(0.34)
+                                handle = Entrez.elink(
+                                    dbfrom="clinvar",
+                                    db="pubmed",
+                                    id=id_list[0]
+                                )
+                                link_results = Entrez.read(handle, validate=False)
+                                handle.close()
+                                
+                                # 提取 PubMed IDs
+                                if link_results and len(link_results) > 0:
+                                    linksetdb = link_results[0].get('LinkSetDb', [])
+                                    for linkdb in linksetdb:
+                                        if linkdb.get('LinkName') == 'clinvar_pubmed':
+                                            links = linkdb.get('Link', [])
+                                            pmids = [link['Id'] for link in links]
+                                            
+                                            # 過濾排除的 PMID
+                                            original_count = len(pmids)
+                                            pmids = [pmid for pmid in pmids if pmid not in EXCLUDED_PMIDS]
+                                            excluded_count = original_count - len(pmids)
+                                            
+                                            if excluded_count > 0:
+                                                logger.info(f"排除 {excluded_count} 個通用引用 PMID")
+                                            
+                                            result['pmid_list'] = pmids[:20]  # 限制最多20篇
+                                            logger.info(f"從 ClinVar elink 提取到 {len(result['pmid_list'])} 個 PubMed IDs")
+                                            break
+                            except Exception as api_error:
+                                logger.warning(f"elink API 備用方法失敗: {api_error}")
+                except Exception as scrape_error:
+                    logger.warning(f"網頁抓取失敗: {scrape_error}")
+                    logger.debug(f"詳細錯誤: {scrape_error}", exc_info=True)
+                    # 如果網頁抓取失敗，嘗試 elink API 作為備用
+                    if Entrez and id_list:
+                        try:
+                            logger.info("網頁抓取失敗，嘗試 elink API 作為備用...")
+                            time.sleep(0.34)
+                            handle = Entrez.elink(
+                                dbfrom="clinvar",
+                                db="pubmed",
+                                id=id_list[0]
+                            )
+                            link_results = Entrez.read(handle, validate=False)
+                            handle.close()
+                            
+                            # 提取 PubMed IDs
+                            if link_results and len(link_results) > 0:
+                                linksetdb = link_results[0].get('LinkSetDb', [])
+                                for linkdb in linksetdb:
+                                    if linkdb.get('LinkName') == 'clinvar_pubmed':
+                                        links = linkdb.get('Link', [])
+                                        pmids = [link['Id'] for link in links]
+                                        
+                                        # 過濾排除的 PMID
+                                        original_count = len(pmids)
+                                        pmids = [pmid for pmid in pmids if pmid not in EXCLUDED_PMIDS]
+                                        excluded_count = original_count - len(pmids)
+                                        
+                                        if excluded_count > 0:
+                                            logger.info(f"排除 {excluded_count} 個通用引用 PMID")
+                                        
+                                        result['pmid_list'] = pmids[:20]  # 限制最多20篇
+                                        logger.info(f"從 ClinVar elink 提取到 {len(result['pmid_list'])} 個 PubMed IDs")
+                                        break
+                        except Exception as api_error:
+                            logger.warning(f"elink API 備用方法也失敗: {api_error}")
+            elif Entrez and id_list:
+                # 如果網頁抓取不可用，使用 elink API
+                try:
+                    logger.info("網頁抓取不可用，使用 elink API...")
                     time.sleep(0.34)
                     handle = Entrez.elink(
                         dbfrom="clinvar",
@@ -385,30 +480,9 @@ class ClinVarParser:
                                 result['pmid_list'] = pmids[:20]  # 限制最多20篇
                                 logger.info(f"從 ClinVar elink 提取到 {len(result['pmid_list'])} 個 PubMed IDs")
                                 break
-                        
-                        if not result['pmid_list']:
-                            logger.info(f"ClinVar 記錄 {id_list[0]} 沒有關聯的 PubMed 文章（elink 方法）")
-                            # 嘗試備用方法：網頁抓取
-                            if SCRAPING_AVAILABLE:
-                                logger.info("嘗試使用網頁抓取方法獲取 PubMed IDs...")
-                                scraped_pmids = self._scrape_pmids_from_clinvar_page(id_list[0])
-                                if scraped_pmids:
-                                    result['pmid_list'] = scraped_pmids
-                                    logger.info(f"從網頁抓取到 {len(scraped_pmids)} 個 PubMed IDs")
-            except Exception as e:
-                logger.warning(f"從 ClinVar 獲取 PubMed IDs 時出錯: {e}")
-                logger.debug(f"詳細錯誤: {e}", exc_info=True)
-                
-                # 如果 API 失敗，嘗試網頁抓取
-                if SCRAPING_AVAILABLE and id_list:
-                    logger.info("API 方法失敗，嘗試網頁抓取...")
-                    try:
-                        scraped_pmids = self._scrape_pmids_from_clinvar_page(id_list[0])
-                        if scraped_pmids:
-                            result['pmid_list'] = scraped_pmids
-                            logger.info(f"從網頁抓取到 {len(scraped_pmids)} 個 PubMed IDs")
-                    except Exception as scrape_error:
-                        logger.debug(f"網頁抓取也失敗: {scrape_error}")
+                except Exception as e:
+                    logger.warning(f"從 ClinVar 獲取 PubMed IDs 時出錯: {e}")
+                    logger.debug(f"詳細錯誤: {e}", exc_info=True)
             
             logger.info(f"ClinVar 解析成功: {result['clinical_significance']}, {result['variant_impact']}")
             return result
@@ -417,10 +491,248 @@ class ClinVarParser:
             logger.warning(f"解析 ClinVar summary 失敗: {e}")
             return None
     
+    def _search_clinvar_by_web(self, variant_info: Dict[str, str]) -> Optional[Dict]:
+        """
+        通過網頁搜索 ClinVar 變異（當 API 失敗時使用）
+        
+        Args:
+            variant_info: 變異資訊字典
+        
+        Returns:
+            包含 PubMed IDs 和疾病資訊的字典，或 None
+        """
+        if not SCRAPING_AVAILABLE:
+            return None
+        
+        try:
+            # TTN 基因位於負鏈，需要轉換
+            original_pos = variant_info['pos']
+            original_ref = variant_info['ref'].upper()
+            original_alt = variant_info['alt'].upper()
+            
+            # 負鏈轉換
+            negative_strand_pos = original_pos - 1
+            negative_strand_ref = self._get_complement_base(original_ref)
+            negative_strand_alt = self._get_complement_base(original_alt)
+            
+            # 構建 ClinVar 搜索 URL
+            # 使用精確的座標格式搜索
+            search_query = f"NC_000002.12:{negative_strand_pos}:{negative_strand_ref}:{negative_strand_alt}"
+            search_url = f'https://www.ncbi.nlm.nih.gov/clinvar/?term="{search_query}"'
+            print(search_url)
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            }
+            
+            logger.info(f"網頁搜索 URL: {search_url}")
+            
+            # 訪問搜索頁面
+            response = requests.get(search_url, headers=headers, timeout=15)
+            response.raise_for_status()
+            
+            soup = BeautifulSoup(response.content, 'html.parser')
+            
+            # 檢查是否有搜索結果
+            result_count_elem = soup.find('h3', class_='result_count')
+            if result_count_elem:
+                logger.debug(f"搜索結果: {result_count_elem.get_text(strip=True)}")
+            
+            # 嘗試多種方式從搜索結果中找到變異連結
+            variation_link = None
+            candidate_links = []
+            
+            # 方法1: 尋找 docsum 區塊（ClinVar 搜索結果的標準結構）
+            for docsum in soup.find_all(['div', 'dl'], class_=re.compile(r'docsum|rprt')):
+                link = docsum.find('a', href=re.compile(r'/clinvar/variation/(\d+)'))
+                if link:
+                    candidate_links.append(link['href'])
+                    logger.debug(f"  在 docsum 中找到連結: {link['href']}")
+            
+            # 方法2: 尋找包含 "NM_" 的區塊（表示基因轉錄本）
+            if not candidate_links:
+                for elem in soup.find_all(text=re.compile(r'NM_')):
+                    parent = elem.find_parent(['div', 'tr', 'td'])
+                    if parent:
+                        link = parent.find('a', href=re.compile(r'/clinvar/variation/(\d+)'))
+                        if link:
+                            candidate_links.append(link['href'])
+                            logger.debug(f"  在 NM_ 區塊中找到連結: {link['href']}")
+            
+            # 方法3: 尋找所有 variation 連結
+            if not candidate_links:
+                all_variation_links = soup.find_all('a', href=re.compile(r'/clinvar/variation/(\d+)'))
+                for link in all_variation_links:
+                    href = link['href']
+                    # 排除導航連結（通常不包含完整路徑）
+                    if 'variation/' in href:
+                        candidate_links.append(href)
+                        logger.debug(f"  找到 variation 連結: {href}")
+            
+            # 方法4: 尋找 VCV ID 文字
+            if not candidate_links:
+                vcv_pattern = re.compile(r'VCV(\d+)')
+                for elem in soup.find_all(text=vcv_pattern):
+                    vcv_match = vcv_pattern.search(elem)
+                    if vcv_match:
+                        variation_id = vcv_match.group(1)
+                        candidate_links.append(f"/clinvar/variation/{variation_id}/")
+                        logger.debug(f"  從文字中找到 VCV{variation_id}")
+            
+            if candidate_links:
+                variation_link = candidate_links[0]
+                logger.info(f"✓ 找到 {len(candidate_links)} 個候選變異，使用第一個: {variation_link}")
+            else:
+                logger.warning("無法在搜索結果中找到 ClinVar variation 連結")
+                logger.debug(f"頁面內容摘要（前500字元）: {soup.get_text()[:500]}")
+                return None
+            
+            # 提取 variation ID
+            variation_id_match = re.search(r'/clinvar/variation/(\d+)', variation_link)
+            if not variation_id_match:
+                logger.warning("無法從連結中提取 variation ID")
+                return None
+            
+            variation_id = variation_id_match.group(1)
+            logger.info(f"找到 ClinVar variation ID: {variation_id}")
+            
+            # 訪問詳細頁面
+            detail_url = f"https://www.ncbi.nlm.nih.gov{variation_link}" if not variation_link.startswith('http') else variation_link
+            response = requests.get(detail_url, headers=headers, timeout=15)
+            response.raise_for_status()
+            
+            soup = BeautifulSoup(response.content, 'html.parser')
+            
+            # 提取資訊
+            result = {
+                'pmid_list': [],
+                'conditions': [],
+                'variant_impact': 'Not specified',
+                'clinical_significance': 'Not specified',
+                'review_status': 'Not specified'
+            }
+            
+            # 提取臨床意義
+            clinical_sig_elem = soup.find('span', class_=re.compile(r'clinical-significance'))
+            if not clinical_sig_elem:
+                # 嘗試其他方式
+                for elem in soup.find_all(['span', 'div', 'strong']):
+                    text = elem.get_text(strip=True)
+                    if text in ['Pathogenic', 'Likely pathogenic', 'Uncertain significance', 
+                               'Benign', 'Likely benign', 'Conflicting']:
+                        result['clinical_significance'] = text
+                        logger.debug(f"找到臨床意義: {text}")
+                        break
+            else:
+                result['clinical_significance'] = clinical_sig_elem.get_text(strip=True)
+            
+            # 提取疾病/表型（從標題或條件區塊）
+            condition_elems = soup.find_all(['span', 'div'], class_=re.compile(r'condition|trait'))
+            for elem in condition_elems:
+                text = elem.get_text(strip=True)
+                if text and len(text) > 5:  # 過濾太短的文字
+                    result['conditions'].append(text)
+            
+            # 如果沒找到，嘗試從頁面標題提取
+            if not result['conditions']:
+                title = soup.find('h1')
+                if title:
+                    title_text = title.get_text(strip=True)
+                    # 嘗試從標題中提取疾病名稱
+                    if 'cardiomyopathy' in title_text.lower() or 'muscular dystrophy' in title_text.lower():
+                        result['conditions'].append(title_text)
+            
+            # 判斷影響類型
+            result['variant_impact'] = self._determine_impact_type(result['conditions'])
+            
+            # 提取 PMID（只從 germline classification 區塊）
+            pmid_list = self._extract_germline_pmids_from_soup(soup)
+            result['pmid_list'] = pmid_list
+            
+            logger.info(f"網頁抓取結果: {len(pmid_list)} 個 PMIDs, 臨床意義: {result['clinical_significance']}")
+            
+            return result if result['pmid_list'] or result['clinical_significance'] != 'Not specified' else None
+            
+        except Exception as e:
+            logger.warning(f"網頁搜索失敗: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
+            return None
+    
+    def _extract_germline_pmids_from_soup(self, soup: BeautifulSoup) -> List[str]:
+        """
+        從已解析的 BeautifulSoup 對象中提取 germline classification 區塊的 PMIDs
+        
+        Args:
+            soup: BeautifulSoup 對象
+        
+        Returns:
+            PMID 列表
+        """
+        # 尋找 "Citations for germline classification of this variant" 標題
+        germline_citation_section = None
+        
+        # 嘗試多種方式找到這個標題
+        for h3 in soup.find_all('h3'):
+            if h3.get_text(strip=True).startswith('Citations for germline classification'):
+                germline_citation_section = h3
+                logger.debug(f"找到 germline citation 標題 (h3)")
+                break
+        
+        if not germline_citation_section:
+            for heading in soup.find_all(['h2', 'h3', 'h4']):
+                if 'Citations for germline classification' in heading.get_text():
+                    germline_citation_section = heading
+                    logger.debug(f"找到 germline citation 標題 ({heading.name})")
+                    break
+        
+        if not germline_citation_section:
+            germline_citation_section = soup.find(id='new-germline-citation')
+            if germline_citation_section:
+                logger.debug(f"找到 germline citation 區塊 (by id)")
+        
+        if not germline_citation_section:
+            logger.warning(f"無法在 ClinVar 頁面中找到 'Citations for germline classification' 標題")
+            # 回退：提取所有 PMID
+            pmid_links = soup.find_all('a', href=re.compile(r'pubmed[./](\d+)'))
+        else:
+            # 找到包含這個標題的父容器
+            citation_container = germline_citation_section.find_parent('div', class_='new-citation-table')
+            
+            if not citation_container:
+                citation_container = germline_citation_section
+            
+            # 在這個容器內查找所有 PubMed 連結
+            pmid_links = citation_container.find_all('a', href=re.compile(r'pubmed[./](\d+)'))
+            logger.debug(f"在 germline classification 區塊中找到 {len(pmid_links)} 個 PubMed 連結")
+        
+        seen_pmids = set()
+        pmid_list = []
+        
+        for link in pmid_links:
+            pmid_match = re.search(r'pubmed[./](\d+)', link['href'])
+            if pmid_match:
+                pmid = pmid_match.group(1)
+                
+                # 避免重複
+                if pmid in seen_pmids:
+                    continue
+                seen_pmids.add(pmid)
+                
+                # 排除通用引用
+                if pmid in EXCLUDED_PMIDS:
+                    logger.debug(f"排除通用引用 PMID: {pmid}")
+                    continue
+                
+                pmid_list.append(pmid)
+        
+        return pmid_list[:20]  # 限制最多20篇
+    
     def _scrape_pmids_from_clinvar_page(self, clinvar_id: str) -> List[str]:
         """
         從 ClinVar 頁面抓取 PubMed IDs（備用方法）
         當 API 失敗或沒有返回結果時使用
+        
+        只提取 "Citations for germline classification of this variant" 部分之後的 PMID
         """
         if not SCRAPING_AVAILABLE:
             return []
@@ -436,30 +748,11 @@ class ClinVarParser:
             
             soup = BeautifulSoup(response.content, 'html.parser')
             
-            # 尋找所有 PubMed 連結
-            pmid_links = soup.find_all('a', href=re.compile(r'pubmed[./](\d+)'))
+            # 使用共享的提取方法
+            pmid_list = self._extract_germline_pmids_from_soup(soup)
             
-            seen_pmids = set()
-            pmid_list = []
-            
-            for link in pmid_links:
-                pmid_match = re.search(r'pubmed[./](\d+)', link['href'])
-                if pmid_match:
-                    pmid = pmid_match.group(1)
-                    
-                    # 避免重複
-                    if pmid in seen_pmids:
-                        continue
-                    seen_pmids.add(pmid)
-                    
-                    # 排除通用引用
-                    if pmid in EXCLUDED_PMIDS:
-                        logger.debug(f"排除通用引用 PMID: {pmid}")
-                        continue
-                    
-                    pmid_list.append(pmid)
-            
-            return pmid_list[:20]  # 限制最多20篇
+            logger.info(f"從 germline classification 區塊提取到 {len(pmid_list)} 個 PMID")
+            return pmid_list
             
         except Exception as e:
             logger.debug(f"網頁抓取失敗: {e}")
