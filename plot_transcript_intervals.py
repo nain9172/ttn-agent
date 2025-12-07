@@ -75,7 +75,7 @@ def plot_transcript_intervals(xlsx_file, output_file=None):
     # 主標題
     fig.suptitle(
         'TTN Transcript Intervals',
-        fontsize=18,
+        fontsize=24,
         fontweight='bold',
         y=0.98
     )
@@ -135,7 +135,7 @@ def plot_single_transcript(ax, transcript_name, intervals):
         0.02,
         0.75,
         f'{transcript_name}',
-        fontsize=12,
+        fontsize=16,
         fontweight='bold',
         va='center',
         bbox=dict(
@@ -191,7 +191,7 @@ def plot_single_transcript(ax, transcript_name, intervals):
                     f'{i+1}',
                     ha='center',
                     va='center',
-                    fontsize=8,
+                    fontsize=10,
                     fontweight='bold',
                     color='white',
                     zorder=4
@@ -205,7 +205,7 @@ def plot_single_transcript(ax, transcript_name, intervals):
         f'{TTN_GENE_START:,}',
         ha='center',
         va='top',
-        fontsize=8,
+        fontsize=10,
         fontweight='bold',
         bbox=dict(boxstyle='round,pad=0.3', facecolor='white', edgecolor='black', alpha=0.9)
     )
@@ -217,7 +217,7 @@ def plot_single_transcript(ax, transcript_name, intervals):
         f'{TTN_GENE_END:,}',
         ha='center',
         va='top',
-        fontsize=8,
+        fontsize=10,
         fontweight='bold',
         bbox=dict(boxstyle='round,pad=0.3', facecolor='white', edgecolor='black', alpha=0.9)
     )
@@ -230,7 +230,7 @@ def plot_single_transcript(ax, transcript_name, intervals):
         f'{mid_pos:,}',
         ha='center',
         va='top',
-        fontsize=7,
+        fontsize=9,
         color='gray',
         bbox=dict(boxstyle='round,pad=0.2', facecolor='white', edgecolor='gray', alpha=0.7)
     )
@@ -242,7 +242,7 @@ def plot_single_transcript(ax, transcript_name, intervals):
         f'{len(intervals)} intervals',
         ha='right',
         va='center',
-        fontsize=9,
+        fontsize=12,
         color='darkgreen',
         bbox=dict(boxstyle='round,pad=0.4', facecolor='lightgreen', edgecolor='green', alpha=0.7)
     )

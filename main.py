@@ -16,7 +16,8 @@ from config import (
     ENABLE_LOCAL_CLINICAL_EXTRACTION,
     LOCAL_LLM_BACKEND,
     LOCAL_LLM_MODEL,
-    LOCAL_LLM_TENSOR_PARALLEL
+    LOCAL_LLM_TENSOR_PARALLEL,
+    ENABLE_LITVAR_SEARCH
 )
 
 # Try to get enhanced PubMed settings
@@ -29,7 +30,7 @@ except ImportError:
 from utils.variant_parser import parse_variant
 from utils.evo2_predictor import Evo2Predictor
 from utils.clinvar_parser import ClinVarParser
-
+from utils.litvar_search import LitVarSearcher
 # Try to import enhanced PubMed searcher, fallback to standard
 try:
     from utils.enhanced_pubmed_search import EnhancedPubMedSearcher
@@ -218,7 +219,7 @@ def main():
                 # *** 重要：傳入 variant_info 以確保只提取目標變異的信息 ***
                 logger.info(f"Processing {len(pubmed_results)} articles...")
                 logger.info(f"Target variant: chr{variant_info['chrom']}:{variant_info['pos']}:{variant_info['ref']}>{variant_info['alt']}")
-                pubmed_results = extractor.batch_extract(pubmed_results, variant_info)
+                pubmed_results = extractor.batch_extract(pubmed_results, variant_info, clinvar_info)
                 
                 # 統計分析
                 aggregated_stats = extractor.aggregate_stats(pubmed_results)
@@ -246,7 +247,28 @@ def main():
             logger.info("Step 4.5: Skipped (disabled in config)")
         else:
             logger.info("Step 4.5: Skipped (--skip-clinical-extraction flag)")
-        
+        if ENABLE_LITVAR_SEARCH:  # Add this config option
+            logger.info("Step 4b: Searching LitVar...")
+            litvar_searcher = LitVarSearcher()
+            
+            litvar_results = litvar_searcher.search_multiple_formats(
+                variant_info=variant_info,
+                clinvar_info=clinvar_info,
+                max_results=20
+            )
+            
+            logger.info(f"Found {len(litvar_results)} articles from LitVar")
+            
+            # Merge results (remove duplicates by PMID)
+            pubmed_pmids = {a['pmid'] for a in pubmed_results}
+            new_articles = [a for a in litvar_results if a['pmid'] not in pubmed_pmids]
+            
+            logger.info(f"Adding {len(new_articles)} new articles from LitVar")
+            pubmed_results.extend(new_articles)
+            
+            logger.info(f"Total articles after merging: {len(pubmed_results)}")
+        else:
+            logger.info("Step 4b: LitVar search disabled")
         # Step 5: Generate Protein Schematic (with integrated transcript intervals)
         logger.info("Step 5: Generating protein schematic...")
         image_gen = ImageGenerator()
@@ -306,8 +328,10 @@ def main():
             print(f"\nClinical Extraction Summary:")
             print(f"   Articles analyzed: {aggregated_stats['total_articles']}")
             print(f"   Successfully extracted: {aggregated_stats['articles_with_extraction']}")
-            print(f"   Patients: {aggregated_stats['total_patients']}")
-            print(f"   Families: {aggregated_stats['total_families']}")
+            if aggregated_stats.get('disease_distribution'):
+                print(f"   Diseases found: {len(aggregated_stats['disease_distribution'])}")
+            if aggregated_stats.get('inheritance_distribution'):
+                print(f"   Inheritance patterns: {len(aggregated_stats['inheritance_distribution'])}")
         print(f"{'='*70}\n")
         
         return 0

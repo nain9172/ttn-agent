@@ -371,8 +371,8 @@ class ClinVarParser:
             # 優先使用網頁抓取方法
             if SCRAPING_AVAILABLE and id_list:
                 try:
-                    logger.info("優先使用網頁抓取方法獲取 PubMed IDs...")
-                    scraped_pmids = self._scrape_pmids_from_clinvar_page(id_list[0])
+                    logger.info("優先使用網頁抓取方法獲取 PubMed IDs 和 dbSNP ID...")
+                    scraped_pmids = self._scrape_pmids_from_clinvar_page(id_list[0], result)
                     if scraped_pmids:
                         result['pmid_list'] = scraped_pmids
                         logger.info(f"從網頁抓取到 {len(scraped_pmids)} 個 PubMed IDs")
@@ -611,6 +611,12 @@ class ClinVarParser:
                 'review_status': 'Not specified'
             }
             
+            # 提取 dbSNP ID (rsid)
+            rsid = self._extract_rsid_from_soup(soup)
+            if rsid:
+                result['rsid'] = rsid
+                logger.info(f"找到 dbSNP ID: {rsid}")
+            
             # 提取臨床意義
             clinical_sig_elem = soup.find('span', class_=re.compile(r'clinical-significance'))
             if not clinical_sig_elem:
@@ -727,12 +733,19 @@ class ClinVarParser:
         
         return pmid_list[:20]  # 限制最多20篇
     
-    def _scrape_pmids_from_clinvar_page(self, clinvar_id: str) -> List[str]:
+    def _scrape_pmids_from_clinvar_page(self, clinvar_id: str, result: Optional[Dict] = None) -> List[str]:
         """
         從 ClinVar 頁面抓取 PubMed IDs（備用方法）
         當 API 失敗或沒有返回結果時使用
         
         只提取 "Citations for germline classification of this variant" 部分之後的 PMID
+        
+        Args:
+            clinvar_id: ClinVar variation ID
+            result: 可選的結果字典，如提供會同時提取 rsid 並存入
+        
+        Returns:
+            PMID 列表
         """
         if not SCRAPING_AVAILABLE:
             return []
@@ -748,6 +761,13 @@ class ClinVarParser:
             
             soup = BeautifulSoup(response.content, 'html.parser')
             
+            # 同時提取 rsid（如果提供了 result 字典）
+            if result is not None:
+                rsid = self._extract_rsid_from_soup(soup)
+                if rsid:
+                    result['rsid'] = rsid
+                    logger.info(f"從 ClinVar 頁面提取到 dbSNP ID: {rsid}")
+            
             # 使用共享的提取方法
             pmid_list = self._extract_germline_pmids_from_soup(soup)
             
@@ -757,6 +777,153 @@ class ClinVarParser:
         except Exception as e:
             logger.debug(f"網頁抓取失敗: {e}")
             return []
+    
+    def _extract_rsid_from_soup(self, soup: BeautifulSoup) -> Optional[str]:
+        """
+        從 ClinVar 頁面提取 dbSNP ID (rs number)
+        
+        Args:
+            soup: BeautifulSoup 對象
+        
+        Returns:
+            dbSNP ID (如 rs375159973) 或 None
+        """
+        try:
+            # 方法1: 從 Variant Details 區塊中尋找 (常見格式)
+            # 尋找包含 "Identifiers" 或 dbSNP 連結的區塊
+            dbsnp_pattern = re.compile(r'rs\d+')
+            
+            # 嘗試從 dbSNP 連結中提取
+            dbsnp_links = soup.find_all('a', href=re.compile(r'dbsnp|ncbi\.nlm\.nih\.gov/snp/rs'))
+            for link in dbsnp_links:
+                text = link.get_text(strip=True)
+                match = dbsnp_pattern.search(text)
+                if match:
+                    rsid = match.group(0)
+                    logger.debug(f"從 dbSNP 連結提取到 rsid: {rsid}")
+                    return rsid
+                # 也檢查 href 中的 rsid
+                href = link.get('href', '')
+                match = dbsnp_pattern.search(href)
+                if match:
+                    rsid = match.group(0)
+                    logger.debug(f"從 dbSNP href 提取到 rsid: {rsid}")
+                    return rsid
+            
+            # 方法2: 從頁面文字中尋找 rs 開頭的 ID
+            # 尋找 "Identifiers" 區塊
+            for heading in soup.find_all(['h3', 'h4', 'dt', 'th']):
+                text = heading.get_text(strip=True).lower()
+                if 'identifier' in text or 'dbsnp' in text:
+                    parent = heading.find_parent(['div', 'dl', 'table', 'section'])
+                    if parent:
+                        parent_text = parent.get_text()
+                        match = dbsnp_pattern.search(parent_text)
+                        if match:
+                            rsid = match.group(0)
+                            logger.debug(f"從 Identifiers 區塊提取到 rsid: {rsid}")
+                            return rsid
+            
+            # 方法3: 從頁面標題或主要資訊區塊中尋找
+            # ClinVar 頁面通常在 Variant Details 區塊列出 rsid
+            variant_details = soup.find(['div', 'section'], class_=re.compile(r'variant-details|summary'))
+            if variant_details:
+                details_text = variant_details.get_text()
+                match = dbsnp_pattern.search(details_text)
+                if match:
+                    rsid = match.group(0)
+                    logger.debug(f"從 variant details 區塊提取到 rsid: {rsid}")
+                    return rsid
+            
+            # 方法4: 直接在整個頁面中搜索 (作為備用)
+            # 找到所有看起來像 rs number 的文字
+            full_text = soup.get_text()
+            matches = dbsnp_pattern.findall(full_text)
+            if matches:
+                # 取第一個匹配的 rsid
+                rsid = matches[0]
+                logger.debug(f"從頁面全文提取到 rsid: {rsid}")
+                return rsid
+            
+            logger.debug("無法在 ClinVar 頁面中找到 dbSNP ID")
+            return None
+            
+        except Exception as e:
+            logger.warning(f"提取 dbSNP ID 時出錯: {e}")
+            return None
+    
+    def get_rsid_from_clinvar(self, variant_info: Dict[str, str]) -> Optional[str]:
+        """
+        從 ClinVar 獲取變異的 dbSNP ID (rs number)
+        
+        此方法可以獨立調用，用於查詢特定變異的 dbSNP ID 以便後續用於 LitVar 搜索
+        
+        Args:
+            variant_info: 變異資訊字典（包含 chrom, pos, ref, alt）
+        
+        Returns:
+            dbSNP ID (如 rs375159973) 或 None
+        """
+        if not SCRAPING_AVAILABLE:
+            logger.warning("網頁抓取功能不可用，無法獲取 dbSNP ID")
+            return None
+        
+        try:
+            # 構建搜索查詢
+            original_pos = variant_info['pos']
+            original_ref = variant_info['ref'].upper()
+            original_alt = variant_info['alt'].upper()
+            
+            # 負鏈轉換 (TTN 基因位於負鏈)
+            negative_strand_pos = original_pos - 1
+            negative_strand_ref = self._get_complement_base(original_ref)
+            negative_strand_alt = self._get_complement_base(original_alt)
+            
+            search_query = f"NC_000002.12:{negative_strand_pos}:{negative_strand_ref}:{negative_strand_alt}"
+            search_url = f'https://www.ncbi.nlm.nih.gov/clinvar/?term="{search_query}"'
+            
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            }
+            
+            logger.info(f"搜索 ClinVar 以獲取 dbSNP ID: {search_url}")
+            
+            # 訪問搜索頁面
+            response = requests.get(search_url, headers=headers, timeout=15)
+            response.raise_for_status()
+            
+            soup = BeautifulSoup(response.content, 'html.parser')
+            
+            # 尋找變異詳情頁面連結
+            variation_link = None
+            for link in soup.find_all('a', href=re.compile(r'/clinvar/variation/(\d+)')):
+                variation_link = link['href']
+                break
+            
+            if not variation_link:
+                logger.warning("無法找到 ClinVar 變異詳情頁面")
+                return None
+            
+            # 訪問詳細頁面
+            detail_url = f"https://www.ncbi.nlm.nih.gov{variation_link}" if not variation_link.startswith('http') else variation_link
+            response = requests.get(detail_url, headers=headers, timeout=15)
+            response.raise_for_status()
+            
+            soup = BeautifulSoup(response.content, 'html.parser')
+            
+            # 提取 rsid
+            rsid = self._extract_rsid_from_soup(soup)
+            
+            if rsid:
+                logger.info(f"成功從 ClinVar 獲取 dbSNP ID: {rsid}")
+            else:
+                logger.warning("無法從 ClinVar 頁面提取 dbSNP ID")
+            
+            return rsid
+            
+        except Exception as e:
+            logger.warning(f"從 ClinVar 獲取 dbSNP ID 失敗: {e}")
+            return None
     
     def _determine_impact_type(self, conditions: List[str]) -> str:
         """判斷變異影響類型"""

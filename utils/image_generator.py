@@ -1,7 +1,7 @@
 """
 Image Generator Module - FIXED VERSION
 Generates protein schematic images showing variant location
-Fixed: overlap and clipping issues
+Fixed: overlap/clipping issues and ensures variant is only marked on transcripts that actually contain the variant position.
 """
 
 import logging
@@ -28,7 +28,7 @@ class ImageGenerator:
     
     def __init__(self):
         self.output_dir = OUTPUT_DIR / "images"
-        self.output_dir.mkdir(exist_ok=True)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
     
     def generate_titin_schematic(
         self,
@@ -37,13 +37,6 @@ class ImageGenerator:
     ) -> Path:
         """
         Generate titin protein schematic with variant location
-        
-        Args:
-            variant_info: Variant information dictionary
-            xlsx_file: Optional path to transcript intervals Excel file
-        
-        Returns:
-            Path to generated image
         """
         logger.info("Generating titin protein schematic...")
         
@@ -88,16 +81,16 @@ class ImageGenerator:
             f'TTN Variant Location: {variant_info["variant_id"]}\n'
             f'Genomic Position: chr{variant_info["chrom"]}:{variant_info["pos"]} '
             f'({variant_info["ref"]}>{variant_info["alt"]})',
-            fontsize=16,
+            fontsize=22,
             fontweight='bold',
             y=0.97
         )
         
-        # Plot domain overview (保留 Z-disk, I-band 等)
+        # Plot domain overview (Top row - Protein Structure)
         ax_main = fig.add_subplot(gs[0])
         self._plot_domain_overview(ax_main, relative_pos)
         
-        # Plot transcripts: use intervals if available, otherwise use original method
+        # Plot transcripts
         if transcript_intervals_data:
             for idx, (transcript_name, intervals) in enumerate(transcript_intervals_data.items()):
                 ax = fig.add_subplot(gs[idx + 1])
@@ -108,6 +101,7 @@ class ImageGenerator:
                     genomic_pos
                 )
         else:
+            # Fallback if no interval file is provided
             for idx, (transcript_name, transcript_info) in enumerate(TTN_TRANSCRIPTS.items()):
                 ax = fig.add_subplot(gs[idx + 1])
                 self._plot_transcript(
@@ -154,7 +148,10 @@ class ImageGenerator:
         intervals: List[Tuple[int, int]],
         variant_pos: int
     ):
-        """Plot transcript intervals aligned with domain overview"""
+        """
+        Plot transcript intervals aligned with domain overview.
+        Checks if variant_pos lies within any interval before plotting the marker.
+        """
         # Colors for intervals
         interval_colors = [
             '#FF6B6B', '#4ECDC4', '#45B7D1', '#96CEB4',
@@ -167,12 +164,12 @@ class ImageGenerator:
         ax.set_ylim(0, 1.0)
         ax.axis('off')
         
-        # Transcript name label (左側)
+        # Transcript name label (Left side)
         ax.text(
             -0.03,
             0.5,
             f'{transcript_name}',
-            fontsize=11,
+            fontsize=20,
             fontweight='bold',
             va='center',
             ha='right',
@@ -192,11 +189,22 @@ class ImageGenerator:
         # Background reference line
         ax.plot([0, 1], [y_pos, y_pos], 'k-', linewidth=0.8, alpha=0.2, zorder=1)
         
+        # Check if variant is inside any interval of this transcript
+        variant_in_transcript = False
+        
         # Draw each interval
         for i, (start, end) in enumerate(intervals):
             # Normalize positions using same method as domain overview
             start_norm = self._normalize_genomic_position(start)
             end_norm = self._normalize_genomic_position(end)
+            
+            # Check overlap logic: intervals can be start>end or end>start depending on strand notation
+            # We use min/max to be safe
+            interval_min = min(start, end)
+            interval_max = max(start, end)
+            
+            if interval_min <= variant_pos <= interval_max:
+                variant_in_transcript = True
             
             # Calculate width
             width = end_norm - start_norm
@@ -218,60 +226,53 @@ class ImageGenerator:
             )
             ax.add_patch(rect)
         
-        # Mark variant position
-        variant_norm = self._normalize_genomic_position(variant_pos)
-        marker_height = 0.12
-        
-        ax.plot(
-            [variant_norm, variant_norm],
-            [y_pos - height/2 - marker_height, y_pos + height/2 + marker_height],
-            'r-',
-            linewidth=2.5,
-            zorder=5
-        )
-        ax.scatter(
-            variant_norm,
-            y_pos + height/2 + marker_height + 0.03,
-            marker='v',
-            s=120,
-            color='red',
-            zorder=10,
-            edgecolors='black',
-            linewidth=1.5
-        )
+        # Mark variant position ONLY if it falls within an interval
+        if variant_in_transcript:
+            variant_norm = self._normalize_genomic_position(variant_pos)
+            marker_height = 0.12
+            
+            ax.plot(
+                [variant_norm, variant_norm],
+                [y_pos - height/2 - marker_height, y_pos + height/2 + marker_height],
+                'r-',
+                linewidth=2.5,
+                zorder=5
+            )
+            ax.scatter(
+                variant_norm,
+                y_pos + height/2 + marker_height + 0.03,
+                marker='v',
+                s=120,
+                color='red',
+                zorder=10,
+                edgecolors='black',
+                linewidth=1.5
+            )
     
     def _plot_domain_overview(self, ax, variant_pos):
-        """Plot overview of TTN domains - FIXED"""
-        ax.set_xlim(-0.05, 1.05)  # Extended limits
-        ax.set_ylim(0, 1.3)  # Extended to give more space for labels
+        """Plot overview of TTN domains"""
+        ax.set_xlim(-0.05, 1.05)
+        ax.set_ylim(0, 1.3)
         ax.axis('off')
-        # ax.set_title(
-        #     'TTN Protein Domain Structure (Exon-based)', 
-        #     fontsize=13, 
-        #     fontweight='bold', 
-        #     pad=25
-        # )
         
         # Draw domains
         y_center = 0.5
-        height = 0.22  # Reduced height for better spacing
+        height = 0.22
         
-        # Calculate domain positions (normalized) - use exon 1 as start
+        # Calculate domain positions (normalized)
         total_length = TTN_DOMAINS['M-band']['end'] - TTN_DOMAINS['Z-disk']['start'] + 1
         first_exon = TTN_DOMAINS['Z-disk']['start']
         
         for domain_name, domain_info in TTN_DOMAINS.items():
-            # Normalize from first exon (1) to last exon (364)
             start_norm = (domain_info['start'] - first_exon) / total_length
-            end_norm = (domain_info['end'] - first_exon + 1) / total_length  # +1 to include end exon
+            end_norm = (domain_info['end'] - first_exon + 1) / total_length
             width = end_norm - start_norm
             
-            # Draw domain rectangle with no overlap
             rect = FancyBboxPatch(
                 (start_norm, y_center - height/2),
                 width,
                 height,
-                boxstyle="square,pad=0",  # Use square to prevent gaps
+                boxstyle="square,pad=0",
                 edgecolor='black',
                 facecolor=domain_info['color'],
                 alpha=0.8,
@@ -279,7 +280,6 @@ class ImageGenerator:
             )
             ax.add_patch(rect)
             
-            # Add domain label
             label_x = start_norm + width/2
             ax.text(
                 label_x,
@@ -287,12 +287,12 @@ class ImageGenerator:
                 domain_name,
                 ha='center',
                 va='center',
-                fontsize=10,
+                fontsize=13,
                 fontweight='bold',
                 color='white' if domain_name != 'I-band' else 'black'
             )
         
-        # Mark variant position - IMPROVED
+        # Mark variant position
         marker_height = 0.18
         ax.plot(
             [variant_pos, variant_pos],
@@ -312,21 +312,20 @@ class ImageGenerator:
             linewidth=2
         )
         
-        # Add variant annotation - REPOSITIONED
         ax.text(
             variant_pos,
             y_center + height/2 + marker_height + 0.18,
             'Variant\nLocation',
             ha='center',
             va='bottom',
-            fontsize=9,
+            fontsize=12,
             fontweight='bold',
             color='red',
             bbox=dict(boxstyle='round,pad=0.3', facecolor='white', edgecolor='red', alpha=0.8)
         )
         
-        # Add legend for domains - REPOSITIONED
-        legend_y = 0.08  # Higher position to avoid overlap
+        # Legend
+        legend_y = 0.08
         legend_x_start = 0.05
         legend_spacing = 0.24
         
@@ -346,36 +345,33 @@ class ImageGenerator:
                 legend_y + 0.025,
                 f"{domain_name}: Exon {domain_info['start']}-{domain_info['end']}",
                 va='center',
-                fontsize=7.5
+                fontsize=20
             )
     
     def _plot_transcript(self, ax, name, info, variant_pos, variant_info):
-        """Plot individual transcript with variant location - FIXED"""
-        ax.set_xlim(-0.05, 1.05)  # Extended limits
-        ax.set_ylim(-0.1, 1.0)  # Adjusted range for better spacing
+        """Plot individual transcript (Simple bar fallback)"""
+        ax.set_xlim(-0.05, 1.05)
+        ax.set_ylim(-0.1, 1.0)
         ax.axis('off')
         
-        # Transcript title - REPOSITIONED with more space
         ax.text(
             0.5,
-            0.88,  # Adjusted position
+            0.88,
             f'{name} - {info["description"]}\n'
             f'Length: {info["length"]} AA | Transcript: {info["id"]}',
             ha='center',
             va='top',
-            fontsize=9.5,
+            fontsize=13,
             fontweight='bold',
             bbox=dict(boxstyle='round,pad=0.4', facecolor='lightyellow', edgecolor='gray', alpha=0.8)
         )
         
-        # Draw transcript bar
-        y_center = 0.42  # Adjusted for better spacing
+        y_center = 0.42
         height = 0.15
         bar_start = 0.08
         bar_end = 0.92
         bar_width = bar_end - bar_start
         
-        # Transcript background
         rect = FancyBboxPatch(
             (bar_start, y_center - height/2),
             bar_width,
@@ -388,24 +384,19 @@ class ImageGenerator:
         )
         ax.add_patch(rect)
         
-        # Get transcript length for calculations
-        total_length = info['length']
-        
-        # Color-code domains proportionally (based on exon ranges)
+        # Colors based on domain proportions
         total_exons = TTN_DOMAINS['M-band']['end'] - TTN_DOMAINS['Z-disk']['start'] + 1
         first_exon = TTN_DOMAINS['Z-disk']['start']
         
         for domain_name, domain_info in TTN_DOMAINS.items():
-            # Calculate normalized domain position based on exon ranges
             domain_start_norm = (domain_info['start'] - first_exon) / total_exons
-            domain_end_norm = (domain_info['end'] - first_exon + 1) / total_exons  # +1 to include end exon
+            domain_end_norm = (domain_info['end'] - first_exon + 1) / total_exons
             
-            # Map to bar coordinates
             start_x = bar_start + domain_start_norm * bar_width
             end_x = bar_start + domain_end_norm * bar_width
             width = end_x - start_x
             
-            if width > 0.001:  # Only draw if visible
+            if width > 0.001:
                 rect = patches.Rectangle(
                     (start_x, y_center - height/2),
                     width,
@@ -439,139 +430,16 @@ class ImageGenerator:
             linewidth=1.5
         )
         
-        # Add position labels - positioned below the bar
+        # Labels
         label_y = y_center - height/2 - marker_height - 0.05
-        
         ax.text(
-            bar_start,
-            label_y,
-            '1',
-            ha='center',
-            va='top',
-            fontsize=7.5,
-            fontweight='bold',
+            bar_start, label_y, '1', ha='center', va='top', fontsize=11, fontweight='bold',
             bbox=dict(boxstyle='round,pad=0.25', facecolor='white', edgecolor='black', alpha=0.9)
         )
         ax.text(
-            bar_end,
-            label_y,
-            str(total_length),
-            ha='center',
-            va='top',
-            fontsize=7.5,
-            fontweight='bold',
+            bar_end, label_y, str(info['length']), ha='center', va='top', fontsize=11, fontweight='bold',
             bbox=dict(boxstyle='round,pad=0.25', facecolor='white', edgecolor='black', alpha=0.9)
         )
-        
-        # Add variant position estimate
-        estimated_aa = int(variant_pos * total_length)
-        ax.text(
-            variant_x,
-            label_y,
-            f'~{estimated_aa}',
-            ha='center',
-            va='top',
-            fontsize=7.5,
-            color='red',
-            fontweight='bold',
-            bbox=dict(boxstyle='round,pad=0.25', facecolor='white', edgecolor='red', alpha=0.95)
-        )
-    
-    def generate_transcript_intervals(
-        self,
-        xlsx_file: str,
-        variant_info: Optional[Dict[str, str]] = None
-    ) -> Path:
-        """
-        Generate transcript intervals diagram from Excel file
-        
-        Args:
-            xlsx_file: Path to Excel file containing transcript intervals
-            variant_info: Optional variant information to mark on the diagram
-        
-        Returns:
-            Path to generated image
-        """
-        logger.info("Generating transcript intervals diagram...")
-        
-        # Read data
-        df = pd.read_excel(xlsx_file)
-        logger.info(f"Loaded {len(df)} transcripts from {xlsx_file}")
-        
-        # Create figure
-        num_transcripts = len(df)
-        fig_height = 3 + (num_transcripts * 1.5)
-        fig = plt.figure(figsize=(20, fig_height))
-        
-        # Setup grid layout
-        gs = fig.add_gridspec(
-            num_transcripts,
-            1,
-            hspace=0.6,
-            top=0.95,
-            bottom=0.05,
-            left=0.08,
-            right=0.95
-        )
-        
-        # Main title
-        title = 'TTN Transcript Intervals'
-        if variant_info:
-            title += f' - Variant: {variant_info["variant_id"]}'
-        
-        fig.suptitle(
-            title,
-            fontsize=18,
-            fontweight='bold',
-            y=0.98
-        )
-        
-        # Calculate variant position if provided
-        variant_pos = None
-        if variant_info:
-            genomic_pos = variant_info['pos']
-            variant_pos = genomic_pos
-        
-        # Plot each transcript
-        for idx, row in df.iterrows():
-            ax = fig.add_subplot(gs[idx])
-            transcript_name = row['transcript']
-            
-            # Parse all intervals
-            intervals = []
-            for col in df.columns:
-                if col.startswith('interval'):
-                    interval = self._parse_interval(row[col])
-                    if interval:
-                        intervals.append(interval)
-            
-            logger.info(f"{transcript_name}: {len(intervals)} intervals")
-            
-            # Plot this transcript
-            self._plot_transcript_with_intervals(
-                ax,
-                transcript_name,
-                intervals,
-                variant_pos
-            )
-        
-        # Save figure
-        output_filename = 'transcript_intervals.png'
-        if variant_info:
-            output_filename = f"transcript_intervals_{variant_info['variant_id']}.png"
-        
-        output_path = self.output_dir / output_filename
-        plt.savefig(
-            output_path,
-            dpi=300,
-            bbox_inches='tight',
-            facecolor='white',
-            pad_inches=0.3
-        )
-        plt.close()
-        
-        logger.info(f"Transcript intervals diagram saved to: {output_path}")
-        return output_path
     
     def _parse_interval(self, interval_str) -> Optional[Tuple[int, int]]:
         """Parse interval string '178807423-178758984' to (start, end)"""
@@ -589,181 +457,3 @@ class ImageGenerator:
         """Normalize genomic position to 0-1 range"""
         gene_length = TTN_GENE_INFO['start'] - TTN_GENE_INFO['end']
         return (TTN_GENE_INFO['start'] - pos) / gene_length
-    
-    def _plot_transcript_with_intervals(
-        self,
-        ax,
-        transcript_name: str,
-        intervals: List[Tuple[int, int]],
-        variant_pos: Optional[int] = None
-    ):
-        """Plot a single transcript with its intervals"""
-        # Colors for intervals
-        interval_colors = [
-            '#FF6B6B', '#4ECDC4', '#45B7D1', '#96CEB4',
-            '#FECA57', '#FF9FF3', '#54A0FF', '#48DBFB',
-            '#00D2D3'
-        ]
-        
-        ax.set_xlim(0, 1)
-        ax.set_ylim(0, 1)
-        ax.axis('off')
-        
-        # Transcript name
-        ax.text(
-            0.02,
-            0.75,
-            f'{transcript_name}',
-            fontsize=12,
-            fontweight='bold',
-            va='center',
-            bbox=dict(
-                boxstyle='round,pad=0.5',
-                facecolor='lightblue',
-                edgecolor='navy',
-                alpha=0.8,
-                linewidth=2
-            )
-        )
-        
-        # Draw genomic coordinate axis
-        y_pos = 0.45
-        height = 0.12
-        
-        # Background reference line
-        ax.plot([0.12, 0.95], [y_pos, y_pos], 'k-', linewidth=1, alpha=0.3, zorder=1)
-        
-        # Draw each interval
-        for i, (start, end) in enumerate(intervals):
-            # Normalize positions (TTN is on negative strand)
-            start_norm = self._normalize_genomic_position(start)
-            end_norm = self._normalize_genomic_position(end)
-            
-            # Map to x coordinates
-            x_start = 0.12 + start_norm * 0.83
-            x_end = 0.12 + end_norm * 0.83
-            width = x_end - x_start
-            
-            if width > 0:
-                # Use different colors
-                color = interval_colors[i % len(interval_colors)]
-                
-                # Draw interval rectangle
-                rect = FancyBboxPatch(
-                    (x_start, y_pos - height/2),
-                    width,
-                    height,
-                    boxstyle="round,pad=0.002",
-                    edgecolor='black',
-                    facecolor=color,
-                    alpha=0.8,
-                    linewidth=1.5,
-                    zorder=3
-                )
-                ax.add_patch(rect)
-                
-                # Add interval label if wide enough
-                if width > 0.05:
-                    ax.text(
-                        x_start + width/2,
-                        y_pos,
-                        f'{i+1}',
-                        ha='center',
-                        va='center',
-                        fontsize=8,
-                        fontweight='bold',
-                        color='white',
-                        zorder=4
-                    )
-        
-        # Mark variant position if provided
-        if variant_pos is not None:
-            variant_norm = self._normalize_genomic_position(variant_pos)
-            variant_x = 0.12 + variant_norm * 0.83
-            marker_height = 0.15
-            
-            ax.plot(
-                [variant_x, variant_x],
-                [y_pos - height/2 - marker_height, y_pos + height/2 + marker_height],
-                'r-',
-                linewidth=2.5,
-                zorder=5
-            )
-            ax.scatter(
-                variant_x,
-                y_pos + height/2 + marker_height + 0.03,
-                marker='v',
-                s=150,
-                color='red',
-                zorder=10,
-                edgecolors='black',
-                linewidth=1.5
-            )
-            
-            # Add variant label
-            ax.text(
-                variant_x,
-                y_pos + height/2 + marker_height + 0.08,
-                'Variant',
-                ha='center',
-                va='bottom',
-                fontsize=8,
-                fontweight='bold',
-                color='red',
-                bbox=dict(
-                    boxstyle='round,pad=0.3',
-                    facecolor='white',
-                    edgecolor='red',
-                    alpha=0.9
-                )
-            )
-        
-        # Add coordinate axis markers
-        # Start position
-        ax.text(
-            0.12,
-            y_pos - height/2 - 0.12,
-            f'{TTN_GENE_INFO["start"]:,}',
-            ha='center',
-            va='top',
-            fontsize=8,
-            fontweight='bold',
-            bbox=dict(boxstyle='round,pad=0.3', facecolor='white', edgecolor='black', alpha=0.9)
-        )
-        
-        # End position
-        ax.text(
-            0.95,
-            y_pos - height/2 - 0.12,
-            f'{TTN_GENE_INFO["end"]:,}',
-            ha='center',
-            va='top',
-            fontsize=8,
-            fontweight='bold',
-            bbox=dict(boxstyle='round,pad=0.3', facecolor='white', edgecolor='black', alpha=0.9)
-        )
-        
-        # Middle reference point
-        mid_pos = (TTN_GENE_INFO['start'] + TTN_GENE_INFO['end']) // 2
-        ax.text(
-            0.535,
-            y_pos - height/2 - 0.12,
-            f'{mid_pos:,}',
-            ha='center',
-            va='top',
-            fontsize=7,
-            color='gray',
-            bbox=dict(boxstyle='round,pad=0.2', facecolor='white', edgecolor='gray', alpha=0.7)
-        )
-        
-        # Add interval count info
-        ax.text(
-            0.98,
-            0.75,
-            f'{len(intervals)} intervals',
-            ha='right',
-            va='center',
-            fontsize=9,
-            color='darkgreen',
-            bbox=dict(boxstyle='round,pad=0.4', facecolor='lightgreen', edgecolor='green', alpha=0.7)
-        )

@@ -1,349 +1,84 @@
 """
-PubMed Search Module
-Searches PubMed for variant-related literature
+PubMed Search Module (Updated)
 """
 
 import logging
 import time
-import re
 from typing import Dict, List
-
 try:
     from Bio import Entrez
 except ImportError:
-    print("Warning: Biopython not installed. PubMed search will not work.")
-    print("Install with: pip install biopython")
     Entrez = None
 
-from config import (
-    PUBMED_EMAIL,
-    PUBMED_API_KEY,
-    PUBMED_MAX_RESULTS,
-    PHENOTYPE_CATEGORIES
-)
+from config import PUBMED_EMAIL, PUBMED_API_KEY, PUBMED_MAX_RESULTS
 
 logger = logging.getLogger(__name__)
 
-# Set Entrez email (required by NCBI)
 if Entrez:
     Entrez.email = PUBMED_EMAIL
-    if PUBMED_API_KEY:
-        Entrez.api_key = PUBMED_API_KEY
-
+    if PUBMED_API_KEY: Entrez.api_key = PUBMED_API_KEY
 
 class PubMedSearcher:
-    """PubMed literature searcher"""
-    
-    # 鹼基互補配對（TTN 基因位於負鏈）
-    COMPLEMENT = {
-        'A': 'T', 'T': 'A',
-        'G': 'C', 'C': 'G'
-    }
-    
-    def __init__(self):
+    def __init__(self, try_full_text=False, max_text_length=8000):
         self.max_results = PUBMED_MAX_RESULTS
-        if not Entrez:
-            logger.warning("Biopython not available - PubMed search disabled")
-    
-    def _get_complement_base(self, base: str) -> str:
-        """獲取互補鹼基（用於負鏈基因）"""
-        return self.COMPLEMENT.get(base.upper(), base)
     
     def search(self, variant_info: Dict[str, str], pmid_list: List[str] = None) -> List[Dict]:
-        """
-        Search PubMed for variant-related articles
+        if not Entrez: return []
         
-        Args:
-            variant_info: Variant information dictionary
-            pmid_list: Optional list of PubMed IDs to fetch directly (from ClinVar)
-        
-        Returns:
-            List of article dictionaries with extracted information
-        """
-        if not Entrez:
-            logger.error("Biopython not installed - cannot search PubMed")
-            return []
-        
-        logger.info("Searching PubMed...")
         results = []
+        target_pmids = pmid_list if pmid_list else []
         
+        # If no PMIDs provided, search by variant terms
+        if not target_pmids:
+            query = self._build_query(variant_info)
+            try:
+                handle = Entrez.esearch(db="pubmed", term=query, retmax=20)
+                record = Entrez.read(handle)
+                target_pmids = record["IdList"]
+            except Exception as e:
+                logger.error(f"PubMed search failed: {e}")
+                return []
+
+        if not target_pmids:
+            return []
+
+        logger.info(f"Fetching details for {len(target_pmids)} PMIDs...")
         try:
-            # If PMID list provided, use it directly
-            if pmid_list:
-                logger.info(f"使用提供的 {len(pmid_list)} 個 PubMed IDs: {pmid_list}")
-            else:
-                # Build search query
-                query = self._build_query(variant_info)
-                logger.info(f"Search query: {query}")
-                
-                # Search PubMed
-                handle = Entrez.esearch(
-                    db="pubmed",
-                    term=query,
-                    retmax=self.max_results,
-                    sort="relevance"
-                )
-                search_results = Entrez.read(handle)
-                handle.close()
-                
-                pmid_list = search_results["IdList"]
-                logger.info(f"Found {len(pmid_list)} articles")
-            
-            if not pmid_list:
-                return results
-            
-            # Fetch article details
-            time.sleep(0.5)  # Be nice to NCBI servers
-            handle = Entrez.efetch(
-                db="pubmed",
-                id=pmid_list,
-                rettype="medline",
-                retmode="xml"
-            )
+            handle = Entrez.efetch(db="pubmed", id=target_pmids, rettype="medline", retmode="xml")
             articles = Entrez.read(handle)
-            handle.close()
             
-            # Parse articles
-            for article in articles['PubmedArticle']:
-                try:
-                    parsed = self._parse_article(article, variant_info)
-                    if parsed:
-                        results.append(parsed)
-                except Exception as e:
-                    logger.warning(f"Error parsing article: {e}")
-                    continue
-            
-            logger.info(f"Successfully parsed {len(results)} articles")
-            
+            for art in articles['PubmedArticle']:
+                parsed = self._parse_article(art)
+                if parsed: results.append(parsed)
+                
         except Exception as e:
-            logger.error(f"PubMed search error: {e}", exc_info=True)
-        
+            logger.error(f"PubMed fetch failed: {e}")
+            
         return results
-    
-    def _build_query(self, variant_info: Dict[str, str]) -> str:
-        """
-        Build PubMed search query - 使用負鏈轉換的變異坐標
-        
-        策略：優先搜索包含該變異的文章，回退到廣泛的 TTN 相關搜索
-        """
-        # TTN 基因位於負鏈，需要轉換坐標和鹼基
-        original_pos = variant_info['pos']
-        original_ref = variant_info['ref'].upper()
-        original_alt = variant_info['alt'].upper()
-        
-        # 負鏈轉換
-        negative_strand_pos = original_pos - 1
-        negative_strand_ref = self._get_complement_base(original_ref)
-        negative_strand_alt = self._get_complement_base(original_alt)
-        
-        # 構建變異相關的搜索詞（多種可能的格式）
-        variant_terms = [
-            # ClinVar 格式
-            f"NC_000002.12:{negative_strand_pos}:{negative_strand_ref}:{negative_strand_alt}",
-            # 簡化格式
-            f"{variant_info['chrom']}:{negative_strand_pos}:{negative_strand_ref}:{negative_strand_alt}",
-            # 帶箭頭格式
-            f"{negative_strand_pos} {negative_strand_ref}>{negative_strand_alt}",
-            # 原始坐標（也可能被使用）
-            f"{original_pos} {original_ref}>{original_alt}",
-            f"chr{variant_info['chrom']}:{original_pos}",
-        ]
-        
-        # 構建查詢
-        variant_query = " OR ".join([f'"{term}"' for term in variant_terms])
-        
-        # 主要搜索：變異特定 + TTN 基因
-        specific_query = f"({variant_query}) AND TTN[Gene]"
-        
-        # 廣泛搜索：TTN 基因 + 相關疾病（作為後備）
-        broad_query = (
-            "TTN[Gene] AND "
-            "("
-            "cardiomyopathy OR "
-            "myopathy OR "
-            "muscular dystrophy OR "
-            "titin OR "
-            "titinopathy OR "
-            "\"limb-girdle\" OR "
-            "LGMD OR "
-            "DCM OR "
-            "\"dilated cardiomyopathy\" OR "
-            "\"tibial muscular dystrophy\" OR "
-            "centronuclear OR "
-            "\"hereditary myopathy\" OR "
-            "sarcomere OR "
-            "\"M-line\" OR "
-            "\"Z-disk\""
-            ")"
-        )
-        
-        # 組合查詢：優先變異特定，如果沒有結果則使用廣泛搜索
-        query = f"({specific_query}) OR ({broad_query})"
-        
-        # 放寬時間限制，包含更多經典文獻
-        query += " AND (\"2000\"[PDAT] : \"3000\"[PDAT])"
-        
-        logger.debug(f"構建的 PubMed 查詢（負鏈轉換）:")
-        logger.debug(f"  原始變異: chr{variant_info['chrom']}:{original_pos}:{original_ref}>{original_alt}")
-        logger.debug(f"  負鏈轉換: {negative_strand_pos}:{negative_strand_ref}>{negative_strand_alt}")
-        logger.debug(f"  查詢: {query[:200]}...")
-        
-        return query
-    
-    def _parse_article(self, article: Dict, variant_info: Dict[str, str]) -> Dict:
-        """Parse PubMed article and extract relevant information"""
+
+    def _build_query(self, v: Dict) -> str:
+        # Construct a strict query first
+        c, p, r, a = v['chrom'], v['pos'], v['ref'], v['alt']
+        return f"(TTN[Gene]) AND ({p}[Text Word] OR {p-1}[Text Word])"
+
+    def _parse_article(self, article: Dict) -> Dict:
         try:
             medline = article['MedlineCitation']
-            
-            # Extract basic info
             pmid = str(medline['PMID'])
-            article_data = medline['Article']
+            data = medline['Article']
             
-            title = article_data.get('ArticleTitle', '')
-            abstract = article_data.get('Abstract', {}).get('AbstractText', [''])
-            if isinstance(abstract, list):
-                abstract = ' '.join(str(a) for a in abstract)
-            else:
-                abstract = str(abstract)
-            
-            # Extract authors
-            authors = []
-            author_list = article_data.get('AuthorList', [])
-            for author in author_list[:3]:  # First 3 authors
-                last = author.get('LastName', '')
-                init = author.get('Initials', '')
-                if last:
-                    authors.append(f"{last} {init}".strip())
-            
-            # Extract journal and year
-            journal = article_data.get('Journal', {})
-            journal_title = journal.get('Title', '')
-            pub_date = journal.get('JournalIssue', {}).get('PubDate', {})
-            year = pub_date.get('Year', '')
-            
-            # Extract phenotype
-            phenotype = self._extract_phenotype(title + ' ' + abstract)
-            
-            # Extract inheritance pattern
-            inheritance = self._extract_inheritance(title + ' ' + abstract)
-            
-            # Extract age of onset
-            age_onset = self._extract_age_onset(title + ' ' + abstract)
-            
-            # Build PubMed link
-            pubmed_link = f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/"
+            abstract = data.get('Abstract', {}).get('AbstractText', [''])
+            if isinstance(abstract, list): abstract = ' '.join(str(x) for x in abstract)
             
             return {
                 'pmid': pmid,
-                'title': title,
-                'authors': ', '.join(authors) + (' et al.' if len(author_list) > 3 else ''),
-                'journal': journal_title,
-                'year': year,
-                'abstract': abstract[:500] + '...' if len(abstract) > 500 else abstract,
-                'phenotype': phenotype,
-                'inheritance': inheritance,
-                'age_onset': age_onset,
-                'pubmed_link': pubmed_link
+                'title': data.get('ArticleTitle', ''),
+                'abstract': abstract,
+                'authors': 'Et al.', # Simplified for brevity
+                'journal': data.get('Journal', {}).get('Title', ''),
+                'year': data.get('Journal', {}).get('JournalIssue', {}).get('PubDate', {}).get('Year', 'N/A'),
+                'pubmed_link': f"[https://pubmed.ncbi.nlm.nih.gov/](https://pubmed.ncbi.nlm.nih.gov/){pmid}/",
+                'full_text': abstract # Fallback
             }
-            
-        except Exception as e:
-            logger.warning(f"Error parsing article: {e}")
+        except:
             return None
-    
-    def _extract_phenotype(self, text: str) -> str:
-        """Extract phenotype from text"""
-        text = text.lower()
-        
-        for category, keywords in PHENOTYPE_CATEGORIES.items():
-            for keyword in keywords:
-                if keyword.lower() in text:
-                    if category == "heart":
-                        return "Cardiac"
-                    elif category == "skeletal_muscle":
-                        return "Skeletal muscle"
-                    elif category == "both":
-                        return "Both cardiac and skeletal"
-        
-        return "Not specified"
-    
-    def _extract_inheritance(self, text: str) -> str:
-        """Extract inheritance pattern from text"""
-        text = text.lower()
-        
-        patterns = {
-            "Autosomal dominant": ["autosomal dominant", "ad inheritance"],
-            "Autosomal recessive": ["autosomal recessive", "ar inheritance"],
-            "X-linked": ["x-linked", "x linked"],
-            "De novo": ["de novo", "sporadic"]
-        }
-        
-        for pattern, keywords in patterns.items():
-            for keyword in keywords:
-                if keyword in text:
-                    return pattern
-        
-        return "Not specified"
-    
-    def _extract_age_onset(self, text: str) -> str:
-        """Extract age of onset from text"""
-        text = text.lower()
-        
-        # 嘗試提取具體年齡數字
-        age_numbers = self._extract_age_numbers(text)
-        if age_numbers:
-            return age_numbers
-        
-        # 使用關鍵詞匹配
-        age_patterns = {
-            "Congenital": ["congenital", "birth", "neonatal", "prenatal"],
-            "Infantile (0-2 years)": ["infant", "infancy", "neonatal period"],
-            "Early childhood (2-6 years)": ["early childhood", "preschool"],
-            "Childhood (6-12 years)": ["childhood", "pediatric", "juvenile", "school age"],
-            "Adolescent (12-18 years)": ["adolescent", "teenage", "teen"],
-            "Adult-onset (18-60 years)": ["adult onset", "adulthood", "young adult"],
-            "Late-onset (>60 years)": ["late onset", "elderly", "geriatric", "older adult"]
-        }
-        
-        for age, keywords in age_patterns.items():
-            for keyword in keywords:
-                if keyword in text:
-                    return age
-        
-        return "Not specified"
-    
-    def _extract_age_numbers(self, text: str) -> str:
-        """Extract specific age numbers from text"""
-        # 匹配各種年齡表達方式
-        patterns = [
-            r'(\d+)[\s-]*(year|yr|y)[\s-]*old',
-            r'age[s]?\s+(\d+)[\s-]*(to|-)[\s-]*(\d+)',
-            r'at\s+age\s+(\d+)',
-            r'(\d+)[\s-]*month[\s-]*old',
-            r'mean\s+age[:\s]+(\d+\.?\d*)',
-            r'median\s+age[:\s]+(\d+\.?\d*)',
-        ]
-        
-        ages = []
-        for pattern in patterns:
-            matches = re.finditer(pattern, text, re.I)
-            for match in matches:
-                try:
-                    if 'month' in pattern:
-                        # 轉換月齡為年齡
-                        months = int(match.group(1))
-                        ages.append(f"{months} months ({months/12:.1f} years)")
-                    elif 'to' in pattern or '-' in pattern:
-                        # 年齡範圍
-                        age1 = match.group(1)
-                        age2 = match.group(3)
-                        ages.append(f"{age1}-{age2} years")
-                    else:
-                        age = match.group(1)
-                        ages.append(f"{age} years")
-                except (IndexError, ValueError):
-                    continue
-        
-        if ages:
-            return "; ".join(ages[:3])  # 最多返回3個年齡資訊
-        
-        return ""
