@@ -191,6 +191,31 @@ def main():
             logger.warning("ClinVar 未提供 PubMed IDs，報告將不包含文獻（避免不相關文章）")
             logger.info("如需查看文獻，請確認該變異在 ClinVar 資料庫中有記錄")
         
+        # Step 4a: LitVar Search (BEFORE clinical extraction so articles are processed together)
+        if ENABLE_LITVAR_SEARCH:
+            logger.info("Step 4a: Searching LitVar using rsID...")
+            litvar_searcher = LitVarSearcher()
+            
+            # LitVar uses rsID to search - this is extracted from clinvar_info
+            litvar_results = litvar_searcher.search_multiple_formats(
+                variant_info=variant_info,
+                clinvar_info=clinvar_info,  # Contains rsid from ClinVar
+                max_results=20
+            )
+            
+            logger.info(f"Found {len(litvar_results)} articles from LitVar")
+            
+            # Merge results (remove duplicates by PMID)
+            pubmed_pmids = {a['pmid'] for a in pubmed_results}
+            new_articles = [a for a in litvar_results if a['pmid'] not in pubmed_pmids]
+            
+            logger.info(f"Adding {len(new_articles)} new articles from LitVar")
+            pubmed_results.extend(new_articles)
+            
+            logger.info(f"Total articles after merging ClinVar + LitVar: {len(pubmed_results)}")
+        else:
+            logger.info("Step 4a: LitVar search disabled")
+        
         # Step 4.5: Extract clinical information using local LLM
         aggregated_stats = None
         if pubmed_results and ENABLE_LOCAL_CLINICAL_EXTRACTION and not args.skip_clinical_extraction:
@@ -247,28 +272,7 @@ def main():
             logger.info("Step 4.5: Skipped (disabled in config)")
         else:
             logger.info("Step 4.5: Skipped (--skip-clinical-extraction flag)")
-        if ENABLE_LITVAR_SEARCH:  # Add this config option
-            logger.info("Step 4b: Searching LitVar...")
-            litvar_searcher = LitVarSearcher()
-            
-            litvar_results = litvar_searcher.search_multiple_formats(
-                variant_info=variant_info,
-                clinvar_info=clinvar_info,
-                max_results=20
-            )
-            
-            logger.info(f"Found {len(litvar_results)} articles from LitVar")
-            
-            # Merge results (remove duplicates by PMID)
-            pubmed_pmids = {a['pmid'] for a in pubmed_results}
-            new_articles = [a for a in litvar_results if a['pmid'] not in pubmed_pmids]
-            
-            logger.info(f"Adding {len(new_articles)} new articles from LitVar")
-            pubmed_results.extend(new_articles)
-            
-            logger.info(f"Total articles after merging: {len(pubmed_results)}")
-        else:
-            logger.info("Step 4b: LitVar search disabled")
+        
         # Step 5: Generate Protein Schematic (with integrated transcript intervals)
         logger.info("Step 5: Generating protein schematic...")
         image_gen = ImageGenerator()

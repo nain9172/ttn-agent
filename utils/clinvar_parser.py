@@ -767,6 +767,13 @@ class ClinVarParser:
                 if rsid:
                     result['rsid'] = rsid
                     logger.info(f"從 ClinVar 頁面提取到 dbSNP ID: {rsid}")
+                
+                # 同時提取 HGVS 表示法
+                hgvs_data = self._extract_hgvs_from_soup(soup)
+                if hgvs_data['nucleotide'] or hgvs_data['protein']:
+                    result['hgvs'] = hgvs_data['nucleotide'] + hgvs_data['protein']
+                    result['hgvs_nucleotide'] = hgvs_data['nucleotide']
+                    result['hgvs_protein'] = hgvs_data['protein']
             
             # 使用共享的提取方法
             pmid_list = self._extract_germline_pmids_from_soup(soup)
@@ -851,6 +858,77 @@ class ClinVarParser:
         except Exception as e:
             logger.warning(f"提取 dbSNP ID 時出錯: {e}")
             return None
+    
+    def _extract_hgvs_from_soup(self, soup: BeautifulSoup) -> Dict[str, List[str]]:
+        """
+        從 ClinVar 頁面提取 HGVS 表示法（核苷酸和蛋白質）
+        
+        Args:
+            soup: BeautifulSoup 對象
+        
+        Returns:
+            包含 'nucleotide' 和 'protein' HGVS 列表的字典
+        """
+        hgvs_data = {
+            'nucleotide': [],  # e.g., NM_001267550.2:c.3208G>A
+            'protein': []      # e.g., NP_001254479.2:p.Glu1070Lys
+        }
+        
+        try:
+            # HGVS patterns
+            # Nucleotide: NM_XXXXXX.X:c.XXXX or NC_XXXXXX.X:g.XXXX (capture variants like c.100825C>T)
+            nucleotide_pattern = re.compile(r'N[MC]_\d+\.\d+:[cgn]\.\d+[A-Za-z]*[>_]?[A-Za-z]*(?:del|ins|dup)?[A-Za-z0-9]*')
+            # Protein: NP_XXXXXX.X:p.XXXX (capture variants like p.Arg33609Ter or p.Glu1070Lys)
+            protein_pattern = re.compile(r'NP_\d+\.\d+:p\.[A-Za-z]{3}\d+[A-Za-z]{3,4}(?:fs)?(?:\*\d+)?')
+            
+            # 方法1: 從頁面文字中尋找 HGVS
+            full_text = soup.get_text()
+            
+            # 提取核苷酸 HGVS
+            nucleotide_matches = nucleotide_pattern.findall(full_text)
+            for match in nucleotide_matches:
+                # 清理匹配結果（移除尾部標點符號）
+                clean_match = re.sub(r'[,;)\]]+$', '', match)
+                if clean_match and clean_match not in hgvs_data['nucleotide']:
+                    hgvs_data['nucleotide'].append(clean_match)
+            
+            # 提取蛋白質 HGVS
+            protein_matches = protein_pattern.findall(full_text)
+            for match in protein_matches:
+                clean_match = re.sub(r'[,;)\]]+$', '', match)
+                if clean_match and clean_match not in hgvs_data['protein']:
+                    hgvs_data['protein'].append(clean_match)
+            
+            # 方法2: 也尋找 HGVS 區塊
+            for heading in soup.find_all(['dt', 'th', 'strong', 'b']):
+                text = heading.get_text(strip=True).lower()
+                if 'hgvs' in text or 'name' in text:
+                    parent = heading.find_parent(['div', 'dl', 'table', 'tr', 'dd'])
+                    if parent:
+                        parent_text = parent.get_text()
+                        
+                        nuc_matches = nucleotide_pattern.findall(parent_text)
+                        for m in nuc_matches:
+                            clean_m = re.sub(r'[,;)\]]+$', '', m)
+                            if clean_m and clean_m not in hgvs_data['nucleotide']:
+                                hgvs_data['nucleotide'].append(clean_m)
+                        
+                        prot_matches = protein_pattern.findall(parent_text)
+                        for m in prot_matches:
+                            clean_m = re.sub(r'[,;)\]]+$', '', m)
+                            if clean_m and clean_m not in hgvs_data['protein']:
+                                hgvs_data['protein'].append(clean_m)
+            
+            if hgvs_data['nucleotide'] or hgvs_data['protein']:
+                logger.info(f"從 ClinVar 頁面提取到 HGVS: {len(hgvs_data['nucleotide'])} 核苷酸, {len(hgvs_data['protein'])} 蛋白質")
+                logger.debug(f"  核苷酸 HGVS: {hgvs_data['nucleotide'][:3]}")
+                logger.debug(f"  蛋白質 HGVS: {hgvs_data['protein'][:3]}")
+            
+            return hgvs_data
+            
+        except Exception as e:
+            logger.warning(f"提取 HGVS 時出錯: {e}")
+            return hgvs_data
     
     def get_rsid_from_clinvar(self, variant_info: Dict[str, str]) -> Optional[str]:
         """

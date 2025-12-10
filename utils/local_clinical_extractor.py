@@ -83,7 +83,7 @@ class LocalClinicalExtractor:
             return self._get_empty_result("Text too short")
 
         prompt = self._build_cot_prompt(relevant_text, aliases)
-        
+        print(f"=====================prompt: {prompt}=====================")
         try:
             if self.backend == "vllm":
                 raw = self._generate_vllm(prompt)
@@ -105,16 +105,32 @@ class LocalClinicalExtractor:
         aliases = [variant_id] # e.g., 2-178612477-T-A
         
         if clinvar_info:
-            # Use any HGVS or RSID found during ClinVar search/scrape
+            # Use any HGVS found during ClinVar search/scrape
+            # Combined list of all HGVS
             if 'hgvs' in clinvar_info:
                 h = clinvar_info['hgvs']
                 if isinstance(h, list): aliases.extend(h)
                 else: aliases.append(h)
+            
+            # Nucleotide HGVS (e.g., NM_001267550.2:c.3208G>A)
+            if 'hgvs_nucleotide' in clinvar_info:
+                h = clinvar_info['hgvs_nucleotide']
+                if isinstance(h, list): aliases.extend(h)
+                else: aliases.append(h)
+            
+            # Protein HGVS (e.g., NP_001254479.2:p.Glu1070Lys)
+            if 'hgvs_protein' in clinvar_info:
+                h = clinvar_info['hgvs_protein']
+                if isinstance(h, list): aliases.extend(h)
+                else: aliases.append(h)
+            
+            # rsID (e.g., rs1057518195)
             if 'rsid' in clinvar_info:
                 aliases.append(clinvar_info['rsid'])
+            
             # Include VCV ID if available (VCVXXXXXXXXX)
-            if 'vcv' in clinvar_info:
-                aliases.append(clinvar_info['vcv'])
+            # if 'vcv' in clinvar_info:
+            #     aliases.append(clinvar_info['vcv'])
         
         parts = variant_id.split('-')
         if len(parts) == 4:
@@ -130,11 +146,11 @@ class LocalClinicalExtractor:
             
             # Alias 3: Canonical HGVS genomic notation (GRCh38, positive strand)
             # Format: NC_000002.12:g.{pos}{ref}>{alt}
-            hgvs_g = f"NC_000002.12:g.{p_str}{r}>{a}"
-            aliases.append(hgvs_g)
+            # hgvs_g = f"NC_000002.12:g.{p_str}{r}>{a}"
+            # aliases.append(hgvs_g)
 
             # Alias 4: Common text format (e.g., T178612477A)
-            aliases.append(f"{r}{p_str}{a}")
+            # aliases.append(f"{r}{p_str}{a}")
 
         # Filter out Nones, empty strings, and duplicates
         return list(set([str(a).strip() for a in aliases if a]))
@@ -158,15 +174,15 @@ class LocalClinicalExtractor:
 
     def _build_cot_prompt(self, text: str, aliases: List[str]) -> str:
         # Create a clearly formatted list of all aliases
-        alias_list_str = "\n- " + "\n- ".join(aliases)
-        
+        target_variant_list = "\n- " + "\n- ".join(aliases)
+        # print(f"=====================target_variant_list: {target_variant_list}=====================")
         # Enhanced Prompt with STRICT filtering instructions
         return f"""<|begin_of_text|><|start_header_id|>system<|end_header_id|>
 You are a precision medical extraction AI.
-Your sole task is to extract clinical information specifically and only for the target variant mentioned below.
+Your task is to extract clinical information specifically and only for the target variant mentioned below.
 
 TARGET VARIANT ALIASES (Must be one of these in the text):
-{alias_list_str}
+{target_variant_list}
 
 STRICT INSTRUCTIONS:
 1. **IDENTIFICATION:** Scan the entire 'Article Text' ONLY for clear and explicit mentions of the TARGET VARIANT ALIASES.
@@ -180,7 +196,7 @@ JSON STRUCTURE (Reasoning First):
   "reasoning": "Step-by-step thinking: Did the text explicitly mention any of the TARGET VARIANT ALIASES? If yes, what specific patient details were associated with that variant?",
   "evidence_sentence": "Direct quote from text verifying the finding",
   "disease": "Specific diagnosis (e.g. Dilated Cardiomyopathy)",
-  "tissue_affected": "Cardiac", "Skeletal", "Both", or "Not specified",
+  "tissue_affected": ONLY "Cardiac", "Skeletal", "Both", or "Not specified",
   "age_onset": "Age or range (e.g. '45 years', 'Congenital')",
   "inheritance": "Pattern (e.g. Autosomal Dominant, Sporadic)",
   "patient_count": Integer (0 if none found)
@@ -221,14 +237,20 @@ Article Text:
             json_str = clean_text[start:end+1]
             try:
                 return json.loads(json_str)
-            except:
+            except json.JSONDecodeError as e:
                 # Try cleaning trailing commas which LLMs often output
                 try:
                     json_str_clean = re.sub(r',\s*}', '}', json_str)
+                    json_str_clean = re.sub(r',\s*]', ']', json_str_clean)
                     return json.loads(json_str_clean)
-                except:
-                    pass
+                except json.JSONDecodeError as e2:
+                    logger.warning(f"JSON parse error: {e2}")
+                    logger.debug(f"Raw LLM output (first 500 chars): {text[:500]}")
 
+        # Log when we can't find JSON structure at all
+        if start == -1 or end == -1:
+            logger.warning(f"No JSON found in LLM output. Raw output (first 300 chars): {text[:300]}")
+        
         return self._get_empty_result("JSON Parsing Failed")
 
     def _get_empty_result(self, reason: str) -> Dict:

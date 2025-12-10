@@ -143,6 +143,9 @@ class HTMLReportGenerator:
             background: #f8f9fa; padding: 20px; margin-bottom: 20px; border-radius: 8px;
             border-left: 4px solid {REPORT_ACCENT_COLOR};
         }}
+        .pubmed-article.litvar-source {{
+            border-left: 4px solid #e74c3c;
+        }}
         .article-title {{ font-size: 1.2em; font-weight: bold; color: #2c3e50; margin-bottom: 10px; }}
         .article-title a {{ color: {REPORT_ACCENT_COLOR}; text-decoration: none; }}
         .article-meta {{ color: #666; font-size: 0.9em; margin-bottom: 10px; }}
@@ -206,21 +209,25 @@ class HTMLReportGenerator:
             if reasoning or evidence:
                 ai_block = f"""
                 <div style="margin-top: 15px; padding: 15px; background: white; border-radius: 5px; border: 1px solid #eee;">
-                    <div style="font-weight: bold; color: {REPORT_ACCENT_COLOR}; margin-bottom: 5px;">🤖 AI Analysis</div>
+                    <div style="font-weight: bold; color: {REPORT_ACCENT_COLOR}; margin-bottom: 5px;">AI Analysis</div>
                     <div style="font-style: italic; color: #555; margin-bottom: 8px;">"{reasoning}"</div>
                     {f'<div style="background: #eef; padding: 5px 10px; border-radius: 4px; font-family: monospace; font-size: 0.9em; color: #333;">Evidence: "{evidence}"</div>' if evidence else ''}
                 </div>
                 """
 
+            # Add 'litvar-source' class for LitVar articles (red border)
+            source_class = "litvar-source" if article.get('source') == 'LitVar2' else ""
+            source_label = " [LitVar]" if article.get('source') == 'LitVar2' else ""
+            
             html_out += f"""
-            <div class="pubmed-article">
-                <div class="article-title">{idx}. <a href="{article['pubmed_link']}" target="_blank">{article['title']}</a></div>
+            <div class="pubmed-article {source_class}">
+                <div class="article-title">{idx}. <a href="{article['pubmed_link']}" target="_blank">{article['title']}</a>{source_label}</div>
                 <div class="article-meta">{article['journal']} ({article['year']}) | PMID: {article['pmid']}</div>
                 
                 <div class="article-info">
                     <div class="article-info-item"><div class="article-info-label">Disease</div><div>{disease}</div></div>
                     <div class="article-info-item"><div class="article-info-label">Tissue Affected</div><div>{tissue}</div></div>
-                    <div class="article-info-item"><div class="article-info-label">Age Onset</div><div>{age}</div></div>
+                    <div class="article-info-item"><div class="article-info-label">Age</div><div>{age}</div></div>
                     <div class="article-info-item"><div class="article-info-label">Inheritance</div><div>{inheritance}</div></div>
                 </div>
                 {ai_block}
