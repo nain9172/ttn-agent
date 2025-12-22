@@ -29,6 +29,14 @@ ENABLE_FULL_TEXT_FETCH = True
 MAX_TEXT_LENGTH = 15000  # Increased for Llama 3 analysis
 ENABLE_LITVAR_SEARCH = True
 
+# Docling PDF Processing
+ENABLE_DOCLING_PDF = True
+DOCLING_MAX_PRIORITY_LENGTH = 8000  # 優先內容最大長度（節省 GPU 記憶體）
+DOCLING_ENABLE_OCR = True  # 啟用 OCR 提取圖片中的表格
+DOCLING_ENABLE_TABLE_EXTRACTION = True  # 啟用表格提取
+DOCLING_OUTPUT_DIR = OUTPUT_DIR / "markdown"  # Markdown 輸出目錄
+PDF_OUTPUT_DIR = OUTPUT_DIR / "pdfs"  # PDF 下載目錄
+
 # LLM
 LOCAL_LLM_BACKEND = "vllm" # or ollama
 LOCAL_LLM_MODEL = "meta-llama/Llama-3.2-3B-Instruct" # Supports 3B or 8B
