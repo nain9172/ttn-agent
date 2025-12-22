@@ -111,3 +111,11 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+# Data and output directories
+data/
+outputs/
+llm_logs/
+
+# PDF files
+*.pdf

@@ -10,6 +10,8 @@ Fixes:
 import logging
 import json
 import re
+import os
+from datetime import datetime
 from typing import Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -43,7 +45,7 @@ class LocalClinicalExtractor:
                 enforce_eager=True
             )
             # Slightly higher temp to allow reasoning flow, but still focused
-            self.sampling_params = SamplingParams(temperature=0.2, top_p=0.95, max_tokens=1024)
+            self.sampling_params = SamplingParams(temperature=0.7, top_p=0.95, max_tokens=1024)
         except Exception as e:
             logger.error(f"vLLM init failed: {e}")
             raise
@@ -51,6 +53,33 @@ class LocalClinicalExtractor:
     def _init_ollama(self):
         import ollama
         self.ollama_client = ollama
+
+    def _log_prompt_response(self, pmid: str, prompt: str, response: str):
+        """Log prompt and LLaMA response to a file for debugging/analysis."""
+        log_dir = os.path.join(os.path.dirname(__file__), "..", "llm_logs")
+        os.makedirs(log_dir, exist_ok=True)
+        
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_file = os.path.join(log_dir, f"llm_log_{timestamp}_pmid_{pmid}.txt")
+        
+        with open(log_file, "w", encoding="utf-8") as f:
+            f.write("=" * 80 + "\n")
+            f.write(f"Timestamp: {datetime.now().isoformat()}\n")
+            f.write(f"PMID: {pmid}\n")
+            f.write(f"Model: {self.model_name}\n")
+            f.write(f"Backend: {self.backend}\n")
+            f.write("=" * 80 + "\n\n")
+            
+            f.write("=" * 40 + " PROMPT " + "=" * 40 + "\n")
+            f.write(prompt)
+            f.write("\n\n")
+            
+            f.write("=" * 40 + " RESPONSE " + "=" * 38 + "\n")
+            f.write(response)
+            f.write("\n")
+            f.write("=" * 80 + "\n")
+        
+        logger.info(f"Logged prompt/response to: {log_file}")
 
     def batch_extract(self, articles: List[Dict], variant_info: Dict, clinvar_info: Optional[Dict] = None) -> List[Dict]:
         variant_id = f"{variant_info['chrom']}-{variant_info['pos']}-{variant_info['ref']}-{variant_info['alt']}"
@@ -83,12 +112,16 @@ class LocalClinicalExtractor:
             return self._get_empty_result("Text too short")
 
         prompt = self._build_cot_prompt(relevant_text, aliases)
-        print(f"=====================prompt: {prompt}=====================")
+        pmid = article.get('pmid', 'unknown')
+        
         try:
             if self.backend == "vllm":
                 raw = self._generate_vllm(prompt)
             else:
                 raw = self._generate_ollama(prompt)
+            
+            # Log prompt and response to file
+            self._log_prompt_response(pmid, prompt, raw)
             
             data = self._robust_json_parse(raw)
             data['raw_llm_output'] = raw
@@ -195,12 +228,13 @@ JSON STRUCTURE (Reasoning First):
 {{
   "reasoning": "Step-by-step thinking: Did the text explicitly mention any of the TARGET VARIANT ALIASES? If yes, what specific patient details were associated with that variant?",
   "evidence_sentence": "Direct quote from text verifying the finding",
-  "disease": "Specific diagnosis (e.g. Dilated Cardiomyopathy)",
+  "disease": "Specific diagnosis of input variant (e.g. Dilated Cardiomyopathy, muscular dystrophy)",
   "tissue_affected": ONLY "Cardiac", "Skeletal", "Both", or "Not specified",
-  "age_onset": "Age or range (e.g. '45 years', 'Congenital')",
+  "age_onset": "Congenital or Adult",
   "inheritance": "Pattern (e.g. Autosomal Dominant, Sporadic)",
   "patient_count": Integer (0 if none found)
 }}
+Notice the tissue_affected can only be "Cardiac", "Skeletal", "Both", or "Not specified".
 <|eot_id|><|start_header_id|>user<|end_header_id|>
 Article Text:
 {text}

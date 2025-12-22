@@ -26,7 +26,7 @@ PUBMED_EMAIL = os.getenv("PUBMED_EMAIL", "your.email@example.com")
 PUBMED_API_KEY = os.getenv("PUBMED_API_KEY", "")
 PUBMED_MAX_RESULTS = 50
 ENABLE_FULL_TEXT_FETCH = True
-MAX_TEXT_LENGTH = 150000  # Increased for Llama 3 analysis
+MAX_TEXT_LENGTH = 15000  # Increased for Llama 3 analysis
 ENABLE_LITVAR_SEARCH = True
 
 # LLM
