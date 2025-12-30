@@ -15,6 +15,22 @@ from Bio import Entrez
 
 from config import ENABLE_FULL_TEXT_FETCH, MAX_TEXT_LENGTH
 
+# Try to import docling for PDF processing
+try:
+    from config import ENABLE_DOCLING_PDF, DOCLING_MAX_PRIORITY_LENGTH, OUTPUT_DIR, DOWNLOAD_SUPPLEMENTARY_FILES
+except ImportError:
+    ENABLE_DOCLING_PDF = False
+    DOCLING_MAX_PRIORITY_LENGTH = 8000
+    OUTPUT_DIR = Path("./outputs")
+    DOWNLOAD_SUPPLEMENTARY_FILES = True
+
+DOCLING_AVAILABLE = False
+try:
+    from utils.docling_pdf_processor import DoclingPDFProcessor, download_pdf_from_pmc
+    DOCLING_AVAILABLE = True
+except ImportError:
+    pass
+
 logger = logging.getLogger(__name__)
 
 # Set Entrez email (required by NCBI)
@@ -22,12 +38,26 @@ Entrez.email = "variant_agent@example.com"
 
 
 class LitVarSearcher:
-    def __init__(self, try_full_text: bool = None):
+    def __init__(self, try_full_text: bool = None, use_docling: bool = True):
         self.base_url = "https://www.ncbi.nlm.nih.gov/research/litvar2-api/variant/get"
         self.litvar_web_url = "https://www.ncbi.nlm.nih.gov/research/litvar2"
         # Use config setting if not specified
         self.try_full_text = try_full_text if try_full_text is not None else ENABLE_FULL_TEXT_FETCH
         self.max_text_length = MAX_TEXT_LENGTH
+        self.use_docling = use_docling and DOCLING_AVAILABLE and ENABLE_DOCLING_PDF
+        
+        # 初始化 docling 處理器
+        self.docling_processor = None
+        if self.use_docling:
+            try:
+                self.docling_processor = DoclingPDFProcessor(
+                    max_priority_content_length=DOCLING_MAX_PRIORITY_LENGTH,
+                    output_dir=OUTPUT_DIR / "markdown"
+                )
+                logger.info("LitVar2: Docling PDF 處理器已啟用")
+            except Exception as e:
+                logger.warning(f"LitVar2: 無法初始化 Docling: {e}")
+                self.use_docling = False
         
     def search_by_rsid(self, rsid: str) -> List[str]:
         """
@@ -63,6 +93,29 @@ class LitVarSearcher:
             logger.error(f"LitVar2 search error: {e}")
             return []
     
+    def _try_fetch_with_docling(self, pmid: str) -> Optional[dict]:
+        """使用 Docling 處理 PDF"""
+        if not self.docling_processor:
+            return None
+            
+        try:
+            pdf_path = download_pdf_from_pmc(pmid, output_dir=OUTPUT_DIR / "pdfs")
+            if not pdf_path:
+                return None
+                
+            result = self.docling_processor.process_pdf_for_llm(
+                pdf_path, 
+                include_full_text=False, 
+                pmid=pmid,
+                download_supplementary=DOWNLOAD_SUPPLEMENTARY_FILES
+            )
+            if result and result.get('priority_content'):
+                return result
+            return None
+        except Exception as e:
+            logger.debug(f"LitVar2: Docling 處理失敗 (PMID {pmid}): {e}")
+            return None
+
     def _try_fetch_full_text(self, pmid: str) -> Optional[str]:
         """
         Try to fetch full text from PMC or Europe PMC.
@@ -238,23 +291,43 @@ class LitVarSearcher:
                     # Try to fetch full text if enabled
                     full_text = None
                     has_full_text = False
+                    docling_content = None
+                    has_docling = False
                     
                     if self.try_full_text:
-                        full_text = self._try_fetch_full_text(pmid)
-                        if full_text:
-                            has_full_text = True
-                            logger.info(f"LitVar2 PMID {pmid}: 獲取全文 ({len(full_text)} 字元)")
-                        else:
-                            logger.debug(f"LitVar2 PMID {pmid}: 無法獲取全文，使用摘要")
+                        # 優先嘗試 Docling
+                        if self.use_docling:
+                            docling_result = self._try_fetch_with_docling(pmid)
+                            if docling_result:
+                                docling_content = docling_result.get('priority_content', '')
+                                has_docling = True
+                                has_full_text = True
+                                logger.info(f"LitVar2 PMID {pmid}: 使用 Docling 提取優先內容 ({len(docling_content)} 字元)")
+                        
+                        # 如果 Docling 沒開或失敗，嘗試傳統方式
+                        if not has_docling:
+                            full_text = self._try_fetch_full_text(pmid)
+                            if full_text:
+                                has_full_text = True
+                                logger.info(f"LitVar2 PMID {pmid}: 獲取全文 ({len(full_text)} 字元)")
+                            else:
+                                logger.debug(f"LitVar2 PMID {pmid}: 無法獲取全文，使用摘要")
                     
-                    # Use full text or abstract for LLM analysis
-                    text_for_llm = full_text if full_text else abstract
+                    # Use docling > full text or abstract for LLM analysis
+                    if docling_content:
+                        text_for_llm = docling_content
+                    elif full_text:
+                        text_for_llm = full_text
+                    else:
+                        text_for_llm = abstract
                     
                     articles.append({
                         'pmid': pmid,
                         'title': title,
                         'abstract': abstract,
                         'full_text': full_text,
+                        'docling_content': docling_content,
+                        'has_docling': has_docling,
                         'text_for_llm': text_for_llm,  # This is what the LLM uses!
                         'has_full_text': has_full_text,
                         'year': year,

@@ -21,8 +21,24 @@ from config import (
     PUBMED_EMAIL,
     PUBMED_API_KEY,
     PUBMED_MAX_RESULTS,
-    PHENOTYPE_CATEGORIES
+    PHENOTYPE_CATEGORIES,
+    OUTPUT_DIR
 )
+
+# Try to import docling for PDF processing
+try:
+    from config import ENABLE_DOCLING_PDF, DOCLING_MAX_PRIORITY_LENGTH, DOWNLOAD_SUPPLEMENTARY_FILES
+except ImportError:
+    ENABLE_DOCLING_PDF = False
+    DOCLING_MAX_PRIORITY_LENGTH = 8000
+    DOWNLOAD_SUPPLEMENTARY_FILES = True
+
+DOCLING_AVAILABLE = False
+try:
+    from utils.docling_pdf_processor import DoclingPDFProcessor, download_pdf_from_pmc
+    DOCLING_AVAILABLE = True
+except ImportError:
+    pass
 
 logger = logging.getLogger(__name__)
 
@@ -42,17 +58,32 @@ class EnhancedPubMedSearcher:
         'G': 'C', 'C': 'G'
     }
     
-    def __init__(self, try_full_text: bool = True, max_text_length: int = 8000):
+    def __init__(self, try_full_text: bool = True, max_text_length: int = 8000, use_docling: bool = True):
         """
         Initialize enhanced PubMed searcher
         
         Args:
             try_full_text: 是否嘗試獲取全文（默認 True）
             max_text_length: 最大文本長度（默認 8000 字元，適合 LLM）
+            use_docling: 是否使用 docling 處理 PDF（默認 True）
         """
         self.max_results = PUBMED_MAX_RESULTS
         self.try_full_text = try_full_text
         self.max_text_length = max_text_length
+        self.use_docling = use_docling and DOCLING_AVAILABLE and ENABLE_DOCLING_PDF
+        
+        # 初始化 docling 處理器
+        self.docling_processor = None
+        if self.use_docling:
+            try:
+                self.docling_processor = DoclingPDFProcessor(
+                    max_priority_content_length=DOCLING_MAX_PRIORITY_LENGTH,
+                    output_dir=OUTPUT_DIR / "markdown"
+                )
+                logger.info("Docling PDF 處理器已啟用")
+            except Exception as e:
+                logger.warning(f"無法初始化 Docling: {e}")
+                self.use_docling = False
         
         if not Entrez:
             logger.warning("Biopython not available - PubMed search disabled")
@@ -251,6 +282,51 @@ class EnhancedPubMedSearcher:
             logger.debug(f"Error fetching from Unpaywall: {e}")
             return None
     
+    def _try_fetch_with_docling(self, pmid: str) -> Optional[dict]:
+        """
+        使用 Docling 下載並處理 PDF
+        
+        優先提取：Tables、Results、Supplementary Data
+        
+        Args:
+            pmid: PubMed ID
+            
+        Returns:
+            包含優先內容的字典，或 None
+        """
+        if not self.docling_processor:
+            return None
+        
+        try:
+            # 嘗試從 PMC 下載 PDF
+            pdf_path = download_pdf_from_pmc(pmid, output_dir=OUTPUT_DIR / "pdfs")
+            
+            if not pdf_path:
+                logger.debug(f"PMID {pmid}: 無法從 PMC 下載 PDF")
+                return None
+            
+            # 使用 docling 處理 PDF
+            logger.info(f"PMID {pmid}: 使用 Docling 處理 PDF...")
+            result = self.docling_processor.process_pdf_for_llm(
+                pdf_path, 
+                include_full_text=False, 
+                pmid=pmid,
+                download_supplementary=DOWNLOAD_SUPPLEMENTARY_FILES
+            )
+            
+            if result and result.get('priority_content'):
+                logger.info(f"PMID {pmid}: Docling 提取成功")
+                logger.info(f"  - 表格數量: {result.get('tables_count', 0)}")
+                logger.info(f"  - Supplementary 連結: {len(result.get('supplementary_links', []))}")
+                logger.info(f"  - 有 Results: {result.get('has_results', False)}")
+                return result
+            
+            return None
+            
+        except Exception as e:
+            logger.debug(f"Docling 處理失敗 (PMID {pmid}): {e}")
+            return None
+    
     def _clean_text(self, text: str) -> str:
         """清理文本"""
         # 移除多餘空白
@@ -358,14 +434,32 @@ class EnhancedPubMedSearcher:
             # 嘗試獲取全文
             full_text = None
             has_full_text = False
+            docling_content = None
+            has_docling = False
             
             if self.try_full_text:
-                full_text = self._try_fetch_full_text(pmid, doi)
-                if full_text:
-                    has_full_text = True
+                # 優先嘗試使用 docling 處理 PDF
+                if self.use_docling and self.docling_processor:
+                    docling_result = self._try_fetch_with_docling(pmid)
+                    if docling_result:
+                        docling_content = docling_result.get('priority_content', '')
+                        has_docling = True
+                        has_full_text = True
+                        logger.info(f"PMID {pmid}: 使用 Docling 提取優先內容 ({len(docling_content)} 字元)")
+                
+                # 如果 docling 失敗，使用傳統方式獲取全文
+                if not has_docling:
+                    full_text = self._try_fetch_full_text(pmid, doi)
+                    if full_text:
+                        has_full_text = True
             
-            # 使用全文或摘要進行分析
-            text_for_analysis = full_text if full_text else abstract
+            # 使用 docling 優先內容 > 全文 > 摘要 進行分析
+            if docling_content:
+                text_for_analysis = docling_content
+            elif full_text:
+                text_for_analysis = full_text
+            else:
+                text_for_analysis = abstract
             
             # 提取作者
             authors = []
@@ -396,6 +490,8 @@ class EnhancedPubMedSearcher:
                 'full_text': full_text,  # 完整文本（如果有）
                 'text_for_llm': text_for_analysis,  # 用於 LLM 分析的文本
                 'has_full_text': has_full_text,
+                'has_docling': has_docling,  # 是否使用 Docling 處理
+                'docling_content': docling_content,  # Docling 提取的優先內容
                 'doi': doi,
                 'pubmed_link': pubmed_link,
                 'doi_link': doi_link,

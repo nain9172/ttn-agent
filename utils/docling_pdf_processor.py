@@ -206,18 +206,20 @@ class DoclingPDFProcessor:
         logger.debug(f"提取 {section_name} 章節: {len(section_content)} 字元")
         return section_content
     
-    def extract_supplementary_links(self, markdown_content: str) -> List[Dict[str, str]]:
+    def extract_supplementary_links(self, markdown_content: str, pmid: Optional[str] = None) -> List[Dict[str, str]]:
         """
         提取 Supplementary Data 連結
         
         Args:
             markdown_content: Markdown 內容
+            pmid: PubMed ID（可選，用於從網頁抓取）
             
         Returns:
             Supplementary 連結列表 [{"text": "...", "url": "..."}]
         """
         links = []
         
+        # 方法 1: 從 Markdown 內容提取
         for pattern in self.SUPPLEMENTARY_LINK_PATTERNS:
             matches = re.findall(pattern, markdown_content, re.IGNORECASE)
             for match in matches:
@@ -230,9 +232,30 @@ class DoclingPDFProcessor:
                 
                 if url and url.startswith('http'):
                     links.append({
-                        "text": text.strip() if text else "Supplementary Data",
-                        "url": url.strip()
+                        "name": text.strip() if text else "Supplementary Data",  # 使用 'name' 統一欄位名稱
+                        "url": url.strip(),
+                        "type": "unknown"  # 添加 type 欄位
                     })
+        
+        # 方法 2: 如果提供 PMID，從 PMC 網頁抓取（更準確）
+        if pmid and len(links) == 0:
+            try:
+                from utils.supplementary_downloader import SupplementaryDownloader
+                downloader = SupplementaryDownloader()
+                web_links = downloader.scrape_pmc_supplementary_links(pmid)
+                
+                for web_link in web_links:
+                    links.append({
+                        "name": web_link['name'],  # 使用 'name' 而不是 'text'
+                        "url": web_link['url'],
+                        "type": web_link.get('type', 'unknown')
+                    })
+                
+                if web_links:
+                    logger.info(f"從 PMC 網頁抓取到 {len(web_links)} 個 Supplementary 連結")
+                    
+            except Exception as e:
+                logger.debug(f"無法從網頁抓取 supplementary links: {e}")
         
         # 移除重複
         seen_urls = set()
@@ -279,22 +302,26 @@ class DoclingPDFProcessor:
         tables: List[str],
         results_section: str,
         supplementary_links: List[Dict[str, str]],
-        abstract: str
+        abstract: str,
+        full_markdown: str = "",
+        supplementary_content: Optional[List[str]] = None
     ) -> str:
         """
-        創建優先處理的內容（用於有限 GPU 記憶體）
+        創建優先處理的內容（根據用戶需求排序）
         
         優先順序：
-        1. Tables（最重要的數據）
-        2. Results 段落
-        3. Supplementary Data 連結
-        4. Abstract（如果還有空間）
+        1. Supplementary Data (實際內容，如 Excel 表格)
+        2. Tables (PDF 內的表格)
+        3. Results 段落 (關鍵研究結果)
+        4. 其他內容跳過（節省 token）
         
         Args:
             tables: 表格列表
             results_section: Results 段落
             supplementary_links: Supplementary 連結
             abstract: 摘要
+            full_markdown: 完整 Markdown (暫不使用)
+            supplementary_content: Supplementary files 的實際內容（如 Excel 表格轉 Markdown）
             
         Returns:
             優先內容的組合文本
@@ -302,21 +329,56 @@ class DoclingPDFProcessor:
         priority_parts = []
         current_length = 0
         
-        # 1. 添加表格
+        # 1. 最優先：Supplementary Data 實際內容
+        if supplementary_content:
+            supp_data_text = "## Supplementary Data (Extracted Tables)\n\n"
+            supp_data_text += "*(These tables are extracted from supplementary Excel/CSV files)*\n\n"
+            
+            for i, content in enumerate(supplementary_content, 1):
+                entry = f"### Supplementary File {i}\n{content}\n\n"
+                if current_length + len(entry) < self.max_priority_content_length:
+                    supp_data_text += entry
+                    current_length += len(entry)
+                else:
+                    supp_data_text += f"\n[Remaining supplementary files truncated to save space...]\n"
+                    break
+            
+            if len(supp_data_text) > 100:  # 確保有內容
+                priority_parts.append(supp_data_text)
+        
+        # 如果有 supplementary links 但沒有內容，提供連結
+        if supplementary_links and not supplementary_content:
+            supp_links_text = "## Supplementary Data Links\n\n"
+            supp_links_text += "*(Important: These files may contain critical data tables)*\n\n"
+            for link in supplementary_links:
+                link_type = link.get('type', 'file')
+                link_name = link.get('name', 'Supplementary File')
+                supp_links_text += f"- **{link_name}** ({link_type}): {link['url']}\n"
+            
+            if current_length + len(supp_links_text) < self.max_priority_content_length:
+                priority_parts.append(supp_links_text)
+                current_length += len(supp_links_text)
+        
+        # 2. 第二優先：PDF 內的 Tables
         if tables:
-            tables_text = "## Tables\n\n"
+            tables_text = "## Tables from Main Article\n\n"
             for i, table in enumerate(tables, 1):
                 table_entry = f"### Table {i}\n{table}\n\n"
                 if current_length + len(table_entry) < self.max_priority_content_length:
                     tables_text += table_entry
                     current_length += len(table_entry)
-            priority_parts.append(tables_text)
+                else:
+                    tables_text += f"\n[Remaining tables truncated...]\n"
+                    break
+            
+            if len(tables_text) > 50:
+                priority_parts.append(tables_text)
         
-        # 2. 添加 Results 段落
+        # 3. 第三優先：Results 段落
         if results_section:
             remaining = self.max_priority_content_length - current_length
             if remaining > 500:  # 至少保留 500 字元給 results
-                results_text = "## Results\n\n"
+                results_text = "## Results Section\n\n"
                 truncated_results = results_section[:remaining - 100]
                 if len(results_section) > remaining - 100:
                     truncated_results += "\n\n[Results section truncated...]"
@@ -324,36 +386,25 @@ class DoclingPDFProcessor:
                 priority_parts.append(results_text)
                 current_length += len(results_text)
         
-        # 3. 添加 Supplementary 連結
-        if supplementary_links:
-            supp_text = "## Supplementary Data Links\n\n"
-            for link in supplementary_links:
-                supp_text += f"- [{link['text']}]({link['url']})\n"
-            if current_length + len(supp_text) < self.max_priority_content_length:
-                priority_parts.append(supp_text)
-                current_length += len(supp_text)
+        # 4. 其他內容一律跳過（abstract, methods, discussion 等）
+        # 這樣可以節省大量 token，讓 LLM 專注在數據上
         
-        # 4. 添加 Abstract（如果還有空間）
-        if abstract:
-            remaining = self.max_priority_content_length - current_length
-            if remaining > 300:
-                abstract_text = "## Abstract\n\n"
-                truncated_abstract = abstract[:remaining - 50]
-                if len(abstract) > remaining - 50:
-                    truncated_abstract += "..."
-                abstract_text += truncated_abstract
-                priority_parts.append(abstract_text)
+        if not priority_parts:
+            # 如果完全沒有優先內容，提供一個最小的 fallback
+            return f"## Note\n\nNo tables, supplementary data, or results section found in this article.\n\nAbstract: {abstract[:500] if abstract else 'N/A'}"
         
         priority_content = "\n\n".join(priority_parts)
-        logger.info(f"創建優先內容: {len(priority_content)} 字元")
+        logger.info(f"創建優先內容: {len(priority_content)} 字元 (優先級: Supplementary Data > Tables > Results，其他內容已跳過)")
         return priority_content
     
-    def process_pdf(self, pdf_path: str) -> ExtractedContent:
+    def process_pdf(self, pdf_path: str, pmid: Optional[str] = None, download_supplementary: bool = True) -> ExtractedContent:
         """
         完整處理 PDF 文件
         
         Args:
             pdf_path: PDF 文件路徑
+            pmid: PubMed ID（可選，用於從網頁抓取 supplementary links）
+            download_supplementary: 是否下載並解析 supplementary files（預設 True）
             
         Returns:
             ExtractedContent 包含所有提取的內容
@@ -366,15 +417,72 @@ class DoclingPDFProcessor:
         # 提取各部分
         tables = self.extract_tables(markdown_content)
         results_section = self.extract_section(markdown_content, 'results')
-        supplementary_links = self.extract_supplementary_links(markdown_content)
+        supplementary_links = self.extract_supplementary_links(markdown_content, pmid=pmid)
         figures = self.extract_figures(markdown_content)
         abstract = self.extract_section(markdown_content, 'abstract')
         methods_section = self.extract_section(markdown_content, 'methods')
         discussion_section = self.extract_section(markdown_content, 'discussion')
         
+        # 嘗試下載並解析 supplementary files
+        supplementary_content = []
+        if download_supplementary and pmid and supplementary_links:
+            try:
+                from utils.supplementary_downloader import SupplementaryDownloader
+                downloader = SupplementaryDownloader(output_dir=self.output_dir.parent / "supplementary")
+                
+                logger.info(f"PMID {pmid}: 嘗試下載 {len(supplementary_links)} 個 supplementary files...")
+                
+                # 優先下載 Excel 文件
+                excel_links = [l for l in supplementary_links if l.get('type') == 'excel']
+                other_links = [l for l in supplementary_links if l.get('type') != 'excel']
+                priority_links = (excel_links + other_links)[:5]  # 增加到最多 5 個文件
+                
+                for link in priority_links:
+                    try:
+                        file_name = link.get('name', 'Unknown')
+                        file_url = link['url']
+                        file_type = link.get('type', 'unknown')
+                        
+                        logger.info(f"  → 正在下載: {file_name} ({file_type})")
+                        
+                        # 下載文件
+                        local_path = downloader.download_supplementary_file(file_url, pmid=pmid)
+                        
+                        if local_path:
+                            logger.info(f"  ✓ 下載成功: {local_path}")
+                            
+                            if file_type == 'excel':
+                                # 如果是 Excel，提取表格
+                                logger.info(f"  → 正在提取 Excel 表格...")
+                                excel_tables = downloader.extract_tables_from_excel(local_path)
+                                if excel_tables:
+                                    combined = "\n".join(excel_tables)
+                                    supplementary_content.append(f"**{file_name}**\n\n{combined}")
+                                    logger.info(f"  ✓ 提取了 {len(excel_tables)} 個表格來自 {file_name}")
+                                else:
+                                    logger.warning(f"  ⚠ Excel 文件為空或無法解析: {file_name}")
+                        else:
+                            logger.warning(f"  ✗ 下載失敗: {file_name}")
+                        
+                    except Exception as e:
+                        logger.warning(f"  ✗ 無法處理 {link.get('name', 'unknown')}: {e}")
+                        continue
+                
+                if supplementary_content:
+                    logger.info(f"PMID {pmid}: 成功解析 {len(supplementary_content)} 個 supplementary files")
+                else:
+                    logger.warning(f"PMID {pmid}: 未能提取任何 supplementary 內容")
+                    
+            except Exception as e:
+                logger.warning(f"無法下載 supplementary files: {e}")
+                import traceback
+                logger.debug(traceback.format_exc())
+        
         # 創建優先內容
         priority_content = self.create_priority_content(
-            tables, results_section, supplementary_links, abstract
+            tables, results_section, supplementary_links, abstract,
+            full_markdown=markdown_content,
+            supplementary_content=supplementary_content if supplementary_content else None
         )
         
         return ExtractedContent(
@@ -392,7 +500,9 @@ class DoclingPDFProcessor:
     def process_pdf_for_llm(
         self,
         pdf_path: str,
-        include_full_text: bool = False
+        include_full_text: bool = False,
+        pmid: Optional[str] = None,
+        download_supplementary: bool = True
     ) -> Dict[str, any]:
         """
         為 LLM 處理 PDF，返回適合模型輸入的格式
@@ -400,11 +510,13 @@ class DoclingPDFProcessor:
         Args:
             pdf_path: PDF 文件路徑
             include_full_text: 是否包含完整文本（預設 False 以節省 GPU 記憶體）
+            pmid: PubMed ID（可選，用於從網頁抓取 supplementary links）
+            download_supplementary: 是否下載並解析 supplementary files（預設 True）
             
         Returns:
             適合 LLM 輸入的字典
         """
-        extracted = self.process_pdf(pdf_path)
+        extracted = self.process_pdf(pdf_path, pmid=pmid, download_supplementary=download_supplementary)
         
         result = {
             "source": pdf_path,
@@ -433,7 +545,18 @@ def download_pdf_from_pmc(pmid: str, output_dir: Optional[Path] = None) -> Optio
         PDF 文件路徑或 None
     """
     import requests
-    from Bio import Entrez
+    try:
+        from Bio import Entrez
+    except ImportError:
+        logger.warning("Biopython not installed, cannot download PDF from PMC")
+        return None
+    
+    # 設定 Entrez email
+    try:
+        from config import PUBMED_EMAIL
+        Entrez.email = PUBMED_EMAIL
+    except ImportError:
+        Entrez.email = "user@example.com"
     
     output_dir = output_dir or Path("./outputs/pdfs")
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -455,17 +578,55 @@ def download_pdf_from_pmc(pmid: str, output_dir: Optional[Path] = None) -> Optio
         
         pmc_id = result[0]['LinkSetDb'][0]['Link'][0]['Id']
         
-        # 嘗試下載 PDF
-        pdf_url = f"https://www.ncbi.nlm.nih.gov/pmc/articles/PMC{pmc_id}/pdf/"
-        response = requests.get(pdf_url, timeout=30, allow_redirects=True)
-        
-        if response.status_code == 200 and 'pdf' in response.headers.get('content-type', '').lower():
-            pdf_path = output_dir / f"PMC{pmc_id}.pdf"
-            with open(pdf_path, 'wb') as f:
-                f.write(response.content)
-            logger.info(f"PDF 下載成功: {pdf_path}")
+        # 檢查 PDF 是否已存在
+        pdf_path = output_dir / f"PMC{pmc_id}.pdf"
+        if pdf_path.exists():
+            logger.info(f"PDF 已存在: {pdf_path}")
             return str(pdf_path)
         
+        # 設定 headers 模擬瀏覽器
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'application/pdf,*/*',
+        }
+        
+        # 嘗試多種 PDF 下載 URL 格式
+        pdf_urls = [
+            f"https://www.ncbi.nlm.nih.gov/pmc/articles/PMC{pmc_id}/pdf/main.pdf",
+            f"https://pmc.ncbi.nlm.nih.gov/articles/PMC{pmc_id}/pdf/",
+            f"https://www.ncbi.nlm.nih.gov/pmc/articles/PMC{pmc_id}/pdf/",
+        ]
+        
+        for pdf_url in pdf_urls:
+            try:
+                response = requests.get(pdf_url, headers=headers, timeout=30, allow_redirects=True)
+                content_type = response.headers.get('content-type', '').lower()
+                
+                if response.status_code == 200 and ('pdf' in content_type or response.content[:4] == b'%PDF'):
+                    pdf_path = output_dir / f"PMC{pmc_id}.pdf"
+                    with open(pdf_path, 'wb') as f:
+                        f.write(response.content)
+                    logger.info(f"PDF 下載成功: {pdf_path}")
+                    return str(pdf_path)
+            except Exception as url_error:
+                logger.debug(f"URL {pdf_url} 失敗: {url_error}")
+                continue
+        
+        # 如果直接下載失敗，嘗試使用 Europe PMC
+        try:
+            eupmc_url = f"https://europepmc.org/backend/ptpmcrender.fcgi?accid=PMC{pmc_id}&blobtype=pdf"
+            response = requests.get(eupmc_url, headers=headers, timeout=30)
+            
+            if response.status_code == 200 and (response.content[:4] == b'%PDF'):
+                pdf_path = output_dir / f"PMC{pmc_id}.pdf"
+                with open(pdf_path, 'wb') as f:
+                    f.write(response.content)
+                logger.info(f"PDF 從 Europe PMC 下載成功: {pdf_path}")
+                return str(pdf_path)
+        except Exception as eupmc_error:
+            logger.debug(f"Europe PMC 下載失敗: {eupmc_error}")
+        
+        logger.debug(f"PMID {pmid} (PMC{pmc_id}): 所有 PDF 下載方式都失敗")
         return None
         
     except Exception as e:

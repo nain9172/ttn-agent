@@ -45,7 +45,13 @@ class LocalClinicalExtractor:
                 enforce_eager=True
             )
             # Slightly higher temp to allow reasoning flow, but still focused
-            self.sampling_params = SamplingParams(temperature=0.7, top_p=0.95, max_tokens=1024)
+            # 增加 max_tokens 避免回覆被截斷，並添加 stop 條件避免重複
+            self.sampling_params = SamplingParams(
+                temperature=0.7, 
+                top_p=0.95, 
+                max_tokens=2048,
+                stop=["\n\n\n", "```\n\n"]  # 添加 stop 條件避免過度生成
+            )
         except Exception as e:
             logger.error(f"vLLM init failed: {e}")
             raise
@@ -54,17 +60,26 @@ class LocalClinicalExtractor:
         import ollama
         self.ollama_client = ollama
 
-    def _log_prompt_response(self, pmid: str, prompt: str, response: str):
+    def _log_prompt_response(self, pmid: str, prompt: str, response: str, variant_id: str = None):
         """Log prompt and LLaMA response to a file for debugging/analysis."""
-        log_dir = os.path.join(os.path.dirname(__file__), "..", "llm_logs")
+        log_base_dir = os.path.join(os.path.dirname(__file__), "..", "llm_logs")
+        
+        # 如果有 variant_id，創建以變異命名的子資料夾
+        if variant_id:
+            log_dir = os.path.join(log_base_dir, variant_id)
+        else:
+            log_dir = log_base_dir
+        
         os.makedirs(log_dir, exist_ok=True)
         
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        log_file = os.path.join(log_dir, f"llm_log_{timestamp}_pmid_{pmid}.txt")
+        # 文件名只用 PMID
+        log_file = os.path.join(log_dir, f"{pmid}.txt")
         
         with open(log_file, "w", encoding="utf-8") as f:
             f.write("=" * 80 + "\n")
             f.write(f"Timestamp: {datetime.now().isoformat()}\n")
+            if variant_id:
+                f.write(f"Variant ID: {variant_id}\n")
             f.write(f"PMID: {pmid}\n")
             f.write(f"Model: {self.model_name}\n")
             f.write(f"Backend: {self.backend}\n")
@@ -121,7 +136,7 @@ class LocalClinicalExtractor:
                 raw = self._generate_ollama(prompt)
             
             # Log prompt and response to file
-            self._log_prompt_response(pmid, prompt, raw)
+            self._log_prompt_response(pmid, prompt, raw, variant_id)
             
             data = self._robust_json_parse(raw)
             data['raw_llm_output'] = raw

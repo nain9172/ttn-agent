@@ -27,6 +27,12 @@ except ImportError:
     ENABLE_FULL_TEXT_FETCH = False
     MAX_TEXT_LENGTH = 8000
 
+# Try to get Docling settings
+try:
+    from config import ENABLE_DOCLING_PDF
+except ImportError:
+    ENABLE_DOCLING_PDF = False
+
 from utils.variant_parser import parse_variant
 from utils.evo2_predictor import Evo2Predictor
 from utils.clinvar_parser import ClinVarParser
@@ -167,14 +173,18 @@ def main():
         
         # Initialize PubMed searcher (enhanced or standard)
         if ENHANCED_AVAILABLE and ENABLE_FULL_TEXT_FETCH:
+            use_docling = ENABLE_DOCLING_PDF
             logger.info("使用增強版 PubMed 搜尋器（支持全文獲取）")
+            if use_docling:
+                logger.info("  ✓ Docling PDF 處理已啟用（優先提取 Tables/Results/Supplementary）")
             pubmed_searcher = PUBMED_SEARCHER_CLASS(
                 try_full_text=True,
-                max_text_length=MAX_TEXT_LENGTH
+                max_text_length=MAX_TEXT_LENGTH,
+                use_docling=use_docling
             )
         elif ENHANCED_AVAILABLE:
             logger.info("使用增強版 PubMed 搜尋器（全文獲取已禁用）")
-            pubmed_searcher = PUBMED_SEARCHER_CLASS(try_full_text=False)
+            pubmed_searcher = PUBMED_SEARCHER_CLASS(try_full_text=False, use_docling=False)
         else:
             logger.info("使用標準 PubMed 搜尋器（僅摘要）")
             pubmed_searcher = PUBMED_SEARCHER_CLASS()
@@ -194,7 +204,7 @@ def main():
         # Step 4a: LitVar Search (BEFORE clinical extraction so articles are processed together)
         if ENABLE_LITVAR_SEARCH:
             logger.info("Step 4a: Searching LitVar using rsID...")
-            litvar_searcher = LitVarSearcher()
+            litvar_searcher = LitVarSearcher(use_docling=ENABLE_DOCLING_PDF)
             
             # LitVar uses rsID to search - this is extracted from clinvar_info
             litvar_results = litvar_searcher.search_multiple_formats(

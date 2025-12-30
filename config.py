@@ -31,11 +31,15 @@ ENABLE_LITVAR_SEARCH = True
 
 # Docling PDF Processing
 ENABLE_DOCLING_PDF = True
-DOCLING_MAX_PRIORITY_LENGTH = 8000  # 優先內容最大長度（節省 GPU 記憶體）
+DOCLING_MAX_PRIORITY_LENGTH = 24000  # 優先內容最大長度（節省 GPU 記憶體）
 DOCLING_ENABLE_OCR = True  # 啟用 OCR 提取圖片中的表格
 DOCLING_ENABLE_TABLE_EXTRACTION = True  # 啟用表格提取
 DOCLING_OUTPUT_DIR = OUTPUT_DIR / "markdown"  # Markdown 輸出目錄
 PDF_OUTPUT_DIR = OUTPUT_DIR / "pdfs"  # PDF 下載目錄
+
+# Supplementary Files Processing
+DOWNLOAD_SUPPLEMENTARY_FILES = True  # 是否下載並解析 supplementary files（Excel 等）
+MAX_SUPPLEMENTARY_FILES = 3  # 最多下載的 supplementary files 數量（避免太慢）
 
 # LLM
 LOCAL_LLM_BACKEND = "vllm" # or ollama
