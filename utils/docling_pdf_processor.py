@@ -399,90 +399,49 @@ class DoclingPDFProcessor:
     
     def process_pdf(self, pdf_path: str, pmid: Optional[str] = None, download_supplementary: bool = True) -> ExtractedContent:
         """
-        完整處理 PDF 文件
-        
-        Args:
-            pdf_path: PDF 文件路徑
-            pmid: PubMed ID（可選，用於從網頁抓取 supplementary links）
-            download_supplementary: 是否下載並解析 supplementary files（預設 True）
-            
-        Returns:
-            ExtractedContent 包含所有提取的內容
+        完整處理 PDF 文件 (整合 Playwright 下載)
         """
         logger.info(f"開始處理 PDF: {pdf_path}")
         
         # 轉換為 Markdown
         markdown_content = self.convert_pdf_to_markdown(pdf_path)
-        
-        # 提取各部分
         tables = self.extract_tables(markdown_content)
         results_section = self.extract_section(markdown_content, 'results')
-        supplementary_links = self.extract_supplementary_links(markdown_content, pmid=pmid)
         figures = self.extract_figures(markdown_content)
         abstract = self.extract_section(markdown_content, 'abstract')
         methods_section = self.extract_section(markdown_content, 'methods')
         discussion_section = self.extract_section(markdown_content, 'discussion')
         
-        # 嘗試下載並解析 supplementary files
+        # 嘗試從 Markdown 提取連結 (僅作參考)
+        supplementary_links = [] # 您的 Playwright 腳本會自己找連結，不需要從 PDF 這裡抓
+
+        # *** 修改部分：使用簡化版下載器 ***
         supplementary_content = []
-        if download_supplementary and pmid and supplementary_links:
+        if download_supplementary and pmid:
             try:
                 from utils.supplementary_downloader import SupplementaryDownloader
                 downloader = SupplementaryDownloader(output_dir=self.output_dir.parent / "supplementary")
                 
-                logger.info(f"PMID {pmid}: 嘗試下載 {len(supplementary_links)} 個 supplementary files...")
+                # 直接執行您的下載邏輯
+                downloaded_files = downloader.download_all_supplementary_files(pmid)
                 
-                # 優先下載 Excel 文件
-                excel_links = [l for l in supplementary_links if l.get('type') == 'excel']
-                other_links = [l for l in supplementary_links if l.get('type') != 'excel']
-                priority_links = (excel_links + other_links)[:5]  # 增加到最多 5 個文件
-                
-                for link in priority_links:
-                    try:
-                        file_name = link.get('name', 'Unknown')
-                        file_url = link['url']
-                        file_type = link.get('type', 'unknown')
-                        
-                        logger.info(f"  → 正在下載: {file_name} ({file_type})")
-                        
-                        # 下載文件
-                        local_path = downloader.download_supplementary_file(file_url, pmid=pmid)
-                        
-                        if local_path:
-                            logger.info(f"  ✓ 下載成功: {local_path}")
+                # 簡單讀取下載下來的 Excel 內容
+                for file_info in downloaded_files:
+                    if file_info['type'] == 'excel':
+                        excel_tables = downloader.extract_tables_from_excel(Path(file_info['local_path']))
+                        if excel_tables:
+                            combined = "\n\n".join(excel_tables)
+                            supplementary_content.append(f"**Supplementary File: {file_info['name']}**\n\n{combined}")
                             
-                            if file_type == 'excel':
-                                # 如果是 Excel，提取表格
-                                logger.info(f"  → 正在提取 Excel 表格...")
-                                excel_tables = downloader.extract_tables_from_excel(local_path)
-                                if excel_tables:
-                                    combined = "\n".join(excel_tables)
-                                    supplementary_content.append(f"**{file_name}**\n\n{combined}")
-                                    logger.info(f"  ✓ 提取了 {len(excel_tables)} 個表格來自 {file_name}")
-                                else:
-                                    logger.warning(f"  ⚠ Excel 文件為空或無法解析: {file_name}")
-                        else:
-                            logger.warning(f"  ✗ 下載失敗: {file_name}")
-                        
-                    except Exception as e:
-                        logger.warning(f"  ✗ 無法處理 {link.get('name', 'unknown')}: {e}")
-                        continue
-                
-                if supplementary_content:
-                    logger.info(f"PMID {pmid}: 成功解析 {len(supplementary_content)} 個 supplementary files")
-                else:
-                    logger.warning(f"PMID {pmid}: 未能提取任何 supplementary 內容")
-                    
             except Exception as e:
-                logger.warning(f"無法下載 supplementary files: {e}")
-                import traceback
-                logger.debug(traceback.format_exc())
-        
-        # 創建優先內容
+                logger.warning(f"Supplementary download failed: {e}")
+        # *** 修改部分結束 ***
+
+        # 創建優先內容 (這會被送到 LLM)
         priority_content = self.create_priority_content(
             tables, results_section, supplementary_links, abstract,
             full_markdown=markdown_content,
-            supplementary_content=supplementary_content if supplementary_content else None
+            supplementary_content=supplementary_content
         )
         
         return ExtractedContent(
@@ -490,10 +449,10 @@ class DoclingPDFProcessor:
             tables=tables,
             results_section=results_section,
             supplementary_links=supplementary_links,
-            figures=figures,
+            figures=[],
             abstract=abstract,
-            methods_section=methods_section,
-            discussion_section=discussion_section,
+            methods_section="",
+            discussion_section="",
             priority_content=priority_content
         )
     
