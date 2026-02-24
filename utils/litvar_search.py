@@ -58,7 +58,7 @@ class LitVarSearcher:
             except Exception as e:
                 logger.warning(f"LitVar2: 無法初始化 Docling: {e}")
                 self.use_docling = False
-        
+    
     def search_by_rsid(self, rsid: str) -> List[str]:
         """
         Search LitVar2 for publications by rsID.
@@ -93,8 +93,8 @@ class LitVarSearcher:
             logger.error(f"LitVar2 search error: {e}")
             return []
     
-    def _try_fetch_with_docling(self, pmid: str) -> Optional[dict]:
-        """使用 Docling 處理 PDF"""
+    def _try_fetch_with_docling(self, pmid: str, variant_aliases: Optional[List[str]] = None) -> Optional[dict]:
+        """使用 Docling 處理 PDF（支持變異別名過濾）"""
         if not self.docling_processor:
             return None
             
@@ -107,7 +107,8 @@ class LitVarSearcher:
                 pdf_path, 
                 include_full_text=False, 
                 pmid=pmid,
-                download_supplementary=DOWNLOAD_SUPPLEMENTARY_FILES
+                download_supplementary=DOWNLOAD_SUPPLEMENTARY_FILES,
+                variant_aliases=variant_aliases
             )
             if result and result.get('priority_content'):
                 return result
@@ -232,10 +233,14 @@ class LitVarSearcher:
         text = re.sub(r'\n\s*\n', '\n\n', text)
         return text.strip()
     
-    def fetch_article_details(self, pmids: List[str]) -> List[Dict]:
+    def fetch_article_details(self, pmids: List[str], variant_aliases: Optional[List[str]] = None) -> List[Dict]:
         """
         Fetch article details from PubMed for a list of PMIDs.
         Now includes full text fetching when enabled!
+        
+        Args:
+            pmids: List of PubMed IDs
+            variant_aliases: Optional list of variant aliases for table filtering
         """
         if not pmids:
             return []
@@ -295,9 +300,9 @@ class LitVarSearcher:
                     has_docling = False
                     
                     if self.try_full_text:
-                        # 優先嘗試 Docling
+                        # 優先嘗試 Docling（傳遞 variant_aliases 進行表格過濾）
                         if self.use_docling:
-                            docling_result = self._try_fetch_with_docling(pmid)
+                            docling_result = self._try_fetch_with_docling(pmid, variant_aliases)
                             if docling_result:
                                 docling_content = docling_result.get('priority_content', '')
                                 has_docling = True
@@ -351,9 +356,15 @@ class LitVarSearcher:
             
         return articles
     
-    def search_multiple_formats(self, variant_info: Dict, clinvar_info: Optional[Dict] = None, max_results: int = 50) -> List[Dict]:
+    def search_multiple_formats(self, variant_info: Dict, clinvar_info: Optional[Dict] = None, variant_aliases: Optional[List[str]] = None, max_results: int = 50) -> List[Dict]:
         """
         Search LitVar2 using rsID from ClinVar info.
+        
+        Args:
+            variant_info: 變異信息
+            clinvar_info: ClinVar 信息（包含 rsID）
+            variant_aliases: 變異別名列表（從 ClinVar 獲取，用於表格過濾）
+            max_results: 最大結果數量
         """
         all_pmids = []
         
@@ -373,7 +384,7 @@ class LitVarSearcher:
         unique_pmids = list(set(all_pmids))[:max_results]
         logger.info(f"LitVar2: Fetching details for {len(unique_pmids)} publications")
         
-        articles = self.fetch_article_details(unique_pmids)
+        articles = self.fetch_article_details(unique_pmids, variant_aliases)
         
         logger.info(f"LitVar2: Successfully retrieved {len(articles)} articles")
         return articles

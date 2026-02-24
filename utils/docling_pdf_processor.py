@@ -123,6 +123,18 @@ class DoclingPDFProcessor:
         Returns:
             Markdown 格式的文本
         """
+        pdf_name = Path(pdf_path).stem
+        md_path = self.output_dir / f"{pdf_name}.md"
+        
+        # 檢查 Markdown 檔案是否已存在（快取機制）
+        if md_path.exists():
+            logger.info(f"Markdown 已存在，跳過轉換: {md_path}")
+            try:
+                with open(md_path, 'r', encoding='utf-8') as f:
+                    return f.read()
+            except Exception as e:
+                logger.warning(f"讀取快取的 Markdown 失敗: {e}，重新轉換")
+        
         logger.info(f"開始轉換 PDF: {pdf_path}")
         
         try:
@@ -130,8 +142,6 @@ class DoclingPDFProcessor:
             markdown_content = result.document.export_to_markdown()
             
             # 保存 Markdown 文件
-            pdf_name = Path(pdf_path).stem
-            md_path = self.output_dir / f"{pdf_name}.md"
             with open(md_path, 'w', encoding='utf-8') as f:
                 f.write(markdown_content)
             
@@ -304,14 +314,15 @@ class DoclingPDFProcessor:
         supplementary_links: List[Dict[str, str]],
         abstract: str,
         full_markdown: str = "",
-        supplementary_content: Optional[List[str]] = None
+        supplementary_content: Optional[List[str]] = None,
+        variant_aliases: Optional[List[str]] = None
     ) -> str:
         """
         創建優先處理的內容（根據用戶需求排序）
         
         優先順序：
         1. Supplementary Data (實際內容，如 Excel 表格)
-        2. Tables (PDF 內的表格)
+        2. Tables (PDF 內的表格) - 如果提供 variant_aliases，只保留包含目標變異的表格
         3. Results 段落 (關鍵研究結果)
         4. 其他內容跳過（節省 token）
         
@@ -322,6 +333,7 @@ class DoclingPDFProcessor:
             abstract: 摘要
             full_markdown: 完整 Markdown (暫不使用)
             supplementary_content: Supplementary files 的實際內容（如 Excel 表格轉 Markdown）
+            variant_aliases: 目標變異的別名列表（用於過濾表格）
             
         Returns:
             優先內容的組合文本
@@ -332,7 +344,11 @@ class DoclingPDFProcessor:
         # 1. 最優先：Supplementary Data 實際內容
         if supplementary_content:
             supp_data_text = "## Supplementary Data (Extracted Tables)\n\n"
-            supp_data_text += "*(These tables are extracted from supplementary Excel/CSV files)*\n\n"
+            # 根據是否使用過濾添加不同的註記
+            if variant_aliases:
+                supp_data_text += "*(Filtered: only tables from supplementary files mentioning the target variant)*\n\n"
+            else:
+                supp_data_text += "*(These tables are extracted from supplementary Excel/CSV files)*\n\n"
             
             for i, content in enumerate(supplementary_content, 1):
                 entry = f"### Supplementary File {i}\n{content}\n\n"
@@ -359,10 +375,31 @@ class DoclingPDFProcessor:
                 priority_parts.append(supp_links_text)
                 current_length += len(supp_links_text)
         
-        # 2. 第二優先：PDF 內的 Tables
+        # 2. 第二優先：PDF 內的 Tables（使用 variant_aliases 過濾）
         if tables:
+            # 如果提供了 variant_aliases，過濾只包含目標變異的表格
+            if variant_aliases:
+                filtered_tables = []
+                for table in tables:
+                    table_lower = table.lower()
+                    # 檢查表格是否包含任何變異別名
+                    if any(alias.lower() in table_lower for alias in variant_aliases if alias):
+                        filtered_tables.append(table)
+                
+                if filtered_tables:
+                    logger.info(f"表格過濾: {len(tables)} -> {len(filtered_tables)} 個包含目標變異的表格")
+                    tables_to_use = filtered_tables
+                else:
+                    logger.warning(f"表格過濾後沒有匹配的表格，保留所有 {len(tables)} 個表格")
+                    tables_to_use = tables
+            else:
+                tables_to_use = tables
+            
             tables_text = "## Tables from Main Article\n\n"
-            for i, table in enumerate(tables, 1):
+            if variant_aliases:
+                tables_text += "*(Filtered: only tables mentioning the target variant)*\n\n"
+            
+            for i, table in enumerate(tables_to_use, 1):
                 table_entry = f"### Table {i}\n{table}\n\n"
                 if current_length + len(table_entry) < self.max_priority_content_length:
                     tables_text += table_entry
@@ -397,9 +434,15 @@ class DoclingPDFProcessor:
         logger.info(f"創建優先內容: {len(priority_content)} 字元 (優先級: Supplementary Data > Tables > Results，其他內容已跳過)")
         return priority_content
     
-    def process_pdf(self, pdf_path: str, pmid: Optional[str] = None, download_supplementary: bool = True) -> ExtractedContent:
+    def process_pdf(self, pdf_path: str, pmid: Optional[str] = None, download_supplementary: bool = True, variant_aliases: Optional[List[str]] = None) -> ExtractedContent:
         """
         完整處理 PDF 文件 (整合 Playwright 下載)
+        
+        Args:
+            pdf_path: PDF 文件路徑
+            pmid: PubMed ID
+            download_supplementary: 是否下載 supplementary files
+            variant_aliases: 目標變異的別名列表（用於過濾表格）
         """
         logger.info(f"開始處理 PDF: {pdf_path}")
         
@@ -425,10 +468,14 @@ class DoclingPDFProcessor:
                 # 直接執行您的下載邏輯
                 downloaded_files = downloader.download_all_supplementary_files(pmid)
                 
-                # 簡單讀取下載下來的 Excel 內容
+                # 簡單讀取下載下來的 Excel 內容（使用 variant_aliases 過濾）
                 for file_info in downloaded_files:
                     if file_info['type'] == 'excel':
-                        excel_tables = downloader.extract_tables_from_excel(Path(file_info['local_path']))
+                        # 傳遞 variant_aliases 進行表格過濾
+                        excel_tables = downloader.extract_tables_from_excel(
+                            Path(file_info['local_path']), 
+                            variant_aliases=variant_aliases
+                        )
                         if excel_tables:
                             combined = "\n\n".join(excel_tables)
                             supplementary_content.append(f"**Supplementary File: {file_info['name']}**\n\n{combined}")
@@ -441,7 +488,8 @@ class DoclingPDFProcessor:
         priority_content = self.create_priority_content(
             tables, results_section, supplementary_links, abstract,
             full_markdown=markdown_content,
-            supplementary_content=supplementary_content
+            supplementary_content=supplementary_content,
+            variant_aliases=variant_aliases
         )
         
         return ExtractedContent(
@@ -461,7 +509,8 @@ class DoclingPDFProcessor:
         pdf_path: str,
         include_full_text: bool = False,
         pmid: Optional[str] = None,
-        download_supplementary: bool = True
+        download_supplementary: bool = True,
+        variant_aliases: Optional[List[str]] = None
     ) -> Dict[str, any]:
         """
         為 LLM 處理 PDF，返回適合模型輸入的格式
@@ -471,11 +520,12 @@ class DoclingPDFProcessor:
             include_full_text: 是否包含完整文本（預設 False 以節省 GPU 記憶體）
             pmid: PubMed ID（可選，用於從網頁抓取 supplementary links）
             download_supplementary: 是否下載並解析 supplementary files（預設 True）
+            variant_aliases: 目標變異的別名列表（用於過濾表格）
             
         Returns:
             適合 LLM 輸入的字典
         """
-        extracted = self.process_pdf(pdf_path, pmid=pmid, download_supplementary=download_supplementary)
+        extracted = self.process_pdf(pdf_path, pmid=pmid, download_supplementary=download_supplementary, variant_aliases=variant_aliases)
         
         result = {
             "source": pdf_path,

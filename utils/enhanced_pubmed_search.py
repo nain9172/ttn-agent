@@ -282,14 +282,16 @@ class EnhancedPubMedSearcher:
             logger.debug(f"Error fetching from Unpaywall: {e}")
             return None
     
-    def _try_fetch_with_docling(self, pmid: str) -> Optional[dict]:
+    def _try_fetch_with_docling(self, pmid: str, variant_aliases: Optional[List[str]] = None) -> Optional[dict]:
         """
         使用 Docling 下載並處理 PDF
         
         優先提取：Tables、Results、Supplementary Data
+        如果提供 variant_aliases，表格會被過濾以只包含目標變異
         
         Args:
             pmid: PubMed ID
+            variant_aliases: 目標變異的別名列表（用於過濾表格）
             
         Returns:
             包含優先內容的字典，或 None
@@ -305,13 +307,16 @@ class EnhancedPubMedSearcher:
                 logger.debug(f"PMID {pmid}: 無法從 PMC 下載 PDF")
                 return None
             
-            # 使用 docling 處理 PDF
+            # 使用 docling 處理 PDF（傳遞 variant_aliases 用於表格過濾）
             logger.info(f"PMID {pmid}: 使用 Docling 處理 PDF...")
+            if variant_aliases:
+                logger.info(f"  使用 {len(variant_aliases)} 個變異別名進行表格過濾")
             result = self.docling_processor.process_pdf_for_llm(
                 pdf_path, 
                 include_full_text=False, 
                 pmid=pmid,
-                download_supplementary=DOWNLOAD_SUPPLEMENTARY_FILES
+                download_supplementary=DOWNLOAD_SUPPLEMENTARY_FILES,
+                variant_aliases=variant_aliases
             )
             
             if result and result.get('priority_content'):
@@ -335,13 +340,14 @@ class EnhancedPubMedSearcher:
         text = re.sub(r'[\x00-\x08\x0B-\x0C\x0E-\x1F\x7F]', '', text)
         return text.strip()
     
-    def search(self, variant_info: Dict[str, str], pmid_list: List[str] = None) -> List[Dict]:
+    def search(self, variant_info: Dict[str, str], pmid_list: List[str] = None, variant_aliases: Optional[List[str]] = None) -> List[Dict]:
         """
         Search PubMed and fetch articles with full text support
         
         Args:
             variant_info: Variant information dictionary
             pmid_list: Optional list of PubMed IDs to fetch directly
+            variant_aliases: 變異別名列表（從 ClinVar 獲取，用於表格過濾）
         
         Returns:
             List of article dictionaries with full text when available
@@ -379,8 +385,8 @@ class EnhancedPubMedSearcher:
                 try:
                     logger.info(f"處理文章 {idx}/{len(pmid_list)}...")
                     
-                    # 解析基本資訊
-                    parsed = self._parse_article_enhanced(article, variant_info)
+                    # 解析基本資訊（傳遞 variant_aliases）
+                    parsed = self._parse_article_enhanced(article, variant_info, variant_aliases)
                     if parsed:
                         results.append(parsed)
                     
@@ -404,7 +410,7 @@ class EnhancedPubMedSearcher:
         
         return results
     
-    def _parse_article_enhanced(self, article: Dict, variant_info: Dict[str, str]) -> Dict:
+    def _parse_article_enhanced(self, article: Dict, variant_info: Dict[str, str], variant_aliases: Optional[List[str]] = None) -> Dict:
         """解析文章並嘗試獲取全文"""
         try:
             medline = article['MedlineCitation']
@@ -438,9 +444,9 @@ class EnhancedPubMedSearcher:
             has_docling = False
             
             if self.try_full_text:
-                # 優先嘗試使用 docling 處理 PDF
+                # 優先嘗試使用 docling 處理 PDF（傳遞 variant_aliases 進行表格過濾）
                 if self.use_docling and self.docling_processor:
-                    docling_result = self._try_fetch_with_docling(pmid)
+                    docling_result = self._try_fetch_with_docling(pmid, variant_aliases)
                     if docling_result:
                         docling_content = docling_result.get('priority_content', '')
                         has_docling = True

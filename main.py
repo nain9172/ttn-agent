@@ -6,6 +6,7 @@ Fixes for variant-specific extraction
 
 import argparse
 import sys
+import os
 from pathlib import Path
 from datetime import datetime
 
@@ -17,8 +18,20 @@ from config import (
     LOCAL_LLM_BACKEND,
     LOCAL_LLM_MODEL,
     LOCAL_LLM_TENSOR_PARALLEL,
-    ENABLE_LITVAR_SEARCH
+    LOCAL_LLM_MAX_MODEL_LEN,
+    LOCAL_LLM_MAX_CONTEXT_LENGTH,
+    ENABLE_LITVAR_SEARCH,
+    TRITON_PTXAS_PATH
 )
+
+# Try to get ENABLE_EASY_PROMPT setting
+try:
+    from config import ENABLE_EASY_PROMPT
+except ImportError:
+    ENABLE_EASY_PROMPT = False
+
+# 設定 Triton PTXAS 環境變數（用於 vLLM 編譯）
+os.environ['TRITON_PTXAS_PATH'] = TRITON_PTXAS_PATH
 
 # Try to get enhanced PubMed settings
 try:
@@ -37,6 +50,7 @@ from utils.variant_parser import parse_variant
 from utils.evo2_predictor import Evo2Predictor
 from utils.clinvar_parser import ClinVarParser
 from utils.litvar_search import LitVarSearcher
+from utils.variant_utils import get_variant_aliases
 # Try to import enhanced PubMed searcher, fallback to standard
 try:
     from utils.enhanced_pubmed_search import EnhancedPubMedSearcher
@@ -171,8 +185,20 @@ def main():
         # Step 4: PubMed Search
         logger.info("Step 4: Searching PubMed...")
         
+        # 從 ClinVar 信息生成變異別名（用於表格過濾）
+        variant_id = f"{variant_info['chrom']}-{variant_info['pos']}-{variant_info['ref']}-{variant_info['alt']}"
+        variant_aliases = get_variant_aliases(variant_id, clinvar_info)
+        logger.info(f"從 ClinVar 獲取 {len(variant_aliases)} 個變異別名用於表格過濾")
+        
         # Initialize PubMed searcher (enhanced or standard)
-        if ENHANCED_AVAILABLE and ENABLE_FULL_TEXT_FETCH:
+        # 如果啟用 EASY_PROMPT，跳過全文下載和 docling 處理
+        if ENABLE_EASY_PROMPT:
+            logger.info("使用標準 PubMed 搜尋器（EASY_PROMPT 模式：僅摘要，跳過全文下載和 Docling 處理）")
+            if ENHANCED_AVAILABLE:
+                pubmed_searcher = PUBMED_SEARCHER_CLASS(try_full_text=False, use_docling=False)
+            else:
+                pubmed_searcher = PUBMED_SEARCHER_CLASS()
+        elif ENHANCED_AVAILABLE and ENABLE_FULL_TEXT_FETCH:
             use_docling = ENABLE_DOCLING_PDF
             logger.info("使用增強版 PubMed 搜尋器（支持全文獲取）")
             if use_docling:
@@ -195,21 +221,27 @@ def main():
         if clinvar_info and clinvar_info.get('pmid_list'):
             pmid_list = clinvar_info.get('pmid_list')
             logger.info(f"使用 ClinVar 提供的 {len(pmid_list)} 個精確 PubMed IDs")
-            pubmed_results = pubmed_searcher.search(variant_info, pmid_list=pmid_list)
+            pubmed_results = pubmed_searcher.search(variant_info, pmid_list=pmid_list, variant_aliases=variant_aliases)
             logger.info(f"成功獲取 {len(pubmed_results)} 篇 ClinVar 相關文獻")
         else:
             logger.warning("ClinVar 未提供 PubMed IDs，報告將不包含文獻（避免不相關文章）")
             logger.info("如需查看文獻，請確認該變異在 ClinVar 資料庫中有記錄")
         
         # Step 4a: LitVar Search (BEFORE clinical extraction so articles are processed together)
-        if ENABLE_LITVAR_SEARCH:
+        # 如果啟用 EASY_PROMPT，跳過 LitVar 搜尋
+        if ENABLE_EASY_PROMPT:
+            logger.info("Step 4a: Skipped LitVar search (EASY_PROMPT mode)")
+        elif ENABLE_LITVAR_SEARCH:
             logger.info("Step 4a: Searching LitVar using rsID...")
-            litvar_searcher = LitVarSearcher(use_docling=ENABLE_DOCLING_PDF)
+            # 在 EASY_PROMPT 模式下不使用 docling
+            use_docling_for_litvar = False if ENABLE_EASY_PROMPT else ENABLE_DOCLING_PDF
+            litvar_searcher = LitVarSearcher(use_docling=use_docling_for_litvar)
             
             # LitVar uses rsID to search - this is extracted from clinvar_info
             litvar_results = litvar_searcher.search_multiple_formats(
                 variant_info=variant_info,
                 clinvar_info=clinvar_info,  # Contains rsid from ClinVar
+                variant_aliases=variant_aliases,  # 傳遞別名用於表格過濾
                 max_results=20
             )
             
@@ -243,11 +275,15 @@ def main():
                 logger.info(f"Using LLM backend: {backend}")
                 logger.info(f"Using model: {model}")
                 logger.info(f"Tensor parallel size: {LOCAL_LLM_TENSOR_PARALLEL}")
+                logger.info(f"Max model length: {LOCAL_LLM_MAX_MODEL_LEN} tokens")
+                logger.info(f"Max context length: {LOCAL_LLM_MAX_CONTEXT_LENGTH} chars")
                 
                 extractor = LocalClinicalExtractor(
                     backend=backend,
                     model_name=model,
-                    tensor_parallel_size=LOCAL_LLM_TENSOR_PARALLEL
+                    tensor_parallel_size=LOCAL_LLM_TENSOR_PARALLEL,
+                    max_model_len=LOCAL_LLM_MAX_MODEL_LEN,
+                    max_context_length=LOCAL_LLM_MAX_CONTEXT_LENGTH
                 )
                 
                 # 批次擷取臨床資訊
@@ -307,8 +343,19 @@ def main():
         if args.output:
             output_path = Path(args.output)
         else:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            output_path = OUTPUT_DIR / f"variant_report_{timestamp}.html"
+            # 使用 variant_id 作為檔名（格式：chrom-pos-ref-alt）
+            variant_id = f"{variant_info['chrom']}-{variant_info['pos']}-{variant_info['ref']}-{variant_info['alt']}"
+            
+            # 取得 LLM 模型名稱並簡化（去除路徑前綴）
+            if ENABLE_LOCAL_CLINICAL_EXTRACTION and not args.skip_clinical_extraction and pubmed_results:
+                model_name = args.llm_model or LOCAL_LLM_MODEL
+                model_name_short = model_name.split('/')[-1] if '/' in model_name else model_name
+                # 清理模型名稱中的特殊字元，確保檔名合法
+                model_name_short = model_name_short.replace(':', '-').replace(' ', '_')
+            else:
+                model_name_short = "no-llm"
+            
+            output_path = OUTPUT_DIR / f"{variant_id}_{model_name_short}.html"
         
         # Pass aggregated stats to report generator
         import inspect
