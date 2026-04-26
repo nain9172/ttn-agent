@@ -234,20 +234,20 @@ class AccuracyEvaluator:
         variants = self.read_clinvar_csv(csv_path)
         self.stats['total'] = len(variants)
         
-        print(f"\n{'='*70}")
-        print(f"開始處理 {len(variants)} 個變異")
-        print(f"{'='*70}\n")
+        # print(f"\n{'='*70}")
+        # print(f"開始處理 {len(variants)} 個變異")
+        # print(f"{'='*70}\n")
         
         # 評估每個變異
         for idx, variant_data in enumerate(variants, 1):
             variant_str = f"{variant_data['chr']}-{variant_data['position']}-{variant_data['ref']}-{variant_data['alt']}"
             
             # 即時顯示當前處理的變異
-            print(f"\r[{idx}/{len(variants)}] 處理中: {variant_str}", end='', flush=True)
+            # print(f"\r[{idx}/{len(variants)}] 處理中: {variant_str}", end='', flush=True)
             
-            self.logger.info(f"\n{'='*70}")
-            self.logger.info(f"評估變異 {idx}/{len(variants)}: {variant_str}")
-            self.logger.info(f"{'='*70}")
+            # self.logger.info(f"\n{'='*70}")
+            # self.logger.info(f"評估變異 {idx}/{len(variants)}: {variant_str}")
+            # self.logger.info(f"{'='*70}")
             
             result = self.evaluate_variant(variant_data)
             self.detailed_results.append(result)
@@ -261,18 +261,18 @@ class AccuracyEvaluator:
             evo2_pred = result.get('evo2_prediction', 'N/A')
             
             # 清除之前的行並顯示完整信息
-            print(f"\r[{idx}/{len(variants)}] {variant_str} | ClinVar: {clinvar_label} | Evo2: {evo2_pred} | 準確率: {metrics['accuracy']:.1%} ({metrics['evaluated']} 個已評估)")
+            # print(f"\r[{idx}/{len(variants)}] {variant_str} | ClinVar: {clinvar_label} | Evo2: {evo2_pred} | 準確率: {metrics['accuracy']:.1%} ({metrics['evaluated']} 個已評估)")
             
             # 每10個顯示詳細統計
             if idx % 10 == 0:
-                print(f"  ├─ 致病: {self.stats['clinvar_labels']['pathogenic']}, 良性: {self.stats['clinvar_labels']['benign']}")
+                # print(f"  ├─ 致病: {self.stats['clinvar_labels']['pathogenic']}, 良性: {self.stats['clinvar_labels']['benign']}")
                 if metrics['evaluated'] > 0:
                     cm = metrics['confusion_matrix']
-                    print(f"  └─ TP:{cm['true_positive']} TN:{cm['true_negative']} FP:{cm['false_positive']} FN:{cm['false_negative']}")
+        #             print(f"  └─ TP:{cm['true_positive']} TN:{cm['true_negative']} FP:{cm['false_positive']} FN:{cm['false_negative']}")
         
-        print(f"\n{'='*70}")
-        print("評估完成！")
-        print(f"{'='*70}\n")
+        # print(f"\n{'='*70}")
+        # print("評估完成！")
+        # print(f"{'='*70}\n")
         
         # 計算最終指標
         final_metrics = self.calculate_metrics()
@@ -368,7 +368,7 @@ def main():
     parser.add_argument(
         'csv_file',
         type=str,
-        default='/home/ryan910702/ttn_agent/data/clinvar_result_with_ref_alt.csv',
+        default='/home/ryan910702/ttn-agent/data/clinvar_result_with_ref_alt.csv',
         nargs='?',
         help='ClinVar CSV 檔案路徑'
     )
@@ -408,14 +408,14 @@ def main():
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         output_dir = OUTPUT_DIR / f"evaluation_{timestamp}"
     
-    logger.info(f"輸出目錄: {output_dir}")
+    # logger.info(f"輸出目錄: {output_dir}")
     
     # 創建評估器
     evaluator = AccuracyEvaluator(skip_evo2=args.skip_evo2)
     
     # 如果有限制，只讀取部分變異
     if args.limit:
-        logger.info(f"限制評估數量: {args.limit}")
+        # logger.info(f"限制評估數量: {args.limit}")
         # 修改讀取邏輯以支持限制
         original_read = evaluator.read_clinvar_csv
         def limited_read(path):
@@ -424,9 +424,9 @@ def main():
         evaluator.read_clinvar_csv = limited_read
     
     # 評估數據集
-    logger.info("\n" + "="*70)
-    logger.info("開始評估 TTN Agent 精準度")
-    logger.info("="*70 + "\n")
+    # logger.info("\n" + "="*70)
+    # logger.info("開始評估 TTN Agent 精準度")
+    # logger.info("="*70 + "\n")
     
     metrics = evaluator.evaluate_dataset(csv_path)
     
@@ -434,20 +434,20 @@ def main():
     evaluator.save_results(metrics, output_dir)
     
     # 顯示結果
-    print("\n" + "="*70)
-    print("評估完成！")
-    print("="*70)
-    print(f"\n總變異數:     {metrics['total_variants']}")
-    print(f"成功處理:     {metrics['processed']}")
-    print(f"失敗:         {metrics['failed']}")
-    print(f"參與評估:     {metrics['evaluated']}")
-    print(f"\n準確率:       {metrics['accuracy']:.2%}")
-    print(f"精確率:       {metrics['precision']:.2%}")
-    print(f"召回率:       {metrics['recall']:.2%}")
-    print(f"特異性:       {metrics['specificity']:.2%}")
-    print(f"F1 分數:      {metrics['f1_score']:.4f}")
-    print(f"\n輸出目錄:     {output_dir}")
-    print("="*70 + "\n")
+    # print("\n" + "="*70)
+    # print("評估完成！")
+    # print("="*70)
+    # print(f"\n總變異數:     {metrics['total_variants']}")
+    # print(f"成功處理:     {metrics['processed']}")
+    # print(f"失敗:         {metrics['failed']}")
+    # print(f"參與評估:     {metrics['evaluated']}")
+    # print(f"\n準確率:       {metrics['accuracy']:.2%}")
+    # print(f"精確率:       {metrics['precision']:.2%}")
+    # print(f"召回率:       {metrics['recall']:.2%}")
+    # print(f"特異性:       {metrics['specificity']:.2%}")
+    # print(f"F1 分數:      {metrics['f1_score']:.4f}")
+    # print(f"\n輸出目錄:     {output_dir}")
+    # print("="*70 + "\n")
     
     return 0
 

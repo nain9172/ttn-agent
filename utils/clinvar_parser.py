@@ -175,6 +175,9 @@ class ClinVarParser:
                     # 解析並獲取 PubMed IDs
                     result = self._parse_clinvar_summary(summary, variant_info, [clinvar_id])
                     if result:
+                        # 儲存 ClinVar 頁面連結
+                        result['clinvar_url'] = f"https://www.ncbi.nlm.nih.gov/clinvar/variation/{clinvar_id}/"
+                        result['clinvar_variation_id'] = clinvar_id
                         # 只要能解析出結果就返回，不管是否有 PubMed IDs
                         if result.get('pmid_list'):
                             logger.info(f"成功從 ClinVar 提取資訊（含 {len(result['pmid_list'])} 個 PubMed IDs）")
@@ -594,8 +597,8 @@ class ClinVarParser:
             
             variation_id = variation_id_match.group(1)
             logger.info(f"找到 ClinVar variation ID: {variation_id}")
-            
-            # 訪問詳細頁面
+
+            # 詳細頁面 URL（同時作為報告超連結用）
             detail_url = f"https://www.ncbi.nlm.nih.gov{variation_link}" if not variation_link.startswith('http') else variation_link
             response = requests.get(detail_url, headers=headers, timeout=15)
             response.raise_for_status()
@@ -653,9 +656,13 @@ class ClinVarParser:
             # 提取 PMID（只從 germline classification 區塊）
             pmid_list = self._extract_germline_pmids_from_soup(soup)
             result['pmid_list'] = pmid_list
-            
+
+            # 儲存 ClinVar 頁面連結
+            result['clinvar_url'] = detail_url
+            result['clinvar_variation_id'] = variation_id
+
             logger.info(f"網頁抓取結果: {len(pmid_list)} 個 PMIDs, 臨床意義: {result['clinical_significance']}")
-            
+
             return result if result['pmid_list'] or result['clinical_significance'] != 'Not specified' else None
             
         except Exception as e:

@@ -4,6 +4,25 @@ Configuration file
 import os
 from pathlib import Path
 
+# 自動載入 .env（如果存在）
+def _load_dotenv():
+    env_path = Path(__file__).parent / ".env"
+    if not env_path.exists():
+        return
+    with open(env_path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip()
+            value = value.strip()
+            # 只在環境變數尚未設定時才套用（讓 shell 的設定優先）
+            if key and value and key not in os.environ:
+                os.environ[key] = value
+
+_load_dotenv()
+
 # Paths
 PROJECT_ROOT = Path(__file__).parent
 OUTPUT_DIR = PROJECT_ROOT / "outputs"
@@ -22,9 +41,12 @@ REFERENCE_GENOME_PATH = DATA_DIR / "sequence.fasta"
 TTN_SEQUENCE_START = 178807423
 TTN_SEQUENCE_END = 178525989
 
-# PubMed
-PUBMED_EMAIL = os.getenv("PUBMED_EMAIL", "your.email@example.com")
-PUBMED_API_KEY = os.getenv("PUBMED_API_KEY", "")
+# PubMed / ClinVar / NCBI API 認證
+# email 是 NCBI 必要欄位；API Key 可提高速率限制（3→10 req/s）
+# 在 .env 中設定 PUBMED_EMAIL / PUBMED_API_KEY，或透過 shell 環境變數傳入
+PUBMED_EMAIL = os.getenv("PUBMED_EMAIL", "ryan910702@gmail.com")
+_raw_api_key = os.getenv("PUBMED_API_KEY", "987512860b8bf8e96a09d672b03ff32e2c08")
+PUBMED_API_KEY = _raw_api_key if _raw_api_key not in ("", "your_api_key_here") else ""
 PUBMED_MAX_RESULTS = 50
 ENABLE_FULL_TEXT_FETCH = True
 MAX_TEXT_LENGTH = 80000  # 增加到 80K 字元，充分利用 MedGemma 的長 context 能力（最高 128K tokens）

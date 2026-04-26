@@ -1,0 +1,10 @@
+models:
+  - model: gemma3-thinking1
+    parameters:
+      weight: 1.0
+  - model: google/medgemma-27b-it
+    parameters: 
+      weight: 1.618033988749
+merge_method: nuslerp
+tokenizer_source: google/medgemma-27b-it
+dtype: bfloat16

@@ -159,21 +159,126 @@ class LocalClinicalExtractor:
         )
         logger.info(f"Extracting from {len(articles)} articles. Target: {variant_id}")
 
-        enriched = []
-        for article in articles:
-            if not any([article.get("title"), article.get("abstract"), article.get("full_text")]):
+        aliases = get_variant_aliases(variant_id, clinvar_info)
+
+        # Filter out completely empty articles early
+        valid_articles = [
+            a for a in articles
+            if any([a.get("title"), a.get("abstract"), a.get("full_text")])
+        ]
+
+        # ── Phase 1: Build contexts and prompts for all articles ──────────────
+        # Each entry: (article, raw_text, context, prompt_or_None)
+        pipeline: List[tuple] = []
+        for article in valid_articles:
+            raw_text = (
+                article.get("text_for_llm")
+                or article.get("full_text")
+                or article.get("abstract")
+                or ""
+            )
+            context = self._prepare_context(raw_text, aliases, article)
+            if len(context.strip()) < 50:
+                pipeline.append((article, raw_text, context, None))
                 continue
-            info = self._extract_single(article, variant_id, clinvar_info)
+
+            if not ENABLE_EASY_PROMPT and self.backend == "vllm":
+                prompt = self._build_prompt(context, aliases, variant_id)
+            else:
+                prompt = None
+            pipeline.append((article, raw_text, context, prompt))
+
+        # ── Phase 2: Batch vLLM inference (one call for all articles) ─────────
+        # Only used when backend == "vllm" and ENABLE_EASY_PROMPT is False
+        prompt_indices: List[int] = []
+        prompts_to_run: List[str] = []
+        for i, (_, _, _, prompt) in enumerate(pipeline):
+            if prompt is not None:
+                prompt_indices.append(i)
+                prompts_to_run.append(prompt)
+
+        batch_outputs: List[str] = []
+        if prompts_to_run:
+            logger.info(f"  Running vLLM batch inference on {len(prompts_to_run)} prompts...")
+            try:
+                raw_outputs = self.llm.generate(prompts_to_run, self.sampling_params)
+                batch_outputs = [o.outputs[0].text for o in raw_outputs]
+                logger.info(f"  vLLM batch inference complete.")
+            except Exception as e:
+                logger.error(f"vLLM batch inference error: {e}")
+                batch_outputs = [""] * len(prompts_to_run)
+
+        # Map batch output index → pipeline index
+        output_map: Dict[int, str] = {
+            pipeline_idx: batch_outputs[out_idx]
+            for out_idx, pipeline_idx in enumerate(prompt_indices)
+        }
+
+        # ── Phase 3: Parse results, apply regex fallback, log ─────────────────
+        enriched: List[Dict] = []
+        for i, (article, raw_text, context, prompt) in enumerate(pipeline):
+            pmid = article.get("pmid", "unknown")
+
+            if prompt is None:
+                # Text too short or easy-prompt mode: skip LLM
+                llm_result = None
+            else:
+                raw = output_map.get(i, "")
+                self._log_prompt_response(pmid, prompt, raw, variant_id)
+                try:
+                    data = self._robust_json_parse(raw)
+                    data["raw_llm_output"] = raw
+                    data["extraction_source"] = "llm"
+                    llm_result = data
+                except Exception as e:
+                    logger.error(f"Parse error for PMID {pmid}: {e}")
+                    llm_result = None
+
+            # Ollama fallback (non-batched path, used only when backend != vllm)
+            if self.backend != "vllm" and not ENABLE_EASY_PROMPT and prompt is not None:
+                try:
+                    raw = self._generate_ollama(prompt)
+                    self._log_prompt_response(pmid, prompt, raw, variant_id)
+                    data = self._robust_json_parse(raw)
+                    data["raw_llm_output"] = raw
+                    data["extraction_source"] = "llm"
+                    llm_result = data
+                except Exception as e:
+                    logger.error(f"LLM extraction error for PMID {pmid}: {e}")
+                    llm_result = None
+
+            # Regex fallback if LLM gave "Not specified" or failed
+            if llm_result is None or llm_result.get("disease") in ("Not specified", None, ""):
+                regex_result = self._regex_extract(raw_text, aliases, article)
+                if regex_result.get("disease") not in ("Not specified", None):
+                    if llm_result:
+                        merged = llm_result.copy()
+                        for key in ("disease", "tissue_affected", "age_onset", "inheritance"):
+                            if merged.get(key) in ("Not specified", None, ""):
+                                merged[key] = regex_result.get(key, "Not specified")
+                        merged["extraction_source"] = "llm+regex"
+                        info = merged
+                    else:
+                        info = regex_result
+                else:
+                    info = llm_result if llm_result else self._get_empty_result("All methods failed")
+            else:
+                info = llm_result
+
+            # Handle text-too-short case
+            if prompt is None and not ENABLE_EASY_PROMPT and len(context.strip()) < 50:
+                info = self._get_empty_result("Text too short")
+
             article["clinical_info"] = info
 
             if info.get("disease") not in ("Not specified", None):
                 logger.info(
-                    f"  [+] PMID {article.get('pmid')}: "
+                    f"  [+] PMID {pmid}: "
                     f"{info.get('disease')} | {info.get('tissue_affected')} | "
-                    f"source={info.get('extraction_source','llm')}"
+                    f"source={info.get('extraction_source', 'llm')}"
                 )
             else:
-                logger.info(f"  [-] PMID {article.get('pmid')}: No relevant info found")
+                logger.info(f"  [-] PMID {pmid}: No relevant info found")
 
             enriched.append(article)
         return enriched
@@ -181,6 +286,7 @@ class LocalClinicalExtractor:
     def _extract_single(
         self, article: Dict, variant_id: str, clinvar_info: Optional[Dict]
     ) -> Dict:
+        """Single-article extraction (kept for backward compatibility; not used by batch_extract)."""
         raw_text = (
             article.get("text_for_llm")
             or article.get("full_text")
@@ -189,13 +295,11 @@ class LocalClinicalExtractor:
         )
         aliases = get_variant_aliases(variant_id, clinvar_info)
 
-        # Build structured context with labelled sections
         context = self._prepare_context(raw_text, aliases, article)
 
         if len(context.strip()) < 50:
             return self._get_empty_result("Text too short")
 
-        # ── Step 1: Try LLM extraction ────────────────────────────────────────
         llm_result = None
         if not ENABLE_EASY_PROMPT:
             prompt = self._build_prompt(context, aliases, variant_id)
@@ -214,11 +318,9 @@ class LocalClinicalExtractor:
             except Exception as e:
                 logger.error(f"LLM extraction error for PMID {pmid}: {e}")
 
-        # ── Step 2: Regex fallback (always run if LLM gave "Not specified") ──
         if llm_result is None or llm_result.get("disease") in ("Not specified", None, ""):
             regex_result = self._regex_extract(raw_text, aliases, article)
             if regex_result.get("disease") not in ("Not specified", None):
-                # Merge: prefer LLM values where non-empty, fill gaps with regex
                 if llm_result:
                     merged = llm_result.copy()
                     for key in ("disease", "tissue_affected", "age_onset", "inheritance"):

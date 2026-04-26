@@ -46,8 +46,7 @@ class HTMLReportGenerator:
             evo2_result,
             pubmed_results,
             image_base64,
-            clinvar_info
-            # aggregated_stats is no longer passed to _generate_html
+            clinvar_info,
         )
         
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -87,7 +86,7 @@ class HTMLReportGenerator:
 </head>
 <body>
     <div class="container">
-        {self._generate_header(variant_info)}
+        {self._generate_header(variant_info, clinvar_info)}
         {self._generate_summary_section(variant_info, evo2_result)}
         {self._generate_evo2_section(evo2_result)}
         {self._generate_image_section(image_base64, variant_info)}
@@ -118,6 +117,8 @@ class HTMLReportGenerator:
         header {{ background: {REPORT_HEADER_COLOR}; color: white; padding: 30px; text-align: center; }}
         header h1 {{ font-size: 2.5em; margin-bottom: 10px; }}
         header .subtitle {{ font-size: 1.2em; opacity: 0.9; }}
+        header .clinvar-link {{ color: #7ecfff; text-decoration: underline dotted; }}
+        header .clinvar-link:hover {{ color: #ffffff; text-decoration: underline; }}
         .section {{ padding: 30px; border-bottom: 1px solid #eee; }}
         .section h2 {{
             color: {REPORT_HEADER_COLOR};
@@ -158,8 +159,28 @@ class HTMLReportGenerator:
         footer {{ background: #f8f9fa; padding: 20px; text-align: center; color: #666; font-size: 0.9em; }}
         """
 
-    def _generate_header(self, variant_info: Dict) -> str:
-        return f"""<header><h1>{REPORT_TITLE}</h1><div class="subtitle">Variant: {variant_info['variant_id']}<br>Generated: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}</div></header>"""
+    def _generate_header(self, variant_info: Dict, clinvar_info: Optional[Dict] = None) -> str:
+        variant_id = variant_info['variant_id']
+        clinvar_url = clinvar_info.get('clinvar_url') if clinvar_info else None
+
+        if clinvar_url:
+            variant_display = (
+                f'Variant: <a href="{html.escape(clinvar_url)}" '
+                f'target="_blank" rel="noopener" class="clinvar-link">'
+                f'{html.escape(variant_id)}</a>'
+            )
+        else:
+            variant_display = f"Variant: {html.escape(variant_id)}"
+
+        return (
+            f'<header>'
+            f'<h1>{REPORT_TITLE}</h1>'
+            f'<div class="subtitle">'
+            f'{variant_display}<br>'
+            f'Generated: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}'
+            f'</div>'
+            f'</header>'
+        )
 
     def _generate_summary_section(self, variant_info: Dict, evo2_result: Optional[Dict]) -> str:
         pred = evo2_result['prediction'].upper() if evo2_result and evo2_result.get('success') else "N/A"

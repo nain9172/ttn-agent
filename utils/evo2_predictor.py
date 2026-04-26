@@ -180,14 +180,11 @@ class Evo2Predictor:
                     'error': 'Reference sequence mismatch or parsing error'
                 }
             
-            # Score sequences
-            logger.info("Scoring reference sequence...")
-            ref_scores = self.model.score_sequences([ref_seq])
-            ref_score = float(ref_scores[0])
-            
-            logger.info("Scoring variant sequence...")
-            var_scores = self.model.score_sequences([var_seq])
-            var_score = float(var_scores[0])
+            # Score both sequences in a single batch call (ref + var together)
+            logger.info("Scoring reference and variant sequences (batched)...")
+            both_scores = self.model.score_sequences([ref_seq, var_seq])
+            ref_score = float(both_scores[0])
+            var_score = float(both_scores[1])
             
             # Calculate delta score
             delta_score = var_score - ref_score

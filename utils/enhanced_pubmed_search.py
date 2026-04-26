@@ -6,7 +6,9 @@ Enhanced PubMed Search Module with Full Text Support
 import logging
 import time
 import re
+import threading
 import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional
 from bs4 import BeautifulSoup
 
@@ -58,10 +60,13 @@ class EnhancedPubMedSearcher:
         'G': 'C', 'C': 'G'
     }
     
+    # Lock for Entrez API calls (biopython is not thread-safe)
+    _entrez_lock = threading.Lock()
+
     def __init__(self, try_full_text: bool = True, max_text_length: int = 8000, use_docling: bool = True):
         """
         Initialize enhanced PubMed searcher
-        
+
         Args:
             try_full_text: 是否嘗試獲取全文（默認 True）
             max_text_length: 最大文本長度（默認 8000 字元，適合 LLM）
@@ -152,34 +157,35 @@ class EnhancedPubMedSearcher:
         return None
     
     def _try_fetch_from_pmc(self, pmid: str) -> Optional[str]:
-        """從 PubMed Central 獲取全文"""
+        """從 PubMed Central 獲取全文（使用 lock 保護 Entrez，以支援多執行緒）"""
         try:
-            # 先查詢是否在 PMC 中
-            handle = Entrez.elink(
-                dbfrom="pubmed",
-                db="pmc",
-                id=pmid,
-                linkname="pubmed_pmc"
-            )
-            result = Entrez.read(handle)
-            handle.close()
-            
+            # Entrez 非 thread-safe，使用 class-level lock 序列化所有呼叫
+            with self.__class__._entrez_lock:
+                handle = Entrez.elink(
+                    dbfrom="pubmed",
+                    db="pmc",
+                    id=pmid,
+                    linkname="pubmed_pmc"
+                )
+                result = Entrez.read(handle)
+                handle.close()
+
             # 檢查是否有 PMC ID
             if not result[0]['LinkSetDb']:
                 return None
-            
+
             pmc_id = result[0]['LinkSetDb'][0]['Link'][0]['Id']
-            
+
             # 獲取全文
-            handle = Entrez.efetch(
-                db="pmc",
-                id=pmc_id,
-                rettype="xml"
-            )
-            
-            # 解析 XML
-            xml_content = handle.read()
-            handle.close()
+            with self.__class__._entrez_lock:
+                handle = Entrez.efetch(
+                    db="pmc",
+                    id=pmc_id,
+                    rettype="xml"
+                )
+                # 解析 XML
+                xml_content = handle.read()
+                handle.close()
             
             # 使用 BeautifulSoup 提取文本
             soup = BeautifulSoup(xml_content, 'xml')
@@ -369,7 +375,7 @@ class EnhancedPubMedSearcher:
             if self.try_full_text:
                 logger.info("將嘗試獲取全文（如果可用）")
             
-            # 批次獲取基本資訊
+            # 批次獲取所有文章 metadata（一次 API call）
             time.sleep(0.5)
             handle = Entrez.efetch(
                 db="pubmed",
@@ -379,27 +385,43 @@ class EnhancedPubMedSearcher:
             )
             articles = Entrez.read(handle)
             handle.close()
-            
-            # 處理每篇文章
-            for idx, article in enumerate(articles['PubmedArticle'], 1):
+
+            # Step 1: 解析所有文章的基本 metadata（本地操作，不需要 I/O）
+            metas = []
+            for article in articles['PubmedArticle']:
                 try:
-                    logger.info(f"處理文章 {idx}/{len(pmid_list)}...")
-                    
-                    # 解析基本資訊（傳遞 variant_aliases）
-                    parsed = self._parse_article_enhanced(article, variant_info, variant_aliases)
-                    if parsed:
-                        results.append(parsed)
-                    
-                    # 避免請求過快
-                    if idx < len(pmid_list):
-                        time.sleep(0.5)
-                        
+                    meta = self._parse_article_metadata(article)
+                    if meta:
+                        metas.append(meta)
                 except Exception as e:
-                    logger.warning(f"解析文章時出錯: {e}")
-                    continue
-            
+                    logger.warning(f"解析 metadata 時出錯: {e}")
+
+            logger.info(f"解析了 {len(metas)} 篇文章 metadata")
+
+            # Step 2: 並行獲取全文 / Docling（I/O bound，可安全並行）
+            if self.try_full_text and metas:
+                # 最多 4 個 workers 以符合 NCBI 速率限制（API key 最多 10 req/s）
+                max_workers = min(len(metas), 4)
+                logger.info(f"以 {max_workers} 個 worker 並行獲取全文...")
+
+                def _fetch_worker(meta):
+                    try:
+                        return self._enrich_with_full_text(meta, variant_aliases)
+                    except Exception as e:
+                        logger.warning(f"全文獲取失敗 (PMID {meta.get('pmid')}): {e}")
+                        return meta  # 回傳僅有 metadata 的版本
+
+                with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    future_to_meta = {executor.submit(_fetch_worker, m): m for m in metas}
+                    for future in as_completed(future_to_meta):
+                        enriched = future.result()
+                        if enriched:
+                            results.append(enriched)
+            else:
+                results = metas
+
             logger.info(f"成功獲取 {len(results)} 篇文章")
-            
+
             # 統計全文獲取情況
             full_text_count = sum(1 for r in results if r.get('has_full_text'))
             if full_text_count > 0:
@@ -410,64 +432,32 @@ class EnhancedPubMedSearcher:
         
         return results
     
-    def _parse_article_enhanced(self, article: Dict, variant_info: Dict[str, str], variant_aliases: Optional[List[str]] = None) -> Dict:
-        """解析文章並嘗試獲取全文"""
+    def _parse_article_metadata(self, article: Dict) -> Optional[Dict]:
+        """
+        Phase 1: 從已下載的 Entrez 結果中解析基本 metadata（純本地操作，無 I/O）。
+        傳回的 dict 包含 pmid, title, abstract, doi, authors, journal, year 等欄位，
+        full_text / docling_content 欄位留空，等待 _enrich_with_full_text 填入。
+        """
         try:
             medline = article['MedlineCitation']
-            
-            # 提取基本資訊
             pmid = str(medline['PMID'])
             article_data = medline['Article']
-            
+
             title = article_data.get('ArticleTitle', '')
-            
-            # 提取摘要
+
             abstract = article_data.get('Abstract', {}).get('AbstractText', [''])
             if isinstance(abstract, list):
                 abstract = ' '.join(str(a) for a in abstract)
             else:
                 abstract = str(abstract)
-            
-            # 提取 DOI
+
             doi = None
             if 'PubmedData' in article:
-                article_ids = article['PubmedData'].get('ArticleIdList', [])
-                for article_id in article_ids:
+                for article_id in article['PubmedData'].get('ArticleIdList', []):
                     if article_id.attributes.get('IdType') == 'doi':
                         doi = str(article_id)
                         break
-            
-            # 嘗試獲取全文
-            full_text = None
-            has_full_text = False
-            docling_content = None
-            has_docling = False
-            
-            if self.try_full_text:
-                # 優先嘗試使用 docling 處理 PDF（傳遞 variant_aliases 進行表格過濾）
-                if self.use_docling and self.docling_processor:
-                    docling_result = self._try_fetch_with_docling(pmid, variant_aliases)
-                    if docling_result:
-                        docling_content = docling_result.get('priority_content', '')
-                        has_docling = True
-                        has_full_text = True
-                        logger.info(f"PMID {pmid}: 使用 Docling 提取優先內容 ({len(docling_content)} 字元)")
-                
-                # 如果 docling 失敗，使用傳統方式獲取全文
-                if not has_docling:
-                    full_text = self._try_fetch_full_text(pmid, doi)
-                    if full_text:
-                        has_full_text = True
-            
-            # 使用 docling 優先內容 > 全文 > 摘要 進行分析
-            if docling_content:
-                text_for_analysis = docling_content
-            elif full_text:
-                text_for_analysis = full_text
-            else:
-                text_for_analysis = abstract
-            
-            # 提取作者
+
             authors = []
             author_list = article_data.get('AuthorList', [])
             for author in author_list[:3]:
@@ -475,17 +465,15 @@ class EnhancedPubMedSearcher:
                 init = author.get('Initials', '')
                 if last:
                     authors.append(f"{last} {init}".strip())
-            
-            # 提取期刊和年份
+
             journal = article_data.get('Journal', {})
             journal_title = journal.get('Title', '')
             pub_date = journal.get('JournalIssue', {}).get('PubDate', {})
             year = pub_date.get('Year', '')
-            
-            # 構建 PubMed 和 DOI 連結
+
             pubmed_link = f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/"
             doi_link = f"https://doi.org/{doi}" if doi else None
-            
+
             return {
                 'pmid': pmid,
                 'title': title,
@@ -493,19 +481,73 @@ class EnhancedPubMedSearcher:
                 'journal': journal_title,
                 'year': year,
                 'abstract': abstract,
-                'full_text': full_text,  # 完整文本（如果有）
-                'text_for_llm': text_for_analysis,  # 用於 LLM 分析的文本
-                'has_full_text': has_full_text,
-                'has_docling': has_docling,  # 是否使用 Docling 處理
-                'docling_content': docling_content,  # Docling 提取的優先內容
+                'full_text': None,
+                'text_for_llm': abstract,  # 先以摘要為預設，_enrich_with_full_text 會覆蓋
+                'has_full_text': False,
+                'has_docling': False,
+                'docling_content': None,
                 'doi': doi,
                 'pubmed_link': pubmed_link,
                 'doi_link': doi_link,
-                'phenotype': 'Not specified',  # 將由 LLM 提取
-                'inheritance': 'Not specified',  # 將由 LLM 提取
-                'age_onset': 'Not specified'  # 將由 LLM 提取
+                'phenotype': 'Not specified',
+                'inheritance': 'Not specified',
+                'age_onset': 'Not specified',
             }
-            
+
         except Exception as e:
-            logger.warning(f"解析文章時出錯: {e}")
+            logger.warning(f"解析 metadata 時出錯: {e}")
             return None
+
+    def _enrich_with_full_text(
+        self, meta: Dict, variant_aliases: Optional[List[str]] = None
+    ) -> Dict:
+        """
+        Phase 2: 為已有 metadata 的文章獲取全文 / Docling 內容（I/O bound，可並行）。
+        直接修改並回傳傳入的 meta dict。
+        """
+        pmid = meta['pmid']
+        doi = meta.get('doi')
+
+        full_text = None
+        has_full_text = False
+        docling_content = None
+        has_docling = False
+
+        # 優先 Docling（使用 requests 下載 PDF，thread-safe）
+        if self.use_docling and self.docling_processor:
+            docling_result = self._try_fetch_with_docling(pmid, variant_aliases)
+            if docling_result:
+                docling_content = docling_result.get('priority_content', '')
+                has_docling = True
+                has_full_text = True
+                logger.info(f"PMID {pmid}: 使用 Docling 提取優先內容 ({len(docling_content)} 字元)")
+
+        # Docling 失敗時改用傳統全文獲取（PMC XML / Europe PMC）
+        if not has_docling:
+            full_text = self._try_fetch_full_text(pmid, doi)
+            if full_text:
+                has_full_text = True
+
+        # 優先級：docling > full_text > abstract
+        if docling_content:
+            text_for_analysis = docling_content
+        elif full_text:
+            text_for_analysis = full_text
+        else:
+            text_for_analysis = meta['abstract']
+
+        meta['full_text'] = full_text
+        meta['text_for_llm'] = text_for_analysis
+        meta['has_full_text'] = has_full_text
+        meta['has_docling'] = has_docling
+        meta['docling_content'] = docling_content
+        return meta
+
+    def _parse_article_enhanced(self, article: Dict, variant_info: Dict[str, str], variant_aliases: Optional[List[str]] = None) -> Dict:
+        """解析文章並嘗試獲取全文（保留以向後相容；新流程請使用 _parse_article_metadata + _enrich_with_full_text）"""
+        meta = self._parse_article_metadata(article)
+        if meta is None:
+            return None
+        if self.try_full_text:
+            return self._enrich_with_full_text(meta, variant_aliases)
+        return meta
