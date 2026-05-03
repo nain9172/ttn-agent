@@ -46,6 +46,21 @@ try:
 except ImportError:
     ENABLE_DOCLING_PDF = False
 
+# Pre-import vLLM before Evo2/PyTorch to avoid dynamic linker symbol conflicts.
+# vLLM's _C.abi3.so must be loaded into the process before torch initialises
+# its CUDA runtime; once torch is live the required symbols are shadowed and
+# the import fails with "undefined symbol".
+_VLLM_PRELOAD_OK = False
+if ENABLE_LOCAL_CLINICAL_EXTRACTION and LOCAL_LLM_BACKEND == "vllm":
+    try:
+        import vllm as _vllm_preload  # noqa: F401
+        _VLLM_PRELOAD_OK = True
+    except Exception as _e:
+        import warnings
+        warnings.warn(
+            f"vLLM pre-import failed (clinical extraction will be skipped): {_e}"
+        )
+
 from utils.variant_parser import parse_variant
 from utils.evo2_predictor import Evo2Predictor
 from utils.clinvar_parser import ClinVarParser
@@ -260,16 +275,23 @@ def main():
         
         # Step 4.5: Extract clinical information using local LLM
         aggregated_stats = None
+        backend = args.llm_backend or LOCAL_LLM_BACKEND
+        vllm_ok = _VLLM_PRELOAD_OK if backend == "vllm" else True
         if pubmed_results and ENABLE_LOCAL_CLINICAL_EXTRACTION and not args.skip_clinical_extraction:
             logger.info("=" * 70)
             logger.info("Step 4.5: Extracting clinical information with local LLM...")
             logger.info("=" * 70)
-            
+
+            if backend == "vllm" and not vllm_ok:
+                logger.error(
+                    "vLLM pre-import failed at startup — clinical extraction skipped. "
+                    "Check that vLLM is installed and compatible with the current PyTorch build."
+                )
+
             try:
                 from utils.local_clinical_extractor import LocalClinicalExtractor
                 
-                # 使用命令行參數或配置檔案的設定
-                backend = args.llm_backend or LOCAL_LLM_BACKEND
+                # 使用命令行參數或配置檔案的設定（backend 已在外層定義）
                 model = args.llm_model or LOCAL_LLM_MODEL
                 
                 logger.info(f"Using LLM backend: {backend}")

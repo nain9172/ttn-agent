@@ -119,3 +119,6 @@ llm_logs/
 
 # PDF files
 *.pdf
+
+# Third-party submodules / large vendor directories
+flash-attention/

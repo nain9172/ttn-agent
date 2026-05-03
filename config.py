@@ -76,9 +76,8 @@ FORCE_REDOWNLOAD_SUPPLEMENTARY = False  # 是否強制重新下載已存在的 s
 
 # LLM
 LOCAL_LLM_BACKEND = "vllm" # or ollama
-# LOCAL_LLM_MODEL = "google/medgemma-27b-text-it"
 LOCAL_LLM_MODEL = "google/medgemma-27b-it"  # MedGemma-27B instruction-tuned (醫療專用，27B 參數，約需 54GB)
-# LOCAL_LLM_MODEL = "google/medgemma-1.5-4b-it"  # 更輕量的選擇（約需 8GB）
+# LOCAL_LLM_MODEL = "google/gemma-4-31B-it"
 # LOCAL_LLM_MODEL = "meta-llama/Llama-3.2-8B-Instruct"  # Llama 3.2 8B（約需 16GB）
 # LOCAL_LLM_MODEL = "google/gemma-3-27b-it"
 LOCAL_LLM_TENSOR_PARALLEL = 1  # 單 GPU 使用 1，多 GPU 可增加（例如 2 或 4）
