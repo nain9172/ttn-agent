@@ -65,11 +65,11 @@ class ImageGenerator:
         fig_height = 5 + (num_transcripts * 1.8)
         fig = plt.figure(figsize=(20, fig_height))
         
-        # Adjust spacing to prevent overlap
+        # Adjust spacing to prevent overlap (reduced hspace for tighter layout)
         gs = fig.add_gridspec(
             num_transcripts + 1, 
             1, 
-            hspace=0.8,
+            hspace=0.1,  # 減少間距從 0.8 到 0.3
             top=0.95,
             bottom=0.05,
             left=0.05,
@@ -268,6 +268,7 @@ class ImageGenerator:
             end_norm = (domain_info['end'] - first_exon + 1) / total_length
             width = end_norm - start_norm
             
+            # Draw domain rectangle without internal label
             rect = FancyBboxPatch(
                 (start_norm, y_center - height/2),
                 width,
@@ -280,19 +281,20 @@ class ImageGenerator:
             )
             ax.add_patch(rect)
             
-            label_x = start_norm + width/2
-            ax.text(
-                label_x,
-                y_center,
-                domain_name,
-                ha='center',
-                va='center',
-                fontsize=13,
-                fontweight='bold',
-                color='white' if domain_name != 'I-band' else 'black'
-            )
+            # 移除內部文字標籤
+            # label_x = start_norm + width/2
+            # ax.text(
+            #     label_x,
+            #     y_center,
+            #     domain_name,
+            #     ha='center',
+            #     va='center',
+            #     fontsize=13,
+            #     fontweight='bold',
+            #     color='white' if domain_name != 'I-band' else 'black'
+            # )
         
-        # Mark variant position
+        # Mark variant position (only line and arrow marker, no text label)
         marker_height = 0.18
         ax.plot(
             [variant_pos, variant_pos],
@@ -312,37 +314,26 @@ class ImageGenerator:
             linewidth=2
         )
         
-        ax.text(
-            variant_pos,
-            y_center + height/2 + marker_height + 0.18,
-            'Variant\nLocation',
-            ha='center',
-            va='bottom',
-            fontsize=12,
-            fontweight='bold',
-            color='red',
-            bbox=dict(boxstyle='round,pad=0.3', facecolor='white', edgecolor='red', alpha=0.8)
-        )
-        
-        # Legend
+        # Legend (增加顏色塊大小)
         legend_y = 0.08
         legend_x_start = 0.05
         legend_spacing = 0.24
         
         for idx, (domain_name, domain_info) in enumerate(TTN_DOMAINS.items()):
             legend_x = legend_x_start + (idx * legend_spacing)
+            # 增加顏色塊大小（從 0.025x0.05 增加到 0.04x0.08）
             rect = patches.Rectangle(
                 (legend_x, legend_y),
-                0.025,
-                0.05,
+                0.04,  # 增加寬度從 0.025 到 0.04
+                0.08,  # 增加高度從 0.05 到 0.08
                 facecolor=domain_info['color'],
                 edgecolor='black',
-                linewidth=1
+                linewidth=1.5  # 增加邊框粗細
             )
             ax.add_patch(rect)
             ax.text(
-                legend_x + 0.03,
-                legend_y + 0.025,
+                legend_x + 0.045,  # 調整文字位置以配合新的顏色塊大小
+                legend_y + 0.04,   # 垂直置中
                 f"{domain_name}: Exon {domain_info['start']}-{domain_info['end']}",
                 va='center',
                 fontsize=20

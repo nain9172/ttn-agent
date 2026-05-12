@@ -161,38 +161,56 @@ class ClinVarParser:
                 
                 logger.info(f"找到 {len(id_list)} 個 ClinVar 記錄")
                 
-                # 使用第一個記錄（通常是最相關的）
-                clinvar_id = id_list[0]
-                logger.info(f"  使用 ClinVar ID: {clinvar_id}")
-                
-                try:
-                    # 獲取 summary 信息
-                    time.sleep(0.34)
-                    handle = Entrez.esummary(db="clinvar", id=clinvar_id)
-                    summary = Entrez.read(handle, validate=False)
-                    handle.close()
+                # 驗證每個記錄，找到真正匹配的變異
+                for clinvar_id in id_list:
+                    logger.info(f"  檢查 ClinVar ID: {clinvar_id}")
                     
-                    # 解析並獲取 PubMed IDs
-                    result = self._parse_clinvar_summary(summary, variant_info, [clinvar_id])
-                    if result:
-                        # 儲存 ClinVar 頁面連結
-                        result['clinvar_url'] = f"https://www.ncbi.nlm.nih.gov/clinvar/variation/{clinvar_id}/"
-                        result['clinvar_variation_id'] = clinvar_id
-                        # 只要能解析出結果就返回，不管是否有 PubMed IDs
-                        if result.get('pmid_list'):
-                            logger.info(f"成功從 ClinVar 提取資訊（含 {len(result['pmid_list'])} 個 PubMed IDs）")
+                    try:
+                        # 先獲取完整的 XML 記錄以驗證變異是否匹配
+                        time.sleep(0.34)
+                        handle = Entrez.efetch(
+                            db="clinvar",
+                            id=clinvar_id,
+                            rettype="vcv",
+                            retmode="xml"
+                        )
+                        xml_record = handle.read()
+                        handle.close()
+                        
+                        # 驗證變異是否匹配
+                        if not self._verify_variant_match(xml_record, variant_info):
+                            logger.info(f"  ClinVar ID {clinvar_id} 不匹配輸入變異，跳過")
+                            continue
+                        
+                        logger.info(f"  ✓ ClinVar ID {clinvar_id} 匹配輸入變異")
+                        
+                        # 獲取 summary 信息
+                        time.sleep(0.34)
+                        handle = Entrez.esummary(db="clinvar", id=clinvar_id)
+                        summary = Entrez.read(handle, validate=False)
+                        handle.close()
+                        
+                        # 解析並獲取 PubMed IDs
+                        result = self._parse_clinvar_summary(summary, variant_info, [clinvar_id])
+                        if result:
+                            # 儲存 ClinVar 頁面連結
+                            result['clinvar_url'] = f"https://www.ncbi.nlm.nih.gov/clinvar/variation/{clinvar_id}/"
+                            result['clinvar_variation_id'] = clinvar_id
+                            # 只要能解析出結果就返回，不管是否有 PubMed IDs
+                            if result.get('pmid_list'):
+                                logger.info(f"成功從 ClinVar 提取資訊（含 {len(result['pmid_list'])} 個 PubMed IDs）")
+                            else:
+                                logger.info(f"成功從 ClinVar 提取資訊（但該記錄無關聯的 PubMed 文章）")
+                            return result
                         else:
-                            logger.info(f"成功從 ClinVar 提取資訊（但該記錄無關聯的 PubMed 文章）")
-                        return result
-                    else:
-                        logger.debug(f"  無法解析 ClinVar 記錄 {clinvar_id}")
+                            logger.debug(f"  無法解析 ClinVar 記錄 {clinvar_id}")
+                            continue
+                    
+                    except Exception as e:
+                        logger.warning(f"  處理記錄 {clinvar_id} 時出錯: {e}")
+                        import traceback
+                        logger.debug(traceback.format_exc())
                         continue
-                
-                except Exception as e:
-                    logger.warning(f"  處理記錄 {clinvar_id} 時出錯: {e}")
-                    import traceback
-                    logger.debug(traceback.format_exc())
-                    continue
             
             logger.warning(f"ClinVar 中未找到精確匹配的變異 {variant_info['variant_id']}")
             return None
@@ -200,6 +218,60 @@ class ClinVarParser:
         except Exception as e:
             logger.warning(f"ClinVar API 查詢失敗: {e}")
             return None
+    
+    def _verify_variant_match_from_page(self, soup: BeautifulSoup, variant_info: Dict[str, str]) -> bool:
+        """
+        從 ClinVar 網頁驗證變異是否匹配輸入的變異
+        
+        Args:
+            soup: BeautifulSoup 對象
+            variant_info: 輸入的變異資訊
+        
+        Returns:
+            True 如果匹配，False 否則
+        """
+        try:
+            # 取得需要匹配的資訊
+            original_pos = variant_info['pos']
+            original_ref = variant_info['ref'].upper()
+            original_alt = variant_info['alt'].upper()
+            
+            # 負鏈轉換
+            negative_strand_pos = original_pos - 1
+            negative_strand_ref = self._get_complement_base(original_ref)
+            negative_strand_alt = self._get_complement_base(original_alt)
+            
+            page_text = soup.get_text().upper()
+            
+            # 檢查位置（兩種可能性）
+            pos_match = (str(original_pos) in page_text or 
+                        str(negative_strand_pos) in page_text)
+            
+            # 檢查參考和替代鹼基
+            # 在 ClinVar 頁面中可能以不同格式出現
+            # 例如：NC_000002.12:g.178621118C>G 或 VCF 格式
+            ref_alt_patterns = [
+                f"{negative_strand_ref}>{negative_strand_alt}",  # 負鏈
+                f"{negative_strand_ref}>{negative_strand_alt}".lower(),
+                f"{original_ref}>{original_alt}",  # 原始
+                f"{original_ref}>{original_alt}".lower(),
+                f"REFERENCEALLELEVCF>{negative_strand_ref}<",
+                f"ALTERNATEALLELEVCF>{negative_strand_alt}<",
+            ]
+            
+            variant_match = any(pattern.upper() in page_text for pattern in ref_alt_patterns)
+            
+            if pos_match and variant_match:
+                logger.info(f"    ✓ 頁面變異匹配: pos={original_pos}/{negative_strand_pos}, {original_ref}/{negative_strand_ref}>{original_alt}/{negative_strand_alt}")
+                return True
+            else:
+                logger.debug(f"    變異不匹配: pos_match={pos_match}, variant_match={variant_match}")
+                return False
+            
+        except Exception as e:
+            logger.warning(f"驗證頁面變異時出錯: {e}")
+            # 如果無法驗證，保守地假設不匹配
+            return False
     
     def _verify_variant_match(self, xml_record: str, variant_info: Dict[str, str]) -> bool:
         """驗證 ClinVar 記錄是否與輸入的變異匹配（使用負鏈轉換後的坐標）"""
@@ -582,88 +654,102 @@ class ClinVarParser:
                         logger.debug(f"  從文字中找到 VCV{variation_id}")
             
             if candidate_links:
-                variation_link = candidate_links[0]
-                logger.info(f"✓ 找到 {len(candidate_links)} 個候選變異，使用第一個: {variation_link}")
+                # 遍歷所有候選連結，驗證變異是否匹配
+                for variation_link in candidate_links:
+                    try:
+                        # 提取 variation ID
+                        variation_id_match = re.search(r'/clinvar/variation/(\d+)', variation_link)
+                        if not variation_id_match:
+                            logger.debug(f"  無法從連結中提取 variation ID: {variation_link}")
+                            continue
+                        
+                        variation_id = variation_id_match.group(1)
+                        logger.info(f"  檢查 ClinVar variation ID: {variation_id}")
+                        
+                        # 詳細頁面 URL
+                        detail_url = f"https://www.ncbi.nlm.nih.gov{variation_link}" if not variation_link.startswith('http') else variation_link
+                        response = requests.get(detail_url, headers=headers, timeout=15)
+                        response.raise_for_status()
+                        
+                        soup = BeautifulSoup(response.content, 'html.parser')
+                        
+                        # 驗證此頁面的變異是否與輸入的變異匹配
+                        if not self._verify_variant_match_from_page(soup, variant_info):
+                            logger.info(f"  變異不匹配，繼續檢查下一個候選...")
+                            continue
+                        
+                        logger.info(f"  ✓ 找到匹配的 ClinVar variation ID: {variation_id}")
+                        
+                        # 提取資訊
+                        result = {
+                            'pmid_list': [],
+                            'conditions': [],
+                            'variant_impact': 'Not specified',
+                            'clinical_significance': 'Not specified',
+                            'review_status': 'Not specified'
+                        }
+                        
+                        # 提取 dbSNP ID (rsid)
+                        rsid = self._extract_rsid_from_soup(soup)
+                        if rsid:
+                            result['rsid'] = rsid
+                            logger.info(f"找到 dbSNP ID: {rsid}")
+                        
+                        # 提取臨床意義
+                        clinical_sig_elem = soup.find('span', class_=re.compile(r'clinical-significance'))
+                        if not clinical_sig_elem:
+                            # 嘗試其他方式
+                            for elem in soup.find_all(['span', 'div', 'strong']):
+                                text = elem.get_text(strip=True)
+                                if text in ['Pathogenic', 'Likely pathogenic', 'Uncertain significance', 
+                                           'Benign', 'Likely benign', 'Conflicting']:
+                                    result['clinical_significance'] = text
+                                    logger.debug(f"找到臨床意義: {text}")
+                                    break
+                        else:
+                            result['clinical_significance'] = clinical_sig_elem.get_text(strip=True)
+                        
+                        # 提取疾病/表型（從標題或條件區塊）
+                        condition_elems = soup.find_all(['span', 'div'], class_=re.compile(r'condition|trait'))
+                        for elem in condition_elems:
+                            text = elem.get_text(strip=True)
+                            if text and len(text) > 5:  # 過濾太短的文字
+                                result['conditions'].append(text)
+                        
+                        # 如果沒找到，嘗試從頁面標題提取
+                        if not result['conditions']:
+                            title = soup.find('h1')
+                            if title:
+                                title_text = title.get_text(strip=True)
+                                # 嘗試從標題中提取疾病名稱
+                                if 'cardiomyopathy' in title_text.lower() or 'muscular dystrophy' in title_text.lower():
+                                    result['conditions'].append(title_text)
+                        
+                        # 判斷影響類型
+                        result['variant_impact'] = self._determine_impact_type(result['conditions'])
+                        
+                        # 提取 PMID（只從 germline classification 區塊）
+                        pmid_list = self._extract_germline_pmids_from_soup(soup)
+                        result['pmid_list'] = pmid_list
+
+                        # 儲存 ClinVar 頁面連結
+                        result['clinvar_url'] = detail_url
+                        result['clinvar_variation_id'] = variation_id
+
+                        logger.info(f"網頁抓取結果: {len(pmid_list)} 個 PMIDs, 臨床意義: {result['clinical_significance']}")
+
+                        return result if result['pmid_list'] or result['clinical_significance'] != 'Not specified' else None
+                        
+                    except Exception as e:
+                        logger.warning(f"  處理候選連結時出錯: {e}")
+                        continue
+                
+                logger.warning("所有候選變異都不匹配輸入的變異")
+                return None
             else:
                 logger.warning("無法在搜索結果中找到 ClinVar variation 連結")
                 logger.debug(f"頁面內容摘要（前500字元）: {soup.get_text()[:500]}")
                 return None
-            
-            # 提取 variation ID
-            variation_id_match = re.search(r'/clinvar/variation/(\d+)', variation_link)
-            if not variation_id_match:
-                logger.warning("無法從連結中提取 variation ID")
-                return None
-            
-            variation_id = variation_id_match.group(1)
-            logger.info(f"找到 ClinVar variation ID: {variation_id}")
-
-            # 詳細頁面 URL（同時作為報告超連結用）
-            detail_url = f"https://www.ncbi.nlm.nih.gov{variation_link}" if not variation_link.startswith('http') else variation_link
-            response = requests.get(detail_url, headers=headers, timeout=15)
-            response.raise_for_status()
-            
-            soup = BeautifulSoup(response.content, 'html.parser')
-            
-            # 提取資訊
-            result = {
-                'pmid_list': [],
-                'conditions': [],
-                'variant_impact': 'Not specified',
-                'clinical_significance': 'Not specified',
-                'review_status': 'Not specified'
-            }
-            
-            # 提取 dbSNP ID (rsid)
-            rsid = self._extract_rsid_from_soup(soup)
-            if rsid:
-                result['rsid'] = rsid
-                logger.info(f"找到 dbSNP ID: {rsid}")
-            
-            # 提取臨床意義
-            clinical_sig_elem = soup.find('span', class_=re.compile(r'clinical-significance'))
-            if not clinical_sig_elem:
-                # 嘗試其他方式
-                for elem in soup.find_all(['span', 'div', 'strong']):
-                    text = elem.get_text(strip=True)
-                    if text in ['Pathogenic', 'Likely pathogenic', 'Uncertain significance', 
-                               'Benign', 'Likely benign', 'Conflicting']:
-                        result['clinical_significance'] = text
-                        logger.debug(f"找到臨床意義: {text}")
-                        break
-            else:
-                result['clinical_significance'] = clinical_sig_elem.get_text(strip=True)
-            
-            # 提取疾病/表型（從標題或條件區塊）
-            condition_elems = soup.find_all(['span', 'div'], class_=re.compile(r'condition|trait'))
-            for elem in condition_elems:
-                text = elem.get_text(strip=True)
-                if text and len(text) > 5:  # 過濾太短的文字
-                    result['conditions'].append(text)
-            
-            # 如果沒找到，嘗試從頁面標題提取
-            if not result['conditions']:
-                title = soup.find('h1')
-                if title:
-                    title_text = title.get_text(strip=True)
-                    # 嘗試從標題中提取疾病名稱
-                    if 'cardiomyopathy' in title_text.lower() or 'muscular dystrophy' in title_text.lower():
-                        result['conditions'].append(title_text)
-            
-            # 判斷影響類型
-            result['variant_impact'] = self._determine_impact_type(result['conditions'])
-            
-            # 提取 PMID（只從 germline classification 區塊）
-            pmid_list = self._extract_germline_pmids_from_soup(soup)
-            result['pmid_list'] = pmid_list
-
-            # 儲存 ClinVar 頁面連結
-            result['clinvar_url'] = detail_url
-            result['clinvar_variation_id'] = variation_id
-
-            logger.info(f"網頁抓取結果: {len(pmid_list)} 個 PMIDs, 臨床意義: {result['clinical_significance']}")
-
-            return result if result['pmid_list'] or result['clinical_significance'] != 'Not specified' else None
             
         except Exception as e:
             logger.warning(f"網頁搜索失敗: {e}")

@@ -36,7 +36,9 @@ TRITON_PTXAS_PATH = "/usr/local/cuda/bin/ptxas"
 # EVO2_MODEL = "evo2_1b_base"
 EVO2_MODEL = "evo2_7b_base"
 EVO2_WINDOW_SIZE = 8192
-PATHOGENIC_THRESHOLD = 0.0
+# 校準後的閾值（從 ClinVar 評估資料集挑出 Youden's J 最佳化的切點）
+# delta_score < PATHOGENIC_THRESHOLD → pathogenic
+PATHOGENIC_THRESHOLD = -0.000714 # evo2閾值
 REFERENCE_GENOME_PATH = DATA_DIR / "sequence.fasta"
 TTN_SEQUENCE_START = 178807423
 TTN_SEQUENCE_END = 178525989
@@ -76,15 +78,30 @@ FORCE_REDOWNLOAD_SUPPLEMENTARY = False  # 是否強制重新下載已存在的 s
 
 # LLM
 LOCAL_LLM_BACKEND = "vllm" # or ollama
+# LOCAL_LLM_MODEL = "unsloth/medgemma-27b-text-it-GGUF"
 LOCAL_LLM_MODEL = "google/medgemma-27b-it"  # MedGemma-27B instruction-tuned (醫療專用，27B 參數，約需 54GB)
 # LOCAL_LLM_MODEL = "google/gemma-4-31B-it"
 # LOCAL_LLM_MODEL = "meta-llama/Llama-3.2-8B-Instruct"  # Llama 3.2 8B（約需 16GB）
 # LOCAL_LLM_MODEL = "google/gemma-3-27b-it"
 LOCAL_LLM_TENSOR_PARALLEL = 1  # 單 GPU 使用 1，多 GPU 可增加（例如 2 或 4）
-LOCAL_LLM_MAX_MODEL_LEN = 131072  # vLLM 最大模型長度（65K tokens，MedGemma 支持最高 128K）
-LOCAL_LLM_MAX_CONTEXT_LENGTH = 120000  # 準備給 LLM 的文本最大字元數（增加以利用長 context）
+LOCAL_LLM_MAX_MODEL_LEN = 32768  # vLLM 最大模型長度（單個 prompt 上限，tokens）
+# 注意：n=5 self-consistency 時會 sample 5 次，KV cache 是 5 倍。
+# DGX Spark 128GB unified memory，MedGemma-27B BF16 weights ≈ 54GB，
+# 剩下 ~50GB 給 KV cache + activations，5 個 sample × 8K tokens ≈ 35K KV，剛好。
+LOCAL_LLM_MAX_CONTEXT_LENGTH = 30000  # 準備給 LLM 的文本最大字元數（≈ 7.5K tokens）
 ENABLE_LOCAL_CLINICAL_EXTRACTION = True
 ENABLE_EASY_PROMPT = False  # 如果為 True，簡化 LLM prompt，不包含文獻內容，並跳過全文下載、Docling 處理、LitVar 搜尋等步驟（快速測試模式）
+
+# === Extraction quality knobs ===
+# B1: Self-consistency — 對同一個 prompt sample N 次，逐欄位 majority vote
+# 註：成本是 1x 推論時間 × N，但會顯著降低 hallucination
+LLM_SELF_CONSISTENCY_N = 5
+LLM_SAMPLING_TEMPERATURE = 0.5  # self-consistency 需要一些隨機性才有用
+# B3: Guided JSON decoding — 透過 vLLM structured_outputs 強制輸出符合 schema
+LLM_USE_GUIDED_JSON = True
+# B4: Evidence grounding — 驗證 LLM 回傳的 evidence_sentence 是否真的出現在原文
+LLM_VERIFY_EVIDENCE = True
+LLM_EVIDENCE_NGRAM_OVERLAP_THRESHOLD = 0.5  # 5-gram token overlap 比例下限
 
 # TTN Info
 TTN_GENE_INFO = {
