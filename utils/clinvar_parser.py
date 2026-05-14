@@ -166,37 +166,108 @@ class ClinVarParser:
                     logger.info(f"  檢查 ClinVar ID: {clinvar_id}")
                     
                     try:
-                        # 先獲取完整的 XML 記錄以驗證變異是否匹配
+                        # Step 1: 先取得 esummary，從中取出 VCV accession
+                        # 注意：Entrez.efetch 必須用 VCV accession（如 VCV000012654）才會回傳完整 XML，
+                        #       直接用內部 ID（如 12654）會回傳空的 <set/>
+                        time.sleep(0.34)
+                        handle = Entrez.esummary(db="clinvar", id=clinvar_id)
+                        summary = Entrez.read(handle, validate=False)
+                        handle.close()
+                        
+                        vcv_accession = None
+                        try:
+                            doc_first = summary['DocumentSummarySet']['DocumentSummary'][0]
+                            vcv_accession = doc_first.get('accession')  # e.g., VCV000012654
+                        except Exception:
+                            vcv_accession = None
+                        
+                        if not vcv_accession:
+                            # 後備：依規則手動建構 VCV accession
+                            try:
+                                vcv_accession = f"VCV{int(clinvar_id):09d}"
+                            except Exception:
+                                vcv_accession = clinvar_id
+                        
+                        # Step 2: 用 VCV accession efetch 取得完整 XML（含所有 isoform HGVS）
                         time.sleep(0.34)
                         handle = Entrez.efetch(
                             db="clinvar",
-                            id=clinvar_id,
+                            id=vcv_accession,
                             rettype="vcv",
                             retmode="xml"
                         )
                         xml_record = handle.read()
                         handle.close()
                         
-                        # 驗證變異是否匹配
-                        if not self._verify_variant_match(xml_record, variant_info):
-                            logger.info(f"  ClinVar ID {clinvar_id} 不匹配輸入變異，跳過")
-                            continue
+                        # 檢查是否為空 XML（避免無效驗證）
+                        if isinstance(xml_record, bytes):
+                            xml_check = xml_record.decode('utf-8', errors='replace')
+                        else:
+                            xml_check = xml_record
+                        xml_is_empty = (len(xml_check) < 500 or '<VariationArchive' not in xml_check)
                         
-                        logger.info(f"  ✓ ClinVar ID {clinvar_id} 匹配輸入變異")
+                        # Step 3: 驗證變異是否匹配（若 XML 為空，跳過 XML 驗證，靠網頁驗證）
+                        if not xml_is_empty:
+                            if not self._verify_variant_match(xml_record, variant_info):
+                                logger.info(f"  ClinVar ID {clinvar_id} 不匹配輸入變異，跳過")
+                                continue
+                            logger.info(f"  ✓ ClinVar ID {clinvar_id} (acc={vcv_accession}) 匹配輸入變異")
+                        else:
+                            logger.warning(
+                                f"  efetch 回傳空 XML（accession={vcv_accession}），跳過 XML 驗證"
+                            )
                         
-                        # 獲取 summary 信息
-                        time.sleep(0.34)
-                        handle = Entrez.esummary(db="clinvar", id=clinvar_id)
-                        summary = Entrez.read(handle, validate=False)
-                        handle.close()
-                        
-                        # 解析並獲取 PubMed IDs
+                        # Step 4: 解析 summary 並獲取 PubMed IDs
                         result = self._parse_clinvar_summary(summary, variant_info, [clinvar_id])
                         if result:
-                            # 儲存 ClinVar 頁面連結
                             result['clinvar_url'] = f"https://www.ncbi.nlm.nih.gov/clinvar/variation/{clinvar_id}/"
                             result['clinvar_variation_id'] = clinvar_id
-                            # 只要能解析出結果就返回，不管是否有 PubMed IDs
+                            result['clinvar_accession'] = vcv_accession
+                            
+                            # Step 5: 從 esummary + XML 抽取所有 HGVS（含所有 isoform）與 Protein change
+                            summary_hgvs = self._extract_hgvs_from_esummary(summary)
+                            xml_hgvs = self._extract_hgvs_from_xml(xml_record) if not xml_is_empty else {
+                                'nucleotide': [], 'protein': [], 'protein_change': []
+                            }
+                            
+                            existing_nuc = result.get('hgvs_nucleotide') or []
+                            existing_prot = result.get('hgvs_protein') or []
+                            existing_pc = result.get('protein_change') or []
+                            
+                            # 合併（XML 為主，esummary 補充）並去重
+                            merged_nuc = list(dict.fromkeys(
+                                xml_hgvs.get('nucleotide', []) + summary_hgvs.get('nucleotide', []) + existing_nuc
+                            ))
+                            merged_prot = list(dict.fromkeys(
+                                xml_hgvs.get('protein', []) + summary_hgvs.get('protein', []) + existing_prot
+                            ))
+                            merged_pc = list(dict.fromkeys(
+                                xml_hgvs.get('protein_change', []) + summary_hgvs.get('protein_change', []) + existing_pc
+                            ))
+                            
+                            if merged_nuc:
+                                result['hgvs_nucleotide'] = merged_nuc
+                            if merged_prot:
+                                result['hgvs_protein'] = merged_prot
+                            if merged_pc:
+                                result['protein_change'] = merged_pc
+                            if merged_nuc or merged_prot:
+                                result['hgvs'] = merged_nuc + merged_prot
+                            
+                            # 也記下 rsID（從 esummary 抽到的）
+                            sum_rsid = summary_hgvs.get('rsid')
+                            if sum_rsid and not result.get('rsid'):
+                                result['rsid'] = sum_rsid
+                            
+                            logger.info(
+                                f"  HGVS 整合: {len(merged_nuc)} 核苷酸, "
+                                f"{len(merged_prot)} 蛋白質, {len(merged_pc)} Protein change "
+                                f"(XML: {len(xml_hgvs.get('nucleotide', []))}/{len(xml_hgvs.get('protein', []))}/"
+                                f"{len(xml_hgvs.get('protein_change', []))}, "
+                                f"summary: {len(summary_hgvs.get('nucleotide', []))}/{len(summary_hgvs.get('protein', []))}/"
+                                f"{len(summary_hgvs.get('protein_change', []))})"
+                            )
+                            
                             if result.get('pmid_list'):
                                 logger.info(f"成功從 ClinVar 提取資訊（含 {len(result['pmid_list'])} 個 PubMed IDs）")
                             else:
@@ -274,136 +345,102 @@ class ClinVarParser:
             return False
     
     def _verify_variant_match(self, xml_record: str, variant_info: Dict[str, str]) -> bool:
-        """驗證 ClinVar 記錄是否與輸入的變異匹配（使用負鏈轉換後的坐標）"""
+        """
+        驗證 ClinVar 記錄是否與輸入的變異匹配
+        
+        ClinVar VCV XML 真正的變異座標寫在 <SequenceLocation> 標籤的「屬性」上，
+        而不是子元素的 text。例子：
+            <SequenceLocation Assembly="GRCh38" forDisplay="true"
+                Chr="2" positionVCF="178785999"
+                referenceAlleleVCF="C" alternateAlleleVCF="A"/>
+        
+        重要：positionVCF 是 1-based VCF 座標，與輸入的 variant_info['pos'] 直接對應。
+              （不需要 -1，那是 SPDI 才需要的轉換）
+              referenceAlleleVCF/alternateAlleleVCF 是正鏈表示。
+              對於負鏈基因（如 TTN），這會是輸入 ref/alt 的互補鹼基。
+        
+        驗證策略：
+            候選 (pos, ref, alt) 三元組
+            1. 正鏈：(original_pos, original_ref, original_alt)
+            2. 負鏈：(original_pos, complement(ref), complement(alt))  ← TTN 常見
+            只要任一組與 XML 中任一 SequenceLocation 屬性完全一致 → 匹配
+        """
         try:
-            import xml.etree.ElementTree as XMLTree
+            import re as _re
             
-            # 使用負鏈轉換後的坐標進行驗證（因為 ClinVar 中存儲的是負鏈坐標）
             original_pos = variant_info['pos']
             original_ref = variant_info['ref'].upper()
             original_alt = variant_info['alt'].upper()
             
-            # 負鏈轉換
-            negative_strand_pos = original_pos - 1
-            negative_strand_ref = self._get_complement_base(original_ref)
-            negative_strand_alt = self._get_complement_base(original_alt)
+            neg_ref = self._get_complement_base(original_ref)
+            neg_alt = self._get_complement_base(original_alt)
             
-            # 同時檢查原始和轉換後的坐標
-            ref = negative_strand_ref
-            alt = negative_strand_alt
-            pos = str(negative_strand_pos)
+            # 候選的 (pos, ref, alt) 組合
+            candidates = [
+                (str(original_pos), original_ref, original_alt),       # 正鏈
+                (str(original_pos), neg_ref, neg_alt),                 # 負鏈
+            ]
             
-            # 將字符串轉換為 XML 對象
             if isinstance(xml_record, bytes):
-                xml_record = xml_record.decode('utf-8')
+                xml_str = xml_record.decode('utf-8', errors='replace')
+            else:
+                xml_str = xml_record or ''
             
-            root = XMLTree.fromstring(xml_record)
-            
-            # ClinVar XML 中的變異信息通常在 SimpleAllele 或 VariationArchive 中
-            # 查找所有可能包含 allele 信息的標籤
-            
-            # 檢查位置是否匹配
-            position_found = False
-            for start_elem in root.iter('Start'):
-                if start_elem.text == pos:
-                    position_found = True
-                    break
-            
-            if not position_found:
-                for pos_elem in root.iter('Position'):
-                    if pos in str(pos_elem.text):
-                        position_found = True
-                        break
-            
-            if not position_found:
-                logger.debug(f"  位置不匹配: 期望 {pos}")
+            if not xml_str or '<VariationArchive' not in xml_str:
+                logger.debug("  XML 內容為空或非 VCV 格式，無法驗證")
                 return False
             
-            # 檢查 ref 和 alt alleles
-            # ClinVar 使用 ReferenceAllele 和 AlternateAllele 標籤
-            ref_found = False
-            alt_found = False
+            # 抓出所有 <SequenceLocation ... /> 元素的屬性字串
+            seqloc_attrs_list: List[Dict[str, str]] = []
+            for m in _re.finditer(r'<SequenceLocation\s+([^/>]+)/?>', xml_str):
+                attrs_str = m.group(1)
+                attrs: Dict[str, str] = {}
+                for kv in _re.finditer(r'(\w+)\s*=\s*"([^"]*)"', attrs_str):
+                    attrs[kv.group(1)] = kv.group(2)
+                seqloc_attrs_list.append(attrs)
             
-            for ref_elem in root.iter('ReferenceAlleleVCF'):
-                if ref_elem.text and ref_elem.text.upper() == ref:
-                    ref_found = True
-                    break
+            if not seqloc_attrs_list:
+                logger.debug("  XML 中沒有 SequenceLocation 標籤")
+                return False
             
-            for alt_elem in root.iter('AlternateAlleleVCF'):
-                if alt_elem.text and alt_elem.text.upper() == alt:
-                    alt_found = True
-                    break
+            # 逐一比對：只看 GRCh38 的 forDisplay/current 紀錄優先，但其他也可以接受
+            # 先收集 GRCh38 的紀錄；若沒有匹配再 fallback 到任何 assembly
+            grch38_locs = [a for a in seqloc_attrs_list if a.get('Assembly') == 'GRCh38']
+            check_order = grch38_locs + [a for a in seqloc_attrs_list if a not in grch38_locs]
             
-            # 也檢查其他可能的標籤
-            if not ref_found:
-                text_content = xml_record.upper()
-                ref_patterns = [
-                    f'REFERENCEALLELE>{ref}<',
-                    f'REFERENCEALLELEVCF>{ref}<',
-                    f'"REFERENCE":"{ref}"'
-                ]
-                ref_found = any(pattern in text_content for pattern in ref_patterns)
+            for attrs in check_order:
+                xml_pos = attrs.get('positionVCF') or attrs.get('start')
+                xml_ref = (attrs.get('referenceAlleleVCF') or '').upper()
+                xml_alt = (attrs.get('alternateAlleleVCF') or '').upper()
+                
+                if not xml_pos or not xml_ref or not xml_alt:
+                    continue
+                
+                for cand_pos, cand_ref, cand_alt in candidates:
+                    if (xml_pos == cand_pos and 
+                        xml_ref == cand_ref.upper() and 
+                        xml_alt == cand_alt.upper()):
+                        logger.info(
+                            f"  ✓ 變異匹配: assembly={attrs.get('Assembly', '?')}, "
+                            f"pos={xml_pos}, {xml_ref}>{xml_alt}"
+                        )
+                        return True
             
-            if not alt_found:
-                text_content = xml_record.upper()
-                alt_patterns = [
-                    f'ALTERNATEALLELE>{alt}<',
-                    f'ALTERNATEALLELEVCF>{alt}<',
-                    f'"ALTERNATE":"{alt}"'
-                ]
-                alt_found = any(pattern in text_content for pattern in alt_patterns)
-            
-            if position_found and ref_found and alt_found:
-                logger.info(f"  變異匹配: pos={pos}, ref={ref}, alt={alt}")
-                return True
-            else:
-                # 如果負鏈坐標不匹配，也嘗試原始坐標（有些記錄可能使用正鏈）
-                logger.debug(f"  負鏈坐標不匹配，嘗試原始坐標...")
-                logger.debug(f"  不匹配: pos={position_found}, ref={ref_found}, alt={alt_found}")
-                
-                # 嘗試原始坐標
-                pos_original = str(original_pos)
-                ref_original = original_ref
-                alt_original = original_alt
-                
-                position_found_orig = False
-                for start_elem in root.iter('Start'):
-                    if start_elem.text == pos_original:
-                        position_found_orig = True
-                        break
-                
-                if not position_found_orig:
-                    for pos_elem in root.iter('Position'):
-                        if pos_original in str(pos_elem.text):
-                            position_found_orig = True
-                            break
-                
-                ref_found_orig = False
-                for ref_elem in root.iter('ReferenceAlleleVCF'):
-                    if ref_elem.text and ref_elem.text.upper() == ref_original:
-                        ref_found_orig = True
-                        break
-                
-                alt_found_orig = False
-                for alt_elem in root.iter('AlternateAlleleVCF'):
-                    if alt_elem.text and alt_elem.text.upper() == alt_original:
-                        alt_found_orig = True
-                        break
-                
-                if position_found_orig and ref_found_orig and alt_found_orig:
-                    logger.info(f"  變異匹配（原始坐標）: pos={pos_original}, ref={ref_original}, alt={alt_original}")
-                    return True
-                else:
-                    logger.debug(f"  原始坐標也不匹配")
-                    return False
+            # 沒匹配上 - 印出 XML 中實際的內容以利除錯
+            sample_locs = [
+                (a.get('Assembly', '?'), a.get('positionVCF', a.get('start', '?')),
+                 a.get('referenceAlleleVCF', '?'), a.get('alternateAlleleVCF', '?'))
+                for a in seqloc_attrs_list[:3]
+            ]
+            logger.debug(
+                f"  XML 中無匹配紀錄。候選: {candidates}, "
+                f"XML 中前幾筆 SequenceLocation: {sample_locs}"
+            )
+            return False
             
         except Exception as e:
             logger.debug(f"驗證變異匹配時出錯: {e}")
-            # 如果無法解析，使用簡單的字符串匹配作為後備
-            xml_str = xml_record if isinstance(xml_record, str) else xml_record.decode('utf-8')
-            return (pos in xml_str and 
-                    ref.upper() in xml_str.upper() and 
-                    alt.upper() in xml_str.upper())
+            return False
     
     def _parse_clinvar_summary(self, summary: Dict, variant_info: Dict[str, str], id_list: List) -> Optional[Dict]:
         """解析 ClinVar summary 結果並獲取 PubMed IDs"""
@@ -861,12 +898,14 @@ class ClinVarParser:
                     result['rsid'] = rsid
                     logger.info(f"從 ClinVar 頁面提取到 dbSNP ID: {rsid}")
                 
-                # 同時提取 HGVS 表示法
+                # 同時提取 HGVS 表示法（含 Protein change 單字母多 isoform）
                 hgvs_data = self._extract_hgvs_from_soup(soup)
-                if hgvs_data['nucleotide'] or hgvs_data['protein']:
+                if hgvs_data['nucleotide'] or hgvs_data['protein'] or hgvs_data.get('protein_change'):
                     result['hgvs'] = hgvs_data['nucleotide'] + hgvs_data['protein']
                     result['hgvs_nucleotide'] = hgvs_data['nucleotide']
                     result['hgvs_protein'] = hgvs_data['protein']
+                    if hgvs_data.get('protein_change'):
+                        result['protein_change'] = hgvs_data['protein_change']
             
             # 使用共享的提取方法
             pmid_list = self._extract_germline_pmids_from_soup(soup)
@@ -952,70 +991,313 @@ class ClinVarParser:
             logger.warning(f"提取 dbSNP ID 時出錯: {e}")
             return None
     
+    def _extract_hgvs_from_xml(self, xml_record) -> Dict[str, List[str]]:
+        """
+        從 ClinVar VCV XML 記錄抽取所有 isoform 的 HGVS 與 Protein change。
+        
+        ClinVar XML 結構（簡化）:
+            <HGVSlist>
+              <HGVS>
+                <NucleotideExpression sequenceAccessionVersion="NM_..." change="c....">
+                  <Expression>NM_...:c.....</Expression>
+                </NucleotideExpression>
+                <ProteinExpression sequenceAccessionVersion="NP_..." change="p....">
+                  <Expression>NP_...:p.....</Expression>
+                </ProteinExpression>
+              </HGVS>
+              ...
+            </HGVSlist>
+            <ProteinChange>W34072R</ProteinChange>
+            <ProteinChange>W25132R</ProteinChange>
+            ...
+        
+        Returns:
+            包含 'nucleotide'、'protein'、'protein_change' 列表的字典
+        """
+        result = {
+            'nucleotide': [],
+            'protein': [],
+            'protein_change': [],
+        }
+        
+        try:
+            if isinstance(xml_record, bytes):
+                xml_str = xml_record.decode('utf-8', errors='replace')
+            else:
+                xml_str = xml_record or ''
+            
+            if not xml_str or '<VariationArchive' not in xml_str:
+                return result
+            
+            def _decode(s):
+                return (s.replace('&gt;', '>')
+                          .replace('&lt;', '<')
+                          .replace('&amp;', '&')
+                          .replace('&quot;', '"'))
+            
+            # 1) 解析所有 <Expression>...</Expression> 標籤
+            for m in re.finditer(r'<Expression[^>]*>([^<]+)</Expression>', xml_str):
+                expr = _decode(m.group(1).strip())
+                if not expr:
+                    continue
+                if re.search(r':[cgnr]\.', expr):
+                    if expr not in result['nucleotide']:
+                        result['nucleotide'].append(expr)
+                elif ':p.' in expr or expr.startswith('p.'):
+                    if expr not in result['protein']:
+                        result['protein'].append(expr)
+            
+            # 2) 解析所有 <ProteinChange>...</ProteinChange>（單字母多 isoform）
+            for m in re.finditer(r'<ProteinChange[^>]*>([^<]+)</ProteinChange>', xml_str):
+                pc = m.group(1).strip()
+                if pc and pc not in result['protein_change']:
+                    result['protein_change'].append(pc)
+            
+            # 3) 備用：從 NucleotideExpression/ProteinExpression 的 change 屬性也抽
+            for m in re.finditer(r'<NucleotideExpression[^>]*\bchange="([^"]+)"', xml_str):
+                change = _decode(m.group(1).strip())
+                if change and change not in result['nucleotide']:
+                    result['nucleotide'].append(change)
+            for m in re.finditer(r'<ProteinExpression[^>]*\bchange="([^"]+)"', xml_str):
+                change = _decode(m.group(1).strip())
+                if change and change not in result['protein']:
+                    result['protein'].append(change)
+            
+            if result['nucleotide'] or result['protein'] or result['protein_change']:
+                logger.debug(
+                    f"  從 XML 抽取到 HGVS: {len(result['nucleotide'])} 核苷酸, "
+                    f"{len(result['protein'])} 蛋白質, "
+                    f"{len(result['protein_change'])} Protein change"
+                )
+            
+            return result
+            
+        except Exception as e:
+            logger.warning(f"從 XML 抽取 HGVS 時出錯: {e}")
+            return result
+    
+    def _extract_hgvs_from_esummary(self, summary) -> Dict[str, List[str]]:
+        """
+        從 ClinVar esummary 結果抽取 HGVS / Protein change / rsID。
+        
+        esummary 的主要 HGVS 欄位:
+            - title: "NM_001267550.2(TTN):c.107840T>A (p.Ile35947Asn)"
+            - protein_change: "I33379N, I34306N, I35947N, ..."  (單字母多 isoform)
+            - variation_set[0].variation_name: 同 title
+            - variation_set[0].cdna_change: "c.107840T>A"
+            - variation_set[0].canonical_spdi: "NC_000002.12:178527147:A:T"
+            - variation_set[0].aliases: 其他別名 list
+            - variation_set[0].variation_xrefs: dbSNP 等 xref
+        
+        Returns:
+            dict with keys 'nucleotide', 'protein', 'protein_change', 'rsid'
+        """
+        result = {
+            'nucleotide': [],
+            'protein': [],
+            'protein_change': [],
+            'rsid': None,
+        }
+        
+        try:
+            if not summary or 'DocumentSummarySet' not in summary:
+                return result
+            docs = summary['DocumentSummarySet'].get('DocumentSummary') or []
+            if not docs:
+                return result
+            doc = docs[0]
+            
+            nucleotide_pattern = re.compile(
+                r'N[MCGR]_\d+\.\d+:[cgnr]\.\d+[A-Za-z]*[>_]?[A-Za-z]*(?:del|ins|dup)?[A-Za-z0-9]*'
+            )
+            protein_pattern = re.compile(
+                r'NP_\d+\.\d+:p\.[A-Za-z]{3}\d+(?:[A-Za-z]{3,4}|\*|Ter)(?:fs)?(?:\*\d+)?'
+            )
+            bare_nucleotide_pattern = re.compile(
+                r'(?<![A-Za-z0-9_:])[cgnr]\.\d+[A-Za-z]*[>_]?[A-Za-z]*(?:del|ins|dup)?[A-Za-z0-9]*'
+            )
+            bare_protein_three_pattern = re.compile(
+                r'(?<![A-Za-z0-9_:])p\.[A-Za-z]{3}\d+(?:[A-Za-z]{3,4}|\*|Ter)(?:fs)?(?:\*\d+)?'
+            )
+            
+            def _decode(s):
+                if not s:
+                    return ''
+                return str(s).replace('&gt;', '>').replace('&lt;', '<').replace('&amp;', '&')
+            
+            def _add(s, target):
+                s = _decode(s).strip()
+                s = re.sub(r'[,;)\]]+$', '', s)
+                if s and s not in target:
+                    target.append(s)
+            
+            # 1) title
+            title = _decode(doc.get('title', ''))
+            if title:
+                for m in nucleotide_pattern.findall(title):
+                    _add(m, result['nucleotide'])
+                for m in protein_pattern.findall(title):
+                    _add(m, result['protein'])
+                for m in bare_nucleotide_pattern.findall(title):
+                    _add(m, result['nucleotide'])
+                for m in bare_protein_three_pattern.findall(title):
+                    _add(m, result['protein'])
+            
+            # 2) protein_change（逗號分隔字串）
+            pc_field = doc.get('protein_change', '')
+            if pc_field:
+                for item in re.split(r'[,;\s]+', str(pc_field)):
+                    item = item.strip()
+                    if re.match(r'^[ARNDCQEGHILKMFPSTWYV]\d+[ARNDCQEGHILKMFPSTWYV\*]$', item):
+                        if item not in result['protein_change']:
+                            result['protein_change'].append(item)
+            
+            # 3) variation_set
+            for vs in (doc.get('variation_set') or []):
+                name = _decode(vs.get('variation_name', ''))
+                if name:
+                    for m in nucleotide_pattern.findall(name):
+                        _add(m, result['nucleotide'])
+                    for m in protein_pattern.findall(name):
+                        _add(m, result['protein'])
+                    for m in bare_nucleotide_pattern.findall(name):
+                        _add(m, result['nucleotide'])
+                    for m in bare_protein_three_pattern.findall(name):
+                        _add(m, result['protein'])
+                
+                cdna = _decode(vs.get('cdna_change', ''))
+                if cdna:
+                    _add(cdna, result['nucleotide'])
+                
+                spdi = _decode(vs.get('canonical_spdi', ''))
+                if spdi:
+                    _add(spdi, result['nucleotide'])
+                
+                for alias in (vs.get('aliases') or []):
+                    a = _decode(alias)
+                    if nucleotide_pattern.search(a) or bare_nucleotide_pattern.search(a):
+                        _add(a, result['nucleotide'])
+                    elif protein_pattern.search(a) or bare_protein_three_pattern.search(a):
+                        _add(a, result['protein'])
+                
+                # rsID
+                for xref in (vs.get('variation_xrefs') or []):
+                    src = xref.get('db_source', '').lower()
+                    if 'dbsnp' in src:
+                        rs_id_val = xref.get('db_id', '')
+                        if rs_id_val:
+                            rs_full = f"rs{rs_id_val}" if not str(rs_id_val).startswith('rs') else str(rs_id_val)
+                            result['rsid'] = rs_full
+                            break
+            
+            return result
+            
+        except Exception as e:
+            logger.warning(f"從 esummary 抽取 HGVS 時出錯: {e}")
+            return result
+    
     def _extract_hgvs_from_soup(self, soup: BeautifulSoup) -> Dict[str, List[str]]:
         """
-        從 ClinVar 頁面提取 HGVS 表示法（核苷酸和蛋白質）
+        從 ClinVar 頁面提取 HGVS 表示法（核苷酸、蛋白質、單字母 Protein change）
         
         Args:
             soup: BeautifulSoup 對象
         
         Returns:
-            包含 'nucleotide' 和 'protein' HGVS 列表的字典
+            包含 'nucleotide'、'protein'、'protein_change' 列表的字典
         """
         hgvs_data = {
-            'nucleotide': [],  # e.g., NM_001267550.2:c.3208G>A
-            'protein': []      # e.g., NP_001254479.2:p.Glu1070Lys
+            'nucleotide': [],      # e.g., NM_001267550.2:c.3208G>A
+            'protein': [],         # e.g., NP_001254479.2:p.Glu1070Lys
+            'protein_change': [],  # e.g., W34072R, W25132R （單字母多 isoform）
         }
         
         try:
             # HGVS patterns
-            # Nucleotide: NM_XXXXXX.X:c.XXXX or NC_XXXXXX.X:g.XXXX (capture variants like c.100825C>T)
-            nucleotide_pattern = re.compile(r'N[MC]_\d+\.\d+:[cgn]\.\d+[A-Za-z]*[>_]?[A-Za-z]*(?:del|ins|dup)?[A-Za-z0-9]*')
-            # Protein: NP_XXXXXX.X:p.XXXX (capture variants like p.Arg33609Ter or p.Glu1070Lys)
-            protein_pattern = re.compile(r'NP_\d+\.\d+:p\.[A-Za-z]{3}\d+[A-Za-z]{3,4}(?:fs)?(?:\*\d+)?')
+            # 含 RefSeq 前綴
+            nucleotide_pattern = re.compile(
+                r'N[MCGR]_\d+\.\d+:[cgnr]\.\d+[A-Za-z]*[>_]?[A-Za-z]*(?:del|ins|dup)?[A-Za-z0-9]*'
+            )
+            protein_pattern = re.compile(
+                r'NP_\d+\.\d+:p\.[A-Za-z]{3}\d+(?:[A-Za-z]{3,4}|\*|Ter)(?:fs)?(?:\*\d+)?'
+            )
+            # 裸 HGVS（不含 RefSeq 前綴）
+            bare_nucleotide_pattern = re.compile(
+                r'(?<![A-Za-z0-9_:])[cgnr]\.\d+[A-Za-z]*[>_]?[A-Za-z]*(?:del|ins|dup)?[A-Za-z0-9]*'
+            )
+            bare_protein_three_pattern = re.compile(
+                r'(?<![A-Za-z0-9_:])p\.[A-Za-z]{3}\d+(?:[A-Za-z]{3,4}|\*|Ter)(?:fs)?(?:\*\d+)?'
+            )
+            # 單字母 protein change (e.g., W34072R)
+            single_letter_protein_pattern = re.compile(
+                r'(?<![A-Za-z0-9])([ARNDCQEGHILKMFPSTWYV])(\d{2,6})([ARNDCQEGHILKMFPSTWYV\*])(?![A-Za-z0-9])'
+            )
             
-            # 方法1: 從頁面文字中尋找 HGVS
             full_text = soup.get_text()
             
-            # 提取核苷酸 HGVS
-            nucleotide_matches = nucleotide_pattern.findall(full_text)
-            for match in nucleotide_matches:
-                # 清理匹配結果（移除尾部標點符號）
+            # 提取核苷酸 HGVS（含 RefSeq）
+            for match in nucleotide_pattern.findall(full_text):
                 clean_match = re.sub(r'[,;)\]]+$', '', match)
                 if clean_match and clean_match not in hgvs_data['nucleotide']:
                     hgvs_data['nucleotide'].append(clean_match)
             
-            # 提取蛋白質 HGVS
-            protein_matches = protein_pattern.findall(full_text)
-            for match in protein_matches:
+            # 提取蛋白質 HGVS（含 RefSeq）
+            for match in protein_pattern.findall(full_text):
                 clean_match = re.sub(r'[,;)\]]+$', '', match)
                 if clean_match and clean_match not in hgvs_data['protein']:
                     hgvs_data['protein'].append(clean_match)
             
-            # 方法2: 也尋找 HGVS 區塊
+            # 提取裸 HGVS（不含 RefSeq）
+            for match in bare_nucleotide_pattern.findall(full_text):
+                clean_match = re.sub(r'[,;)\]]+$', '', match)
+                if clean_match and clean_match not in hgvs_data['nucleotide']:
+                    hgvs_data['nucleotide'].append(clean_match)
+            for match in bare_protein_three_pattern.findall(full_text):
+                clean_match = re.sub(r'[,;)\]]+$', '', match)
+                if clean_match and clean_match not in hgvs_data['protein']:
+                    hgvs_data['protein'].append(clean_match)
+            
+            # 提取 "Protein change" 區塊（單字母多 isoform）
+            protein_change_match = re.search(
+                r'Protein\s*change\s*[:\s]*([A-Z\d,\s\*]+?)(?=\n|Other\s*names|Canonical|Global|Allele|Links|HGVS|$)',
+                full_text,
+                re.IGNORECASE
+            )
+            if protein_change_match:
+                pc_text = protein_change_match.group(1)
+                for m in single_letter_protein_pattern.finditer(pc_text):
+                    single_letter = f"{m.group(1)}{m.group(2)}{m.group(3)}"
+                    if single_letter not in hgvs_data['protein_change']:
+                        hgvs_data['protein_change'].append(single_letter)
+            
+            # 方法2: 從 HGVS / Protein change 區塊額外抽取
             for heading in soup.find_all(['dt', 'th', 'strong', 'b']):
                 text = heading.get_text(strip=True).lower()
-                if 'hgvs' in text or 'name' in text:
+                if 'hgvs' in text or 'name' in text or 'protein change' in text:
                     parent = heading.find_parent(['div', 'dl', 'table', 'tr', 'dd'])
                     if parent:
                         parent_text = parent.get_text()
-                        
-                        nuc_matches = nucleotide_pattern.findall(parent_text)
-                        for m in nuc_matches:
+                        for m in nucleotide_pattern.findall(parent_text):
                             clean_m = re.sub(r'[,;)\]]+$', '', m)
                             if clean_m and clean_m not in hgvs_data['nucleotide']:
                                 hgvs_data['nucleotide'].append(clean_m)
-                        
-                        prot_matches = protein_pattern.findall(parent_text)
-                        for m in prot_matches:
+                        for m in protein_pattern.findall(parent_text):
                             clean_m = re.sub(r'[,;)\]]+$', '', m)
                             if clean_m and clean_m not in hgvs_data['protein']:
                                 hgvs_data['protein'].append(clean_m)
+                        if 'protein change' in text:
+                            for m in single_letter_protein_pattern.finditer(parent_text):
+                                single = f"{m.group(1)}{m.group(2)}{m.group(3)}"
+                                if single not in hgvs_data['protein_change']:
+                                    hgvs_data['protein_change'].append(single)
             
-            if hgvs_data['nucleotide'] or hgvs_data['protein']:
-                logger.info(f"從 ClinVar 頁面提取到 HGVS: {len(hgvs_data['nucleotide'])} 核苷酸, {len(hgvs_data['protein'])} 蛋白質")
-                logger.debug(f"  核苷酸 HGVS: {hgvs_data['nucleotide'][:3]}")
-                logger.debug(f"  蛋白質 HGVS: {hgvs_data['protein'][:3]}")
+            if hgvs_data['nucleotide'] or hgvs_data['protein'] or hgvs_data['protein_change']:
+                logger.info(
+                    f"從 ClinVar 頁面提取到 HGVS: "
+                    f"{len(hgvs_data['nucleotide'])} 核苷酸, "
+                    f"{len(hgvs_data['protein'])} 蛋白質, "
+                    f"{len(hgvs_data['protein_change'])} Protein change"
+                )
             
             return hgvs_data
             

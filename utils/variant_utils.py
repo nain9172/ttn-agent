@@ -65,21 +65,25 @@ def _strip_hgvs_prefix(hgvs: str) -> Optional[str]:
 def get_variant_aliases(variant_id: str, clinvar_info: Optional[Dict]) -> List[str]:
     """
     從 ClinVar 信息中提取變異的所有別名
-    這些信息已經在 ClinVar 頁面抓取時獲得，不需要重新生成
     
-    特別注意：會自動生成單字母和三字母氨基酸格式的變異
+    特別注意：
+    - 會自動產生單字母／三字母氨基酸的不同形式
+    - 會展開 Protein change 欄位中所有 isoform 的單字母格式為三字母版本
     
     Args:
         variant_id: 變異 ID (格式: chrom-pos-ref-alt)
-        clinvar_info: ClinVar 信息字典（包含 HGVS、rsID 等）
+        clinvar_info: ClinVar 信息字典（包含 HGVS、rsID、Protein change 等）
     
     Returns:
         變異別名列表
     """
     aliases: List[str] = [variant_id]  # e.g., 2-178612477-T-A
+    
+    # 單字母 → 三字母對照表
+    ONE_TO_THREE = {v: k for k, v in AA_THREE_TO_ONE.items() if k != 'Stop'}
 
     def _add_hgvs(hgvs_value):
-        """把單一 HGVS 字串展開：原字串 + 剝前綴版本 + 單字母蛋白質版本。"""
+        """把單一 HGVS 字串展開：原字串 + 剝前綴版本 + 單字母蛋白質版本 + p. 前綴單字母。"""
         if not hgvs_value:
             return
         h = str(hgvs_value).strip()
@@ -93,7 +97,30 @@ def get_variant_aliases(variant_id: str, clinvar_info: Optional[Dict]) -> List[s
         # 三字母 → 單字母蛋白質格式
         single_letter = _convert_protein_hgvs_to_single_letter(h)
         if single_letter:
+            # 例如 I35947N
             aliases.append(single_letter)
+            # 也加入 p. 前綴版本：例如 p.I35947N
+            aliases.append(f"p.{single_letter}")
+
+    def _add_protein_change(pc_value):
+        """處理 ClinVar 的 'Protein change' 欄位（單字母多 isoform）。
+        例如 'W34072R' 會展開成多種常見書寫形式 (W34072R, p.W34072R, p.Trp34072Arg)。"""
+        if not pc_value:
+            return
+        s = str(pc_value).strip()
+        m = re.match(r'^([ARNDCQEGHILKMFPSTWYV])(\d+)([ARNDCQEGHILKMFPSTWYV\*])$', s)
+        if not m:
+            return
+        ref_aa, pos, alt_aa = m.group(1), m.group(2), m.group(3)
+        # 1) 原始單字母（e.g. W34072R）
+        aliases.append(s)
+        # 2) p. 前綴單字母（e.g. p.W34072R）
+        aliases.append(f"p.{ref_aa}{pos}{alt_aa}")
+        # 3) 嘗試對應的三字母版本
+        if ref_aa in ONE_TO_THREE and (alt_aa in ONE_TO_THREE or alt_aa == '*'):
+            alt_three = ONE_TO_THREE.get(alt_aa, 'Ter' if alt_aa == '*' else alt_aa)
+            three_letter = f"p.{ONE_TO_THREE[ref_aa]}{pos}{alt_three}"
+            aliases.append(three_letter)
 
     if clinvar_info:
         for key in ('hgvs', 'hgvs_nucleotide', 'hgvs_protein'):
@@ -105,6 +132,17 @@ def get_variant_aliases(variant_id: str, clinvar_info: Optional[Dict]) -> List[s
                     _add_hgvs(item)
             else:
                 _add_hgvs(value)
+        
+        # Protein change 欄位（單字母多 isoform，例如 ['W34072R', 'W25132R', ...]）
+        pc_field = clinvar_info.get('protein_change')
+        if pc_field:
+            if isinstance(pc_field, list):
+                for item in pc_field:
+                    _add_protein_change(item)
+            elif isinstance(pc_field, str):
+                # 支援逗號分隔字串 "W34072R, W25132R, ..."
+                for item in re.split(r'[,;\s]+', pc_field):
+                    _add_protein_change(item)
 
         # rsID (e.g., rs1057518195)
         if 'rsid' in clinvar_info:
