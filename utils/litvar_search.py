@@ -15,6 +15,11 @@ from Bio import Entrez
 
 from config import ENABLE_FULL_TEXT_FETCH, MAX_TEXT_LENGTH
 
+try:
+    from config import LITVAR_MAX_RESULTS as _DEFAULT_LITVAR_MAX
+except ImportError:
+    _DEFAULT_LITVAR_MAX = 50
+
 # Try to import docling for PDF processing
 try:
     from config import ENABLE_DOCLING_PDF, DOCLING_MAX_PRIORITY_LENGTH, OUTPUT_DIR, DOWNLOAD_SUPPLEMENTARY_FILES
@@ -299,12 +304,14 @@ class LitVarSearcher:
                     docling_content = None
                     has_docling = False
                     
+                    docling_full_markdown = None  # 給 deterministic alias gating 用的完整 markdown
                     if self.try_full_text:
                         # 優先嘗試 Docling（傳遞 variant_aliases 進行表格過濾）
                         if self.use_docling:
                             docling_result = self._try_fetch_with_docling(pmid, variant_aliases)
                             if docling_result:
                                 docling_content = docling_result.get('priority_content', '')
+                                docling_full_markdown = docling_result.get('full_markdown', '') or None
                                 has_docling = True
                                 has_full_text = True
                                 logger.info(f"LitVar2 PMID {pmid}: 使用 Docling 提取優先內容 ({len(docling_content)} 字元)")
@@ -326,6 +333,17 @@ class LitVarSearcher:
                     else:
                         text_for_llm = abstract
                     
+                    # gate_text：給 deterministic alias gating 用，盡量完整
+                    # （docling 的 full_markdown > full_text > priority content > abstract）。
+                    # 注意：這份不會塞進 LLM prompt，所以「完整 markdown 很大」也不會吃 token。
+                    gate_text = (
+                        docling_full_markdown
+                        or full_text
+                        or docling_content
+                        or abstract
+                        or ""
+                    )
+
                     articles.append({
                         'pmid': pmid,
                         'title': title,
@@ -334,6 +352,7 @@ class LitVarSearcher:
                         'docling_content': docling_content,
                         'has_docling': has_docling,
                         'text_for_llm': text_for_llm,  # This is what the LLM uses!
+                        'gate_text': gate_text,         # Used only by deterministic alias gate
                         'has_full_text': has_full_text,
                         'year': year,
                         'journal': journal,
@@ -356,7 +375,7 @@ class LitVarSearcher:
             
         return articles
     
-    def search_multiple_formats(self, variant_info: Dict, clinvar_info: Optional[Dict] = None, variant_aliases: Optional[List[str]] = None, max_results: int = 50) -> List[Dict]:
+    def search_multiple_formats(self, variant_info: Dict, clinvar_info: Optional[Dict] = None, variant_aliases: Optional[List[str]] = None, max_results: int = _DEFAULT_LITVAR_MAX) -> List[Dict]:
         """
         Search LitVar2 using rsID from ClinVar info.
         
@@ -381,7 +400,17 @@ class LitVarSearcher:
             logger.info("LitVar2: No publications found")
             return []
         
-        unique_pmids = list(set(all_pmids))[:max_results]
+        # 用 dict.fromkeys 做保序去重，保留 LitVar API 給的原始排序（通常較相關的在前），
+        # 不要用 set() 否則順序會被打亂、超過 max_results 時挑到的不是真正的「前 N 篇」。
+        unique_pmids = list(dict.fromkeys(all_pmids))
+        total_unique = len(unique_pmids)
+        if total_unique > max_results:
+            logger.warning(
+                f"LitVar2: rsID returned {total_unique} unique PMIDs, "
+                f"truncating to LITVAR_MAX_RESULTS={max_results}. "
+                f"Increase LITVAR_MAX_RESULTS in config.py to fetch all."
+            )
+            unique_pmids = unique_pmids[:max_results]
         logger.info(f"LitVar2: Fetching details for {len(unique_pmids)} publications")
         
         articles = self.fetch_article_details(unique_pmids, variant_aliases)

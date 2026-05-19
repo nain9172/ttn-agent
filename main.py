@@ -21,8 +21,14 @@ from config import (
     LOCAL_LLM_MAX_MODEL_LEN,
     LOCAL_LLM_MAX_CONTEXT_LENGTH,
     ENABLE_LITVAR_SEARCH,
-    TRITON_PTXAS_PATH
+    TRITON_PTXAS_PATH,
 )
+
+# LitVar 結果上限（舊 config 沒有此項時 fallback 到 50）
+try:
+    from config import LITVAR_MAX_RESULTS
+except ImportError:
+    LITVAR_MAX_RESULTS = 50
 
 # Try to get ENABLE_EASY_PROMPT setting
 try:
@@ -257,7 +263,7 @@ def main():
                 variant_info=variant_info,
                 clinvar_info=clinvar_info,  # Contains rsid from ClinVar
                 variant_aliases=variant_aliases,  # 傳遞別名用於表格過濾
-                max_results=20
+                max_results=LITVAR_MAX_RESULTS
             )
             
             logger.info(f"Found {len(litvar_results)} articles from LitVar")

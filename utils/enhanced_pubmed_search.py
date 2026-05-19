@@ -511,6 +511,7 @@ class EnhancedPubMedSearcher:
         full_text = None
         has_full_text = False
         docling_content = None
+        docling_full_markdown = None  # 完整 markdown，給 deterministic alias gating 用
         has_docling = False
 
         # 優先 Docling（使用 requests 下載 PDF，thread-safe）
@@ -518,6 +519,7 @@ class EnhancedPubMedSearcher:
             docling_result = self._try_fetch_with_docling(pmid, variant_aliases)
             if docling_result:
                 docling_content = docling_result.get('priority_content', '')
+                docling_full_markdown = docling_result.get('full_markdown', '') or None
                 has_docling = True
                 has_full_text = True
                 logger.info(f"PMID {pmid}: 使用 Docling 提取優先內容 ({len(docling_content)} 字元)")
@@ -536,8 +538,20 @@ class EnhancedPubMedSearcher:
         else:
             text_for_analysis = meta['abstract']
 
+        # gate_text：給 deterministic alias gating 用，盡量完整
+        # （docling full_markdown > full_text > priority content > abstract）。
+        # 不會被塞進 LLM prompt，所以不會吃 token budget。
+        gate_text = (
+            docling_full_markdown
+            or full_text
+            or docling_content
+            or meta.get('abstract')
+            or ""
+        )
+
         meta['full_text'] = full_text
         meta['text_for_llm'] = text_for_analysis
+        meta['gate_text'] = gate_text
         meta['has_full_text'] = has_full_text
         meta['has_docling'] = has_docling
         meta['docling_content'] = docling_content

@@ -4,8 +4,9 @@ Compiles all results into a comprehensive HTML report (Updated for Tissue Suppor
 """
 
 import logging
+import re
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from datetime import datetime
 import base64
 import html
@@ -18,6 +19,45 @@ from config import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Tissue 對應顏色（用於 article border 與 statistics block 顏色塊）
+TISSUE_COLORS = {
+    'Cardiac':       '#e74c3c',  # 紅
+    'Skeletal':      '#f39c12',  # 橘
+    'Both':          '#9b59b6',  # 紫
+    'Not specified': '#95a5a6',  # 灰
+}
+
+# 用來推斷文獻主要疾病的 disease patterns (與 local_clinical_extractor 同步)
+# 格式: (regex, canonical_disease_name, tissue)
+DISEASE_PATTERNS_FOR_INFERENCE: List[Tuple[str, str, str]] = [
+    (r'\bDCM\b|dilated cardiomyopathy',                  'Dilated Cardiomyopathy (DCM)',           'Cardiac'),
+    (r'\bHCM\b|hypertrophic cardiomyopathy',             'Hypertrophic Cardiomyopathy (HCM)',      'Cardiac'),
+    (r'\bARVC\b|\bACM\b|arrhythmogenic.*cardiomyopathy', 'Arrhythmogenic Cardiomyopathy (ARVC)',   'Cardiac'),
+    (r'\bLVNC\b|left ventricular non.?compaction',       'Left Ventricular Noncompaction (LVNC)',  'Cardiac'),
+    (r'\bRCM\b|restrictive cardiomyopathy',              'Restrictive Cardiomyopathy (RCM)',       'Cardiac'),
+    (r'\bheart failure\b',                               'Heart Failure',                          'Cardiac'),
+    (r'\batrial fibrillation\b',                         'Atrial Fibrillation',                    'Cardiac'),
+    (r'\bcardiomyopathy\b',                              'Cardiomyopathy (unspecified)',           'Cardiac'),
+    (r'\bTMD\b|tibial muscular dystrophy',               'Tibial Muscular Dystrophy (TMD)',        'Skeletal'),
+    (r'\bLGMD\b|limb.girdle muscular dystrophy',         'Limb-Girdle Muscular Dystrophy (LGMD)',  'Skeletal'),
+    (r'\bHMERF\b|hereditary myopathy with early respiratory failure',
+                                                          'HMERF',                                 'Skeletal'),
+    (r'\bcentronuclear myopathy\b|\bCNM\b',               'Centronuclear Myopathy (CNM)',          'Skeletal'),
+    (r'\bcongenital myopathy\b',                          'Congenital Myopathy',                    'Skeletal'),
+    (r'\bmuscular dystrophy\b',                           'Muscular Dystrophy',                     'Skeletal'),
+    (r'\bmyopathy\b',                                     'Myopathy',                                'Skeletal'),
+    (r'\bcardioskeletal myopathy\b',                      'Cardioskeletal Myopathy',                 'Both'),
+    (r'\btitinopath',                                     'Titinopathy',                             'Both'),
+]
+
+# Tissue 排序順序（Literature Review 中文獻顯示順序）
+TISSUE_SORT_ORDER = {
+    'Cardiac': 0,
+    'Skeletal': 1,
+    'Both': 2,
+    'Not specified': 3,
+}
 
 
 class HTMLReportGenerator:
@@ -143,10 +183,19 @@ class HTMLReportGenerator:
         .image-container img {{ max-width: 100%; height: auto; border-radius: 8px; box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1); }}
         .pubmed-article {{
             background: #f8f9fa; padding: 20px; margin-bottom: 20px; border-radius: 8px;
-            border-left: 4px solid {REPORT_ACCENT_COLOR};
+            border-left: 6px solid {REPORT_ACCENT_COLOR};
         }}
-        .pubmed-article.litvar-source {{
-            border-left: 4px solid #e74c3c;
+        .mention-badge {{
+            display: inline-block; padding: 2px 8px; border-radius: 4px;
+            font-size: 0.8em; font-weight: bold; margin-left: 8px;
+            vertical-align: middle;
+        }}
+        .mention-badge.mention-true {{ background: #27ae60; color: white; }}
+        .mention-badge.mention-false {{ background: #95a5a6; color: white; }}
+        .source-badge {{
+            display: inline-block; padding: 2px 6px; border-radius: 4px;
+            font-size: 0.75em; font-weight: bold; margin-left: 6px;
+            vertical-align: middle; background: #34495e; color: white;
         }}
         .article-title {{ font-size: 1.2em; font-weight: bold; color: #2c3e50; margin-bottom: 10px; }}
         .article-title a {{ color: {REPORT_ACCENT_COLOR}; text-decoration: none; }}
@@ -209,53 +258,174 @@ class HTMLReportGenerator:
 
     # Removed _generate_clinical_stats_section completely.
 
+    # ── Helpers ────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _normalize_tissue(tissue_raw: str) -> str:
+        """把任意 tissue 字串標準化為 Cardiac / Skeletal / Both / Not specified."""
+        if not tissue_raw:
+            return 'Not specified'
+        t = str(tissue_raw).strip().lower()
+        if 'both' in t:
+            return 'Both'
+        if 'cardiac' in t:
+            return 'Cardiac'
+        if 'skeletal' in t:
+            return 'Skeletal'
+        return 'Not specified'
+
+    @staticmethod
+    def _article_mentions_variant(article: Dict) -> bool:
+        """判斷文獻是否直接提到輸入變異
+        
+        判斷依據（任一條成立即視為「直接提到」）:
+        - clinical_info.evidence_sentence 不是空、不是 "Not specified"
+        - clinical_info.disease 不是 "Not specified"（且不是 JSON parsing failed）
+        - patient_count > 0
+        """
+        info = article.get('clinical_info', {}) or {}
+        
+        evidence = (info.get('evidence_sentence') or '').strip()
+        if evidence and evidence.lower() not in ('not specified', 'n/a', 'none', ''):
+            return True
+        
+        disease = (info.get('disease') or '').strip()
+        if disease and disease.lower() not in ('not specified', 'n/a', 'none', '', 'json parsing failed'):
+            return True
+        
+        try:
+            if int(info.get('patient_count') or 0) > 0:
+                return True
+        except (ValueError, TypeError):
+            pass
+        
+        return False
+
+    @staticmethod
+    def _infer_main_disease_from_article(article: Dict) -> Tuple[str, str]:
+        """從文獻 title + abstract 推斷主要疾病 / tissue (regex match)
+        
+        Returns: (disease_name, tissue) — 若無匹配回傳 ('Not specified', 'Not specified')
+        """
+        title = article.get('title') or ''
+        abstract = article.get('abstract') or ''
+        text = f"{title} {abstract}"
+        if not text.strip():
+            return ('Not specified', 'Not specified')
+        
+        for pattern, disease, tissue in DISEASE_PATTERNS_FOR_INFERENCE:
+            if re.search(pattern, text, re.IGNORECASE):
+                return (disease, tissue)
+        
+        return ('Not specified', 'Not specified')
+
+    # ── Sections ──────────────────────────────────────────────────────────
+
     def _generate_pubmed_section(self, pubmed_results: List[Dict], clinvar_info: Optional[Dict] = None) -> str:
         if not pubmed_results:
             return """<section class="section"><h2>Literature Review</h2><div class="alert">No PubMed articles found.</div></section>"""
         
+        # Step 1: 對每篇 article 計算 mention_input_variant、最終疾病/tissue
+        # 若有提到變異 → 使用 LLM 提取結果
+        # 若沒提到變異 → 從 title+abstract 用 regex 推斷主要疾病
+        enriched_articles: List[Dict] = []
+        for article in pubmed_results:
+            info = article.get('clinical_info', {}) or {}
+            mention = self._article_mentions_variant(article)
+            
+            if mention:
+                final_disease = info.get('disease') or 'Not specified'
+                final_tissue = self._normalize_tissue(info.get('tissue_affected'))
+                disease_source = 'extracted_from_variant'
+            else:
+                # 沒直接提到變異 → 推斷文獻主要疾病
+                inferred_disease, inferred_tissue = self._infer_main_disease_from_article(article)
+                final_disease = inferred_disease
+                final_tissue = inferred_tissue
+                disease_source = 'inferred_from_article'
+            
+            enriched_articles.append({
+                'article': article,
+                'mention': mention,
+                'final_disease': final_disease,
+                'final_tissue': final_tissue,
+                'disease_source': disease_source,
+            })
+        
+        # Step 2: 按 tissue 排序 (Cardiac → Skeletal → Both → Not specified)
+        # 排序的次要 key 用 mention（提到的優先），再來用 year（新的優先）
+        def _sort_key(item):
+            tissue_order = TISSUE_SORT_ORDER.get(item['final_tissue'], 99)
+            mention_order = 0 if item['mention'] else 1  # 提到的優先
+            year_str = str(item['article'].get('year') or '0')
+            try:
+                year_neg = -int(year_str)
+            except ValueError:
+                year_neg = 0
+            return (tissue_order, mention_order, year_neg)
+        
+        enriched_articles.sort(key=_sort_key)
+        
         html_out = f'<section class="section"><h2>Literature Review ({len(pubmed_results)} articles)</h2>'
         
-        # 如果啟用組織統計功能，計算並顯示統計
+        # Step 3: Tissue Involvement Statistics（雙排）
         if ENABLE_TISSUE_STATISTICS:
-            tissue_stats = self._calculate_tissue_statistics(pubmed_results)
+            tissue_stats = self._calculate_tissue_statistics(enriched_articles)
             html_out += self._generate_tissue_statistics_block(tissue_stats)
         
-        for idx, article in enumerate(pubmed_results, 1):
-            info = article.get('clinical_info', {})
+        # Step 4: 渲染每篇文獻
+        for idx, item in enumerate(enriched_articles, 1):
+            article = item['article']
+            info = article.get('clinical_info', {}) or {}
             
-            # Extract fields
-            disease = info.get('disease', 'Not specified')
-            tissue = info.get('tissue_affected', 'Not specified')
+            final_disease = item['final_disease']
+            final_tissue = item['final_tissue']
+            mention = item['mention']
+            disease_source = item['disease_source']
+            
             age = info.get('age_onset', 'Not specified')
             inheritance = info.get('inheritance', 'Not specified')
             reasoning = info.get('reasoning', '')
             evidence = info.get('evidence_sentence', '')
 
-            # AI Analysis Block - kept because the user only asked to remove the *Synthesis* part
+            # AI Analysis Block
             ai_block = ""
             if reasoning or evidence:
                 ai_block = f"""
                 <div style="margin-top: 15px; padding: 15px; background: white; border-radius: 5px; border: 1px solid #eee;">
                     <div style="font-weight: bold; color: {REPORT_ACCENT_COLOR}; margin-bottom: 5px;">AI Analysis</div>
-                    <div style="font-style: italic; color: #555; margin-bottom: 8px;">"{reasoning}"</div>
-                    {f'<div style="background: #eef; padding: 5px 10px; border-radius: 4px; font-family: monospace; font-size: 0.9em; color: #333;">Evidence: "{evidence}"</div>' if evidence else ''}
+                    <div style="font-style: italic; color: #555; margin-bottom: 8px;">"{html.escape(reasoning)}"</div>
+                    {f'<div style="background: #eef; padding: 5px 10px; border-radius: 4px; font-family: monospace; font-size: 0.9em; color: #333;">Evidence: "{html.escape(evidence)}"</div>' if evidence else ''}
                 </div>
                 """
 
-            # Add 'litvar-source' class for LitVar articles (red border)
-            source_class = "litvar-source" if article.get('source') == 'LitVar2' else ""
-            source_label = " [LitVar]" if article.get('source') == 'LitVar2' else ""
+            # 來源 badge（保留 LitVar 標籤，但用獨立 badge）
+            source = article.get('source') or 'PubMed'
+            source_badge = f'<span class="source-badge">{html.escape(str(source))}</span>'
+            
+            # Mention input variant badge
+            mention_class = 'mention-true' if mention else 'mention-false'
+            mention_label = 'Mention input variant: True' if mention else 'Mention input variant: False'
+            mention_badge = f'<span class="mention-badge {mention_class}">{mention_label}</span>'
+            
+            # 左側 border 顏色 → 按 tissue
+            border_color = TISSUE_COLORS.get(final_tissue, TISSUE_COLORS['Not specified'])
+            
+            # 如果是推斷的疾病，顯示 (inferred) 註記
+            disease_display = html.escape(final_disease)
+            if disease_source == 'inferred_from_article' and final_disease != 'Not specified':
+                disease_display = f'{html.escape(final_disease)} <span style="color:#888; font-size:0.85em;">(inferred from article)</span>'
             
             html_out += f"""
-            <div class="pubmed-article {source_class}">
-                <div class="article-title">{idx}. <a href="{article['pubmed_link']}" target="_blank">{article['title']}</a>{source_label}</div>
-                <div class="article-meta">{article['journal']} ({article['year']}) | PMID: {article['pmid']}</div>
+            <div class="pubmed-article" style="border-left-color: {border_color};">
+                <div class="article-title">{idx}. <a href="{article['pubmed_link']}" target="_blank">{html.escape(article['title'])}</a>{source_badge}{mention_badge}</div>
+                <div class="article-meta">{html.escape(str(article['journal']))} ({article['year']}) | PMID: {article['pmid']}</div>
                 
                 <div class="article-info">
-                    <div class="article-info-item"><div class="article-info-label">Disease</div><div>{disease}</div></div>
-                    <div class="article-info-item"><div class="article-info-label">Tissue Affected</div><div>{tissue}</div></div>
-                    <div class="article-info-item"><div class="article-info-label">Age</div><div>{age}</div></div>
-                    <div class="article-info-item"><div class="article-info-label">Inheritance</div><div>{inheritance}</div></div>
+                    <div class="article-info-item"><div class="article-info-label">Disease</div><div>{disease_display}</div></div>
+                    <div class="article-info-item"><div class="article-info-label">Tissue Affected</div><div>{html.escape(final_tissue)}</div></div>
+                    <div class="article-info-item"><div class="article-info-label">Age</div><div>{html.escape(str(age))}</div></div>
+                    <div class="article-info-item"><div class="article-info-label">Inheritance</div><div>{html.escape(str(inheritance))}</div></div>
                 </div>
                 {ai_block}
             </div>
@@ -264,72 +434,108 @@ class HTMLReportGenerator:
         html_out += "</section>"
         return html_out
 
-    def _calculate_tissue_statistics(self, pubmed_results: List[Dict]) -> Dict:
-        """計算從文獻中提取的組織影響統計"""
+    def _calculate_tissue_statistics(self, enriched_articles: List[Dict]) -> Dict:
+        """計算雙排組織影響統計
+        
+        Args:
+            enriched_articles: List of dicts with keys 'mention', 'final_tissue', 'article', ...
+        
+        Returns:
+            {
+              'mentioned':     {'cardiac': N, 'skeletal': N, 'both': N, 'not_specified': N, 'total': N},
+              'not_mentioned': {'cardiac': N, 'skeletal': N, 'both': N, 'not_specified': N, 'total': N},
+              'total_articles': N
+            }
+        """
+        def _empty():
+            return {'cardiac': 0, 'skeletal': 0, 'both': 0, 'not_specified': 0, 'total': 0}
+        
         stats = {
-            'cardiac': 0,
-            'skeletal': 0,
-            'both': 0,
-            'not_specified': 0,
-            'total_articles': len(pubmed_results),
-            'total_extracted': 0
+            'mentioned': _empty(),
+            'not_mentioned': _empty(),
+            'total_articles': len(enriched_articles),
         }
         
-        for article in pubmed_results:
-            info = article.get('clinical_info', {})
-            tissue = info.get('tissue_affected', 'Not specified')
-            
-            # 統計所有文章的 tissue_affected（包括 Not specified）
-            tissue_lower = tissue.lower()
-            if 'both' in tissue_lower:
-                stats['both'] += 1
-            elif 'cardiac' in tissue_lower:
-                stats['cardiac'] += 1
-            elif 'skeletal' in tissue_lower:
-                stats['skeletal'] += 1
-            else:
-                stats['not_specified'] += 1
-            
-            # 記錄成功提取臨床數據的文章數（用於其他統計）
-            if info.get('disease') not in ["Not specified", None, "JSON Parsing Failed"]:
-                stats['total_extracted'] += 1
+        tissue_key_map = {
+            'Cardiac': 'cardiac',
+            'Skeletal': 'skeletal',
+            'Both': 'both',
+            'Not specified': 'not_specified',
+        }
+        
+        for item in enriched_articles:
+            bucket = 'mentioned' if item['mention'] else 'not_mentioned'
+            tissue_key = tissue_key_map.get(item['final_tissue'], 'not_specified')
+            stats[bucket][tissue_key] += 1
+            stats[bucket]['total'] += 1
         
         return stats
     
     def _generate_tissue_statistics_block(self, stats: Dict) -> str:
-        """生成組織影響統計的 HTML 區塊"""
+        """生成雙排 Tissue Involvement Statistics 區塊。
+        
+        - 上排：文獻直接提到輸入變異（disease 取自 LLM extraction）
+        - 下排：文獻沒提到輸入變異（disease 取自文獻主要討論的疾病推斷）
+        """
         if stats['total_articles'] == 0:
             return """<div class="alert alert-info">No articles available for tissue statistics.</div>"""
         
-        # 計算百分比（基於所有文章）
-        total = stats['total_articles']
-        cardiac_pct = (stats['cardiac'] / total * 100) if total > 0 else 0
-        skeletal_pct = (stats['skeletal'] / total * 100) if total > 0 else 0
-        both_pct = (stats['both'] / total * 100) if total > 0 else 0
-        not_spec_pct = (stats['not_specified'] / total * 100) if total > 0 else 0
+        def _row(title: str, subtitle: str, bucket: Dict) -> str:
+            total = bucket['total']
+            if total == 0:
+                return f"""
+                <div style="margin-bottom: 12px;">
+                    <h4 style="color: {REPORT_HEADER_COLOR}; margin-bottom: 8px;">{title}</h4>
+                    <p style="color: #999; font-style: italic;">{subtitle} — No articles in this category.</p>
+                </div>
+                """
+            
+            def _pct(n):
+                return (n / total * 100) if total > 0 else 0
+            
+            return f"""
+            <div style="margin-bottom: 16px;">
+                <h4 style="color: {REPORT_HEADER_COLOR}; margin-bottom: 6px;">{title} <span style="font-weight: normal; color: #666;">— {total} articles</span></h4>
+                <p style="color: #777; font-size: 0.9em; margin-bottom: 10px;">{subtitle}</p>
+                <div class="info-grid">
+                    <div class="info-card" style="border-left-color: {TISSUE_COLORS['Cardiac']};">
+                        <div class="label">Cardiac</div>
+                        <div class="value">{bucket['cardiac']} ({_pct(bucket['cardiac']):.1f}%)</div>
+                    </div>
+                    <div class="info-card" style="border-left-color: {TISSUE_COLORS['Skeletal']};">
+                        <div class="label">Skeletal</div>
+                        <div class="value">{bucket['skeletal']} ({_pct(bucket['skeletal']):.1f}%)</div>
+                    </div>
+                    <div class="info-card" style="border-left-color: {TISSUE_COLORS['Both']};">
+                        <div class="label">Both</div>
+                        <div class="value">{bucket['both']} ({_pct(bucket['both']):.1f}%)</div>
+                    </div>
+                    <div class="info-card" style="border-left-color: {TISSUE_COLORS['Not specified']};">
+                        <div class="label">Not Specified</div>
+                        <div class="value">{bucket['not_specified']} ({_pct(bucket['not_specified']):.1f}%)</div>
+                    </div>
+                </div>
+            </div>
+            """
+        
+        mentioned_row = _row(
+            'Articles that directly mention the input variant',
+            'Disease / tissue extracted from the article for the target variant.',
+            stats['mentioned'],
+        )
+        not_mentioned_row = _row(
+            'Articles that do NOT directly mention the input variant',
+            'Disease / tissue inferred from the main topic discussed in the article.',
+            stats['not_mentioned'],
+        )
         
         return f"""
         <div style="margin: 20px 0; padding: 20px; background: linear-gradient(135deg, #667eea15 0%, #764ba215 100%); border-radius: 10px; border: 2px solid {REPORT_ACCENT_COLOR};">
-            <h3 style="color: {REPORT_HEADER_COLOR}; margin-bottom: 15px; font-size: 1.3em;">📊 Tissue Involvement Statistics</h3>
-            <p style="color: #666; margin-bottom: 15px;">Distribution of tissue affected from all {stats['total_articles']} articles</p>
-            <div class="info-grid">
-                <div class="info-card" style="border-left-color: #e74c3c;">
-                    <div class="label">Cardiac</div>
-                    <div class="value">{stats['cardiac']} articles ({cardiac_pct:.1f}%)</div>
-                </div>
-                <div class="info-card" style="border-left-color: #f39c12;">
-                    <div class="label">Skeletal</div>
-                    <div class="value">{stats['skeletal']} articles ({skeletal_pct:.1f}%)</div>
-                </div>
-                <div class="info-card" style="border-left-color: #9b59b6;">
-                    <div class="label">Both</div>
-                    <div class="value">{stats['both']} articles ({both_pct:.1f}%)</div>
-                </div>
-                <div class="info-card" style="border-left-color: #95a5a6;">
-                    <div class="label">Not Specified</div>
-                    <div class="value">{stats['not_specified']} articles ({not_spec_pct:.1f}%)</div>
-                </div>
-            </div>
+            <h3 style="color: {REPORT_HEADER_COLOR}; margin-bottom: 15px; font-size: 1.3em;">Tissue Involvement Statistics</h3>
+            <p style="color: #666; margin-bottom: 15px;">Total: {stats['total_articles']} articles
+            ({stats['mentioned']['total']} mention the variant, {stats['not_mentioned']['total']} do not)</p>
+            {mentioned_row}
+            {not_mentioned_row}
         </div>
         """
 

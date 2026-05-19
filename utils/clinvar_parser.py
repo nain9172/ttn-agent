@@ -230,20 +230,36 @@ class ClinVarParser:
                                 'nucleotide': [], 'protein': [], 'protein_change': []
                             }
                             
+                            # 結構化來源（XML <HGVSlist>/<ProteinChange> + esummary）的結果。
+                            # 這兩個來源都只描述「本變異本身」，不會包含 co-occurring variants。
+                            structured_nuc = list(dict.fromkeys(
+                                xml_hgvs.get('nucleotide', []) + summary_hgvs.get('nucleotide', [])
+                            ))
+                            structured_prot = list(dict.fromkeys(
+                                xml_hgvs.get('protein', []) + summary_hgvs.get('protein', [])
+                            ))
+                            structured_pc = list(dict.fromkeys(
+                                xml_hgvs.get('protein_change', []) + summary_hgvs.get('protein_change', [])
+                            ))
+                            has_structured = bool(structured_nuc or structured_prot or structured_pc)
+                            
                             existing_nuc = result.get('hgvs_nucleotide') or []
                             existing_prot = result.get('hgvs_protein') or []
                             existing_pc = result.get('protein_change') or []
                             
-                            # 合併（XML 為主，esummary 補充）並去重
-                            merged_nuc = list(dict.fromkeys(
-                                xml_hgvs.get('nucleotide', []) + summary_hgvs.get('nucleotide', []) + existing_nuc
-                            ))
-                            merged_prot = list(dict.fromkeys(
-                                xml_hgvs.get('protein', []) + summary_hgvs.get('protein', []) + existing_prot
-                            ))
-                            merged_pc = list(dict.fromkeys(
-                                xml_hgvs.get('protein_change', []) + summary_hgvs.get('protein_change', []) + existing_pc
-                            ))
+                            if has_structured:
+                                # 結構化來源有資料 → 直接覆寫 web-scrape 版本，
+                                # 避免 ClinVar 頁面 SCV submission Comment 區段帶進來的
+                                # co-occurring variants 污染 alias 清單。
+                                merged_nuc = structured_nuc
+                                merged_prot = structured_prot
+                                merged_pc = structured_pc
+                            else:
+                                # XML/esummary 都失敗（罕見：efetch 回傳空 XML 且 esummary
+                                # 也沒帶 hgvs 欄位）→ 退而保留 web-scrape fallback。
+                                merged_nuc = list(dict.fromkeys(existing_nuc))
+                                merged_prot = list(dict.fromkeys(existing_prot))
+                                merged_pc = list(dict.fromkeys(existing_pc))
                             
                             if merged_nuc:
                                 result['hgvs_nucleotide'] = merged_nuc
@@ -262,10 +278,12 @@ class ClinVarParser:
                             logger.info(
                                 f"  HGVS 整合: {len(merged_nuc)} 核苷酸, "
                                 f"{len(merged_prot)} 蛋白質, {len(merged_pc)} Protein change "
-                                f"(XML: {len(xml_hgvs.get('nucleotide', []))}/{len(xml_hgvs.get('protein', []))}/"
+                                f"(source={'structured' if has_structured else 'web-scrape-fallback'}; "
+                                f"XML: {len(xml_hgvs.get('nucleotide', []))}/{len(xml_hgvs.get('protein', []))}/"
                                 f"{len(xml_hgvs.get('protein_change', []))}, "
                                 f"summary: {len(summary_hgvs.get('nucleotide', []))}/{len(summary_hgvs.get('protein', []))}/"
-                                f"{len(summary_hgvs.get('protein_change', []))})"
+                                f"{len(summary_hgvs.get('protein_change', []))}, "
+                                f"web: {len(existing_nuc)}/{len(existing_prot)}/{len(existing_pc)})"
                             )
                             
                             if result.get('pmid_list'):
@@ -899,6 +917,12 @@ class ClinVarParser:
                     logger.info(f"從 ClinVar 頁面提取到 dbSNP ID: {rsid}")
                 
                 # 同時提取 HGVS 表示法（含 Protein change 單字母多 isoform）
+                # ⚠️ 這份 HGVS 來自整頁 regex 掃描，會把 ClinVar 變異頁 SCV submission
+                # Comment 區段裡列的「co-occurring variants」也抓進來（e.g. rs138060032
+                # 頁面會出現 "TTN c.87491C>T (p.Pro29164Leu); c.69086_69095del10
+                # (p.Arg23029ThrfsX9)" — 那些不是本變異）。下游 _parse_clinvar_summary
+                # 之後的 Step 5（XML/esummary 整合，line ~227）會根據是否有結構化來源
+                # 決定要不要覆寫這份髒結果，所以此處仍寫入 result 作為 fallback。
                 hgvs_data = self._extract_hgvs_from_soup(soup)
                 if hgvs_data['nucleotide'] or hgvs_data['protein'] or hgvs_data.get('protein_change'):
                     result['hgvs'] = hgvs_data['nucleotide'] + hgvs_data['protein']

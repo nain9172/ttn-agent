@@ -122,3 +122,4 @@ llm_logs/
 
 # Third-party submodules / large vendor directories
 flash-attention/
+.flash_attn_build/

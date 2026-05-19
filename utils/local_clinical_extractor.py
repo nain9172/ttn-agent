@@ -31,6 +31,8 @@ try:
         LLM_USE_GUIDED_JSON,
         LLM_VERIFY_EVIDENCE,
         LLM_EVIDENCE_NGRAM_OVERLAP_THRESHOLD,
+        LLM_REQUIRE_DETERMINISTIC_ALIAS,
+        LLM_ALIAS_MIN_DIGIT_RUN,
     )
 except ImportError:
     LLM_SELF_CONSISTENCY_N = 1
@@ -38,6 +40,8 @@ except ImportError:
     LLM_USE_GUIDED_JSON = False
     LLM_VERIFY_EVIDENCE = False
     LLM_EVIDENCE_NGRAM_OVERLAP_THRESHOLD = 0.5
+    LLM_REQUIRE_DETERMINISTIC_ALIAS = True
+    LLM_ALIAS_MIN_DIGIT_RUN = 5
 
 logger = logging.getLogger(__name__)
 
@@ -120,6 +124,10 @@ class LocalClinicalExtractor:
             gpu_memory_utilization=gpu_memory_utilization,
             max_model_len=self.max_model_len,
             enforce_eager=True,
+            # 啟用 prefix caching：跨篇文章共享的 system prompt + few-shot 前綴會在
+            # GPU KV cache 內重用；n>1 的 self-consistency sample 之間也能共享，
+            # 不會改變輸出內容，只節省重複計算。
+            enable_prefix_caching=True,
         )
 
         # B1: self-consistency — n>1 才有意義（要 sample 多個再投票）
@@ -133,7 +141,8 @@ class LocalClinicalExtractor:
         sampling_kwargs: Dict[str, Any] = dict(
             n=self.n_samples,
             temperature=temperature,
-            top_p=0.9,
+            top_p=0.95,
+            top_k=64,
             max_tokens=8192,
             stop=stop_tokens,
         )
@@ -267,22 +276,40 @@ class LocalClinicalExtractor:
                 or article.get("abstract")
                 or ""
             )
+            # gate_text：給 deterministic gating 用的「完整」文字，含 docling 整篇 markdown
+            # （上游 litvar_search / enhanced_pubmed_search 已備好）。priority content 為了
+            # 控制 LLM token 被砍剩 tables+results，gate 不能用它判斷「文中是否提到」。
+            gate_text = article.get("gate_text") or raw_text
+            # A: deterministic alias gate — decide presence in code, not LLM
+            if LLM_REQUIRE_DETERMINISTIC_ALIAS:
+                present, _matched = self._alias_present_in_text(
+                    aliases, gate_text, article
+                )
+                if not present:
+                    logger.info(
+                        f"  [gate] PMID {article.get('pmid', '?')}: no specific "
+                        f"alias matched deterministically -> skip LLM, "
+                        f"disease=Not specified"
+                    )
+                    pipeline.append((article, raw_text, "", None, False))
+                    continue
+
             context = self._prepare_context(raw_text, aliases, article)
             if len(context.strip()) < 50:
-                pipeline.append((article, raw_text, context, None))
+                pipeline.append((article, raw_text, context, None, True))
                 continue
 
             if not ENABLE_EASY_PROMPT and self.backend == "vllm":
                 prompt = self._build_prompt(context, aliases, variant_id)
             else:
                 prompt = None
-            pipeline.append((article, raw_text, context, prompt))
+            pipeline.append((article, raw_text, context, prompt, True))
 
         # ── Phase 2: Batch vLLM inference (one call for all articles) ─────────
         # Only used when backend == "vllm" and ENABLE_EASY_PROMPT is False
         prompt_indices: List[int] = []
         prompts_to_run: List[str] = []
-        for i, (_, _, _, prompt) in enumerate(pipeline):
+        for i, (_, _, _, prompt, _) in enumerate(pipeline):
             if prompt is not None:
                 prompt_indices.append(i)
                 prompts_to_run.append(prompt)
@@ -312,8 +339,25 @@ class LocalClinicalExtractor:
 
         # ── Phase 3: Parse results, apply regex fallback, log ─────────────────
         enriched: List[Dict] = []
-        for i, (article, raw_text, context, prompt) in enumerate(pipeline):
+        for i, (article, raw_text, context, prompt, alias_present) in enumerate(pipeline):
             pmid = article.get("pmid", "unknown")
+
+            # A: deterministic gate failed — variant not named in article.
+            # Do NOT fall through to LLM/regex (regex would re-introduce a
+            # false positive from title/abstract disease keywords).
+            if LLM_REQUIRE_DETERMINISTIC_ALIAS and not alias_present:
+                info = self._get_empty_result(
+                    "Target variant alias not found in article "
+                    "(deterministic exact match)"
+                )
+                info["extraction_source"] = "deterministic_no_alias"
+                article["clinical_info"] = info
+                logger.info(
+                    f"  [-] PMID {pmid}: variant alias absent (deterministic) "
+                    f"-> Not specified"
+                )
+                enriched.append(article)
+                continue
 
             if prompt is None:
                 # Text too short or easy-prompt mode: skip LLM
@@ -432,7 +476,22 @@ class LocalClinicalExtractor:
             or article.get("abstract")
             or ""
         )
+        # gate_text：給 gating 用的完整 markdown（見 batch_extract 註解）
+        gate_text = article.get("gate_text") or raw_text
         aliases = get_variant_aliases(variant_id, clinvar_info)
+
+        # A: deterministic alias gate — decide presence in code, not LLM
+        if LLM_REQUIRE_DETERMINISTIC_ALIAS:
+            present, _matched = self._alias_present_in_text(
+                aliases, gate_text, article
+            )
+            if not present:
+                res = self._get_empty_result(
+                    "Target variant alias not found in article "
+                    "(deterministic exact match)"
+                )
+                res["extraction_source"] = "deterministic_no_alias"
+                return res
 
         context = self._prepare_context(raw_text, aliases, article)
 
@@ -510,6 +569,27 @@ class LocalClinicalExtractor:
             snip = abstract[:ABSTRACT_CAP]
             parts.append(f"[ABSTRACT]\n{snip}")
             budget -= len(snip) + 12
+
+        # Expand `text` to cover BOTH priority-content (tables/results/supplementary)
+        # AND the docling full markdown (letter body, discussion, case report).
+        # `text` (= text_for_llm) is the docling priority filter output, which
+        # strips Abstract/Introduction/Discussion/Case Report — letter-type
+        # papers (e.g. PMID 24578547) end up with ~96 chars of "## Note\nNo
+        # tables, supplementary data, or results section found." and the LLM
+        # never sees the actual content of the letter.
+        #
+        # `article["gate_text"]` (set upstream by litvar_search /
+        # enhanced_pubmed_search) is the docling FULL markdown. It contains
+        # the letter/discussion text but NOT supplementary tables. Concatenating
+        # both keeps supplementary evidence (priority) and narrative evidence
+        # (gate_text) — the alias hit windowing below dedupes overlaps anyway.
+        gate_text = (article.get("gate_text") or "").strip()
+        base_text = (text or "").strip()
+        if gate_text and gate_text != base_text:
+            if base_text and len(base_text) > 200 and base_text not in gate_text:
+                text = gate_text + "\n\n---\n\n" + base_text
+            else:
+                text = gate_text
 
         if budget <= 0 or not text:
             ctx = "\n\n".join(parts)
@@ -603,7 +683,6 @@ Known aliases (search for ANY of these in the text):
 
 ## YOUR TASK
 Read the article text below and answer: does this article provide clinical information (disease, phenotype, patient data) for the target variant listed above?
-
 ### IMPORTANT RULES
 1. **The variant may appear only in a table row** — that is sufficient. Extract the disease studied in that table/cohort.
 2. **Be permissive**: if the study enrolls patients with DCM and lists our variant in a supplementary table, the disease IS DCM.
@@ -864,6 +943,97 @@ Extract clinical information for the target variant. Output ONLY the JSON object
         s = re.sub(r"\s+", " ", s)
         return s.strip()
 
+    # ── A: Deterministic alias gating ────────────────────────────────────────
+
+    # Short protein-change patterns (post-normalization).
+    # `_normalize_for_match` turns `.` and `>` into spaces, so:
+    #   `p.Arg279Trp`  -> `p arg279trp`
+    #   `R279W`        -> `r279w`
+    #   `p.R279W`      -> `p r279w`
+    #
+    # These letter+digit+letter combos are inherently specific (the residue
+    # change pair makes coincidental collision astronomically rare), so we
+    # accept them as identifiers even when the digit run is only 2-4 digits
+    # (canonical TTN NM_133379 positions like 279).
+    _AA1 = "acdefghiklmnpqrstvwy"  # 20 one-letter amino acid codes
+    _AA3 = (
+        "ala|arg|asn|asp|cys|gln|glu|gly|his|ile|"
+        "leu|lys|met|phe|pro|ser|thr|trp|tyr|val"
+    )
+    _SHORT_PROTEIN_1L = re.compile(
+        rf"^(?:p )?[{_AA1}]\d{{2,}}[{_AA1}*]$"
+    )
+    _SHORT_PROTEIN_3L = re.compile(
+        rf"^(?:p )?(?:{_AA3})\d{{2,}}(?:{_AA3}|ter|\*)$"
+    )
+
+    @classmethod
+    def _usable_aliases(cls, aliases: List[str]) -> List[Tuple[str, str]]:
+        """
+        Keep only aliases specific enough to use as an exact identifier.
+
+        Returns [(original_alias, normalized_alias), ...]. An alias is usable if:
+          - normalized form is an rsID (``rs`` + >=4 digits), OR
+          - contains a run of >= LLM_ALIAS_MIN_DIGIT_RUN consecutive digits
+            (cDNA position like 107867, genomic 178527121, …), OR
+          - is a short protein notation (``letter+digits+letter`` or
+            ``Xxx+digits+Yyy``), which is specific enough on its own —
+            e.g. ``R279W``, ``p.R279W``, ``p.Arg279Trp``.
+
+        Loose tokens that could match by coincidence are still dropped: the
+        real guard is the exact contiguous space-delimited match below.
+        """
+        digit_run = re.compile(rf"\d{{{LLM_ALIAS_MIN_DIGIT_RUN},}}")
+        rsid = re.compile(r"rs\d{4,}")
+        out: List[Tuple[str, str]] = []
+        seen = set()
+        for a in aliases:
+            if not a:
+                continue
+            norm = cls._normalize_for_match(a)
+            if not norm or norm in seen:
+                continue
+            if (
+                rsid.fullmatch(norm)
+                or digit_run.search(norm)
+                or cls._SHORT_PROTEIN_1L.fullmatch(norm)
+                or cls._SHORT_PROTEIN_3L.fullmatch(norm)
+            ):
+                out.append((a, norm))
+                seen.add(norm)
+        return out
+
+    @classmethod
+    def _alias_present_in_text(
+        cls, aliases: List[str], raw_text: str, article: Dict
+    ) -> Tuple[bool, Optional[str]]:
+        """
+        Deterministic check: is the *target* variant actually named in the
+        article? Variant identity is an exact-string problem, not a fuzzy one.
+
+        Both sides are normalized so docling/OCR noise collapses
+        (``c.107867T>C`` / ``c.107867T . C`` / ``c.107867T | C`` → ``c 107867
+        t c``), then we require an *exact contiguous, space-delimited* match.
+        Numerically similar but different variants in the same table (e.g.
+        ``c.106244delG``, position ``179395323``) do NOT match and are
+        correctly rejected.
+        """
+        haystack = " ".join(
+            filter(None, [
+                article.get("title", ""),
+                article.get("abstract", ""),
+                raw_text or "",
+            ])
+        )
+        hay = cls._normalize_for_match(haystack)
+        if not hay:
+            return False, None
+        hay_padded = f" {hay} "
+        for original, norm in cls._usable_aliases(aliases):
+            if f" {norm} " in hay_padded:
+                return True, original
+        return False, None
+
     def _verify_evidence_grounding(
         self, evidence: str, raw_text: str, article: Dict
     ) -> Tuple[bool, float]:
@@ -893,10 +1063,17 @@ Extract clinical information for the target variant. Output ONLY the JSON object
         if not ev or ev in ("not specified", "n/a", "none"):
             return False, 0.0
 
+        # haystack：盡可能拉最完整的全文做 grounding 比對。raw_text 通常是
+        # docling priority content（letter/commentary 類 ~96 字元），LLM 引的
+        # evidence 句子常出自被 priority filter 砍掉的 letter body / discussion
+        # 章節 — 那段資料已上游存進 article["gate_text"]（docling 整篇 markdown）。
+        # 不加 gate_text 會把全 5/5 都答 HMERF 的 PMID 24578547 強制降級成
+        # "Not specified"。
         haystack = " ".join(
             filter(None, [
                 article.get("title", ""),
                 article.get("abstract", ""),
+                article.get("gate_text", "") or "",
                 raw_text or "",
             ])
         )

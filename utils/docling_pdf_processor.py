@@ -534,10 +534,14 @@ class DoclingPDFProcessor:
             "supplementary_links": extracted.supplementary_links,
             "has_results": bool(extracted.results_section),
             "has_abstract": bool(extracted.abstract),
+            # 完整 markdown 永遠帶回來：caller 用於 deterministic alias gating
+            # （只做字串比對，不會塞進 LLM prompt，不耗 GPU token）。
+            "full_markdown": extracted.full_markdown,
         }
         
+        # 向後相容：保留 include_full_text 旗標的明確語意（caller 若特意問就明示）
         if include_full_text:
-            result["full_markdown"] = extracted.full_markdown
+            result["include_full_text"] = True
         
         return result
 
