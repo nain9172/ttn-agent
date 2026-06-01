@@ -69,7 +69,7 @@ class ImageGenerator:
         gs = fig.add_gridspec(
             num_transcripts + 1, 
             1, 
-            hspace=0.1,  # 減少間距從 0.8 到 0.3
+            hspace=0.01,  # 減少間距從 0.8 到 0.3
             top=0.95,
             bottom=0.05,
             left=0.05,
