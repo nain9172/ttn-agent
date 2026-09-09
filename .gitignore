@@ -123,3 +123,23 @@ llm_logs/
 # Third-party submodules / large vendor directories
 flash-attention/
 .flash_attn_build/
+
+# === 研究資料與個人文件（不上傳；HGMD 為授權資料庫）===
+inference_data/
+HGMD_*.xlsx
+TTN_all_mutaion_*.csv
+pubtator_*.csv
+clinvar_*.csv
+clinvar_cache.json
+wrong_cases_*.csv
+pubmed_article_stats.csv
+*.docx
+*.pptx
+
+# 作圖腳本與圖表 notebook（與主程式無關）
+make_*_figures*.py
+*_figures.ipynb
+inference_optimization_results.ipynb
+compare_evo2_carbon_clinvar.ipynb
+test_inference_strategies.ipynb
+RELATED_WORK.canvas.tsx

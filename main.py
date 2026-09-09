@@ -36,6 +36,44 @@ try:
 except ImportError:
     ENABLE_EASY_PROMPT = False
 
+# Track B: mechanistic / analogy-based inference（無文獻時的類比推理）
+try:
+    from config import (
+        ENABLE_MECHANISTIC_INFERENCE,
+        INFERENCE_TOP_K_ANALOGS,
+        HGMD_KB_PATH,
+        TTN_BAND_EDGES,
+        TTN_BAND_LABELS,
+        TRANSCRIPT_INTERVAL_PATH,
+        TTN_TRANSCRIPT_MODEL_PATH,
+        HGVS_ALLOW_NETWORK,
+        REFERENCE_GENOME_PATH,
+    )
+except ImportError:
+    ENABLE_MECHANISTIC_INFERENCE = False
+    INFERENCE_TOP_K_ANALOGS = 8
+    HGMD_KB_PATH = None
+    TTN_BAND_EDGES = [178525989, 178535982, 178618584, 178775356, 178807423]
+    TTN_BAND_LABELS = ["M-band", "A-band", "I-band", "Z-disk"]
+    TRANSCRIPT_INTERVAL_PATH = None
+    TTN_TRANSCRIPT_MODEL_PATH = None
+    HGVS_ALLOW_NETWORK = False
+    REFERENCE_GENOME_PATH = None
+
+# 資料庫查表：HGMD / PubTator 對這顆變異登記的疾病（純查表，非推論）
+try:
+    from config import (
+        ENABLE_DATABASE_ANNOTATIONS,
+        HGMD_FULL_CSV_PATH,
+        PUBTATOR_VARIANTS_CSV_PATH,
+        PUBTATOR_COORD_CACHE_PATH,
+    )
+except ImportError:
+    ENABLE_DATABASE_ANNOTATIONS = False
+    HGMD_FULL_CSV_PATH = None
+    PUBTATOR_VARIANTS_CSV_PATH = None
+    PUBTATOR_COORD_CACHE_PATH = None
+
 # 設定 Triton PTXAS 環境變數（用於 vLLM 編譯）
 os.environ['TRITON_PTXAS_PATH'] = TRITON_PTXAS_PATH
 
@@ -101,6 +139,68 @@ def setup_logging():
     return logging.getLogger(__name__)
 
 
+def _any_article_mentions_variant(pubmed_results) -> bool:
+    """判斷是否有任何文獻「直接提到」輸入變異（決定是否需要走 Track B 推理）。
+
+    與 html_report._article_mentions_variant 邏輯一致：只要有一篇文章擷取到
+    非空的 evidence_sentence、具體 disease、或 patient_count > 0，就視為有文獻證據。
+    """
+    if not pubmed_results:
+        return False
+    skip = ("not specified", "n/a", "none", "", "json parsing failed")
+    for article in pubmed_results:
+        info = (article.get("clinical_info") or {}) if isinstance(article, dict) else {}
+        evidence = str(info.get("evidence_sentence") or "").strip().lower()
+        if evidence and evidence not in skip:
+            return True
+        disease = str(info.get("disease") or "").strip().lower()
+        if disease and disease not in skip:
+            return True
+        try:
+            if int(info.get("patient_count") or 0) > 0:
+                return True
+        except (ValueError, TypeError):
+            pass
+    return False
+
+
+def _parse_variant_input(raw: str, logger) -> dict:
+    """接受 `2-178612477-T-A`，也接受文獻慣用的 HGVS（c./p./g.）。
+
+    HGVS 會由 utils/hgvs_resolver 用 TTN 轉錄本外顯子模型離線換算成 GRCh38 座標，
+    ref/alt 依既有慣例為轉錄本方向（TTN 負鏈）。
+    """
+    from utils.variant_parser import VariantParseError
+
+    try:
+        return parse_variant(raw)
+    except VariantParseError as e:
+        from utils.hgvs_resolver import HgvsResolveError, HgvsResolver
+
+        try:
+            resolved = HgvsResolver(
+                model_path=TTN_TRANSCRIPT_MODEL_PATH,
+                fasta_path=REFERENCE_GENOME_PATH,
+                allow_network=HGVS_ALLOW_NETWORK,
+            ).resolve(raw)
+        except HgvsResolveError as he:
+            raise VariantParseError(f"{e}；也無法當成 HGVS 解析（{he}）") from he
+        info = resolved.to_variant_info()
+        if not info.get("ref") or not info.get("alt"):
+            raise VariantParseError(
+                f"{raw} 只能定位到 codon 起點（{info['variant_id']}），"
+                "缺少 ref/alt 無法跑 Evo2；請改用 c.HGVS 或 chr-pos-ref-alt"
+            )
+        logger.info(
+            f"HGVS 解析：{raw} -> {info['variant_id']} "
+            f"（{info.get('transcript')} {info.get('hgvs_c') or info.get('hgvs_p')}, "
+            f"{info.get('hgvs_vclass')}, confidence={info.get('hgvs_confidence')}）"
+        )
+        for w in info.get("hgvs_warnings") or []:
+            logger.warning(f"HGVS 解析提醒：{w}")
+        return info
+
+
 def main():
     """Main pipeline orchestrator"""
     logger = setup_logging()
@@ -112,7 +212,10 @@ def main():
     parser.add_argument(
         'variant',
         type=str,
-        help='Variant in format: chromosome-position-ref-alt (e.g., 2-178612477-T-A)'
+        help=(
+            'Variant as chromosome-position-ref-alt (e.g., 2-178612477-T-A) '
+            'or HGVS (e.g., c.98671-2A>G, NM_001267550.2:c.29800T>C, p.R31056*)'
+        )
     )
     parser.add_argument(
         '--output',
@@ -149,9 +252,9 @@ def main():
     logger.info(f"Starting TTN Variant AI Agent for variant: {args.variant}")
     
     try:
-        # Step 1: Parse variant
+        # Step 1: Parse variant（chr-pos-ref-alt，或 HGVS c./p./g.）
         logger.info("Step 1: Parsing variant...")
-        variant_info = parse_variant(args.variant)
+        variant_info = _parse_variant_input(args.variant, logger)
         logger.info(f"Parsed variant: {variant_info}")
         
         # Step 2: Parse ClinVar Information
@@ -162,6 +265,13 @@ def main():
             logger.info(f"Found {len(clinvar_info['pmid_list'])} PubMed IDs from ClinVar")
             logger.info(f"Variant impact: {clinvar_info.get('variant_impact')}")
             logger.info(f"Clinical significance: {clinvar_info.get('clinical_significance')}")
+        elif clinvar_info:
+            # ClinVar 有此變異記錄，但沒有引用文章。
+            # 保留 clinvar_info（conditions / HGVS / rsid），供 Track B 類比推理與
+            # LitVar(rsID) 使用；不再整個丟棄。文獻檢索仍會因無 pmid_list 而略過。
+            logger.warning(
+                "ClinVar 有記錄但無引用文章 —— 保留 conditions/HGVS/rsID 供類比推理使用"
+            )
         else:
             logger.warning("No ClinVar information found (this is okay, will use standard PubMed search)")
             clinvar_info = None
@@ -281,6 +391,7 @@ def main():
         
         # Step 4.5: Extract clinical information using local LLM
         aggregated_stats = None
+        clinical_extractor = None  # 供 Track B（Step 4.6）重用已載入的 LLM
         backend = args.llm_backend or LOCAL_LLM_BACKEND
         vllm_ok = _VLLM_PRELOAD_OK if backend == "vllm" else True
         if pubmed_results and ENABLE_LOCAL_CLINICAL_EXTRACTION and not args.skip_clinical_extraction:
@@ -313,6 +424,7 @@ def main():
                     max_model_len=LOCAL_LLM_MAX_MODEL_LEN,
                     max_context_length=LOCAL_LLM_MAX_CONTEXT_LENGTH
                 )
+                clinical_extractor = extractor  # 保留給 Track B 重用
                 
                 # 批次擷取臨床資訊
                 # *** 重要：傳入 variant_info 以確保只提取目標變異的信息 ***
@@ -346,7 +458,80 @@ def main():
             logger.info("Step 4.5: Skipped (disabled in config)")
         else:
             logger.info("Step 4.5: Skipped (--skip-clinical-extraction flag)")
-        
+
+        # Step 4.6: Mechanistic / analogy-based inference (Track B)
+        # 當沒有任何文獻直接提到輸入變異時，切換到類比推理路徑：
+        # Evo2 + 結構 band + 變異類型 + HGMD 同區帶同類型的已知致病變異 → LLM 推論。
+        # 輸出明確標示為 inference（非文獻證據），與 evidence 軌在報告上分軌呈現。
+        mechanistic_result = None
+        literature_mentions_variant = _any_article_mentions_variant(pubmed_results)
+        if ENABLE_MECHANISTIC_INFERENCE and not literature_mentions_variant:
+            logger.info("=" * 70)
+            logger.info("Step 4.6: No literature mentions the variant -> mechanistic inference (Track B)")
+            logger.info("=" * 70)
+            try:
+                from utils.mechanistic_inference import MechanisticInference
+
+                mi = MechanisticInference(
+                    kb_path=HGMD_KB_PATH,
+                    band_edges=TTN_BAND_EDGES,
+                    band_labels=TTN_BAND_LABELS,
+                    top_k=INFERENCE_TOP_K_ANALOGS,
+                    transcript_interval_path=TRANSCRIPT_INTERVAL_PATH,
+                    transcript_model_path=TTN_TRANSCRIPT_MODEL_PATH,
+                    reference_fasta_path=REFERENCE_GENOME_PATH,
+                    allow_network=HGVS_ALLOW_NETWORK,
+                )
+
+                # 若 Step 4.5 沒建過 LLM（例如完全無文獻），這裡按需載入一次
+                inference_extractor = clinical_extractor
+                if (
+                    inference_extractor is None
+                    and ENABLE_LOCAL_CLINICAL_EXTRACTION
+                    and not args.skip_clinical_extraction
+                    and vllm_ok
+                ):
+                    try:
+                        from utils.local_clinical_extractor import LocalClinicalExtractor
+
+                        model = args.llm_model or LOCAL_LLM_MODEL
+                        logger.info(f"Loading LLM for inference (backend={backend}, model={model})...")
+                        inference_extractor = LocalClinicalExtractor(
+                            backend=backend,
+                            model_name=model,
+                            tensor_parallel_size=LOCAL_LLM_TENSOR_PARALLEL,
+                            max_model_len=LOCAL_LLM_MAX_MODEL_LEN,
+                            max_context_length=LOCAL_LLM_MAX_CONTEXT_LENGTH,
+                        )
+                        clinical_extractor = inference_extractor
+                    except Exception as e:
+                        logger.warning(f"Could not load LLM for inference, using rule-based fallback: {e}")
+                        inference_extractor = None
+
+                mechanistic_result = mi.infer(
+                    inference_extractor, variant_info, clinvar_info, evo2_result
+                )
+
+                feats = mechanistic_result.get("features", {})
+                inf = mechanistic_result.get("inference", {})
+                logger.info(
+                    f"  Band: {feats.get('band')} | Type: {feats.get('vclass')} "
+                    f"({feats.get('vgroup')}) | Analogs: {len(feats.get('analogs', []))}"
+                )
+                logger.info(
+                    f"  Inferred disease: {inf.get('inferred_disease')} "
+                    f"| tissue: {inf.get('inferred_tissue')} "
+                    f"| confidence: {inf.get('confidence')} "
+                    f"| source: {inf.get('source')}"
+                )
+            except Exception as e:
+                logger.error(f"Error during mechanistic inference: {e}", exc_info=True)
+                logger.warning("Continuing without mechanistic inference...")
+        elif not ENABLE_MECHANISTIC_INFERENCE:
+            logger.info("Step 4.6: Skipped (mechanistic inference disabled in config)")
+        else:
+            logger.info("Step 4.6: Skipped (literature evidence for the variant is available)")
+
         # Step 5: Generate Protein Schematic (with integrated transcript intervals)
         logger.info("Step 5: Generating protein schematic...")
         image_gen = ImageGenerator()
@@ -363,6 +548,33 @@ def main():
         image_path = image_gen.generate_titin_schematic(variant_info, xlsx_path)
         logger.info(f"Generated image: {image_path}")
         
+        # Step 5.5: Curated database lookup（HGMD / PubTator 有沒有這顆變異、登記什麼疾病）
+        db_annotations = None
+        if ENABLE_DATABASE_ANNOTATIONS:
+            logger.info("Step 5.5: Looking up HGMD / PubTator for this variant...")
+            try:
+                from utils.variant_db_lookup import get_shared_lookup
+
+                db_lookup = get_shared_lookup(
+                    hgmd_csv=HGMD_FULL_CSV_PATH,
+                    hgmd_kb=HGMD_KB_PATH,
+                    pubtator_csv=PUBTATOR_VARIANTS_CSV_PATH,
+                    cache_path=PUBTATOR_COORD_CACHE_PATH,
+                )
+                db_annotations = db_lookup.lookup(
+                    chrom=str(variant_info['chrom']),
+                    pos=int(variant_info['pos']),
+                    ref=variant_info['ref'],
+                    alt=variant_info['alt'],
+                )
+                logger.info(
+                    f"  HGMD: {db_annotations.hgmd_diseases() or 'no match'} "
+                    f"| PubTator: {db_annotations.pubtator_diseases() or 'no match'}"
+                )
+            except Exception as e:
+                logger.error(f"Error during database lookup: {e}", exc_info=True)
+                logger.warning("Continuing without database annotations...")
+
         # Step 6: Generate HTML Report
         logger.info("Step 6: Generating HTML report...")
         report_gen = HTMLReportGenerator()
@@ -389,15 +601,21 @@ def main():
         import inspect
         sig = inspect.signature(report_gen.generate_report)
         if 'aggregated_stats' in sig.parameters:
-            report_path = report_gen.generate_report(
+            report_kwargs = dict(
                 variant_info=variant_info,
                 evo2_result=evo2_result,
                 pubmed_results=pubmed_results,
                 image_path=image_path,
                 output_path=output_path,
                 clinvar_info=clinvar_info,
-                aggregated_stats=aggregated_stats
+                aggregated_stats=aggregated_stats,
             )
+            # 只有在報告產生器支援時才傳入 Track B 結果（向後相容）
+            if 'mechanistic_result' in sig.parameters:
+                report_kwargs['mechanistic_result'] = mechanistic_result
+            if 'db_annotations' in sig.parameters:
+                report_kwargs['db_annotations'] = db_annotations
+            report_path = report_gen.generate_report(**report_kwargs)
         else:
             # Fallback for older html_report.py version
             report_path = report_gen.generate_report(

@@ -82,7 +82,8 @@ FORCE_REDOWNLOAD_SUPPLEMENTARY = False  # 是否強制重新下載已存在的 s
 LOCAL_LLM_BACKEND = "vllm" # or ollama
 # LOCAL_LLM_MODEL = "unsloth/medgemma-27b-text-it-GGUF"
 # LOCAL_LLM_MODEL = "google/medgemma-27b-it"  # MedGemma-27B instruction-tuned (醫療專用，27B 參數，約需 54GB)
-LOCAL_LLM_MODEL = "google/gemma-4-31B-it"
+LOCAL_LLM_MODEL = "nvidia/Gemma-4-31B-IT-NVFP4"
+# LOCAL_LLM_MODEL = "google/gemma-4-31B-it"
 # LOCAL_LLM_MODEL = "unsloth/gemma-4-31B-it-GGUF"
 # LOCAL_LLM_MODEL = "meta-llama/Llama-3.2-8B-Instruct"  # Llama 3.2 8B（約需 16GB）
 # LOCAL_LLM_MODEL = "google/gemma-3-27b-it"
@@ -115,6 +116,37 @@ LLM_REQUIRE_DETERMINISTIC_ALIAS = True
 # 別名要被當成「可用識別碼」需具備的特異性：正規化後須含 ≥ 此位數的連續數字，
 # 或為 rsID。避免短數字巧合命中。
 LLM_ALIAS_MIN_DIGIT_RUN = 5
+
+# === Track B: Mechanistic / analogy-based inference（無文獻時的推論） ===
+# 當文獻完全沒有提到輸入變異時，改走「類比推理」路徑：
+# Evo2 致病性 + 結構 band + 變異類型（truncating/missense/splice）+ 從 HGMD
+# 檢索同 band、同類型的已知致病變異作為類比證據，由 LLM 生成標示為
+# inference（非 citation）的推論說明。
+ENABLE_MECHANISTIC_INFERENCE = True
+INFERENCE_TOP_K_ANALOGS = 8  # 每次檢索的類比變異數量
+# HGMD 類比資料庫（已含 POS / REF / ALT / DNA(c.) / PROT(p.) / PHEN / phenotype）
+HGMD_KB_PATH = PROJECT_ROOT / "HGMD_TTN_processed (1).xlsx"
+# TTN 結構 band 的 genomic POS 分箱邊界（GRCh38, chr2；來自 pipeline_figures.ipynb §5）
+# pd.cut(POS, bins=TTN_BAND_EDGES, labels=TTN_BAND_LABELS) → 低 POS 到高 POS
+TTN_BAND_EDGES = [178525989, 178535982, 178618584, 178775356, 178807423]
+TTN_BAND_LABELS = ["M-band", "A-band", "I-band", "Z-disk"]
+# transcript interval 檔（用來判斷變異影響哪些 isoform）
+TRANSCRIPT_INTERVAL_PATH = PROJECT_ROOT / "transcript_interval.xlsx"
+# TTN RefSeq 轉錄本外顯子模型：讓輸入可以是 HGVS（c./p./g.）而不只是 chr-pos-ref-alt。
+# 由 build_ttn_transcript_model.py 從 NCBI RefSeq GFF3 產生（離線換算，不需 VEP）。
+TTN_TRANSCRIPT_MODEL_PATH = DATA_DIR / "ttn_transcript_model.json"
+# rsID 是唯一需要連網（dbSNP）的解析路徑；預設關閉，需要時再開
+HGVS_ALLOW_NETWORK = False
+
+# === 資料庫查表：這顆變異在 HGMD / PubTator 裡登記的疾病是什麼 ===
+# 純查表、不做推論；命中就把資料庫原文列在報告的 Curated Database Annotations 區塊。
+ENABLE_DATABASE_ANNOTATIONS = True
+# HGMD 完整匯出（含 disease / mutype / inheritance / pmid；REF/ALT 靠 acc_num 接 HGMD_KB_PATH）
+HGMD_FULL_CSV_PATH = PROJECT_ROOT / "TTN_all_mutaion_20260703.csv"
+# PubTator 文獻探勘出的 TTN 變異（只有 HGVS，座標靠 hgvs_resolver 離線換算）
+PUBTATOR_VARIANTS_CSV_PATH = PROJECT_ROOT / "pubtator_ttn_variants_all.csv"
+# PubTator HGVS → 座標的解析快取（第一次建索引後就不用重算）
+PUBTATOR_COORD_CACHE_PATH = OUTPUT_DIR / "pubtator_hgvs_coord_cache.json"
 
 # TTN Info
 TTN_GENE_INFO = {
