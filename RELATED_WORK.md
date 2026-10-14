@@ -2,7 +2,7 @@
 
 對照對象（本專案 Track B 推理）：從 HGMD 取同 band、同變異類型的已知致病變異 → 依 genomic 距離加權投票 → 預測疾病與組織，並以 PubTator 文獻標註當 ground truth 驗證。
 
-檢索日期 2026-08-24；§5–§9 為 2026-08-25 補充（限 2020 年後文獻）。實驗數據對應 `test_inference_strategies.ipynb`。
+檢索日期 2026-08-24；§5–§9 為 2026-08-25 補充（限 2020 年後文獻）。實驗數據對應 `research/test_inference_strategies.ipynb`。
 
 ---
 

@@ -5,7 +5,7 @@
 輸入可以是 xlsx 或 csv，變異來源二選一：
   1. 有 `input` 欄位（chr-pos-ref-alt 格式）→ 直接使用
   2. 沒有 `input` 欄位 → 由 --chrom-col/--pos-col/--ref-col/--alt-col 組出
-     （預設 chr / position / ref / alt，符合 data/clinvar_latest.csv）
+     （預設 chr / position / ref / alt，符合 data/clinvar_ttn.csv）
 
 寫回的欄位分兩組。
 
@@ -15,10 +15,17 @@ Tissue Involvement Statistics 的 8 個計數（依 mention input variant 區分
 
 報告層級的中介資料：
   - n_articles           報告裡的文獻數（0 表示 ClinVar 沒有引用文章）
-  - inferred_disease     Track B 類比推理預測的疾病（沒有文獻時才會有）
+  - inferred_disease     Track B 推論預測的疾病（沒有文獻時才會有）
   - inferred_tissue      Track B 預測的組織
   - inference_confidence Track B 的信心等級
+  - inference_source     哪一層做的決定（hierarchical / exon_hotspot_* /
+                         hgmd_exact_match / analogy_voting）
   - report_file          實際解析的報告檔名（也當作「這列已完成」的標記）
+
+Curated Database Annotations 區塊（查表，與有沒有跑 Track B 無關，永遠會有）：
+  - hgmd_match / pubtator_match           exact | same_position | none
+  - hgmd_disease / pubtator_disease       資料庫登記的疾病原文
+  - hgmd_same_pos_n / pubtator_same_pos_n 同位置但非同一顆的變異數
 
 特性：
   - 每跑完一個變異就立刻存檔，避免 SSH 中斷後遺失進度
@@ -27,12 +34,25 @@ Tissue Involvement Statistics 的 8 個計數（依 mention input variant 區分
   - Ctrl+C 會等本筆完成並儲存再退出
 
 用法（conda 環境 gm4）：
-  python batch_run_variants.py --input data/clinvar_latest.csv
+  python batch_run_variants.py --input data/clinvar_ttn.csv --skip-evo2
+
+注意：outputs/ 下已有報告時預設直接解析、不重跑 main.py。推論引擎或報告格式
+改過之後要拿到新結果，必須加 --force 強制重跑。
+
+In-process 模式（--in-process，必須搭配 --skip-evo2）：
+  不再逐筆開 main.py 子程序，而是在本程序內呼叫 main.run_pipeline，LLM 只載入
+  一次（每筆省下 4–5 分鐘的模型載入）。以下情況會存檔後以 exit code 3/4 結束，
+  交給 run_batch_inprocess.sh 自動續跑：
+    3  vLLM 引擎壞掉，或連續失敗達 --max-consecutive-failures 筆
+    4  已跑滿 --restart-every 筆（定期重啟，避免記憶體慢慢洩漏）
+  長時間批次請用包裝腳本（conda 環境 gm4 要先 activate，否則找不到 ninja）：
+    ./run_batch_inprocess.sh --input data/clinvar_ttn.csv --skip-evo2 --require-llm
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import signal
 import subprocess
@@ -45,9 +65,13 @@ import pandas as pd
 from bs4 import BeautifulSoup
 
 PROJECT_ROOT = Path(__file__).parent.resolve()
-DEFAULT_INPUT = PROJECT_ROOT / "HGMD_TTN_processed.xlsx"
+DEFAULT_INPUT = PROJECT_ROOT / "data" / "clinvar_ttn.csv"
 OUTPUT_DIR = PROJECT_ROOT / "outputs"
 MAIN_PY = PROJECT_ROOT / "main.py"
+
+# in-process 模式需要由外層重啟程序才能繼續（見 run_batch_inprocess.sh）
+EXIT_ENGINE_RESTART = 3
+EXIT_PERIODIC_RESTART = 4
 
 INPUT_COL = "input"
 
@@ -62,11 +86,16 @@ RESULT_COLS = [
     "no_mention_Not_Specified",
 ]
 
-INT_META_COLS = ["n_articles"]
+INT_META_COLS = ["n_articles", "hgmd_same_pos_n", "pubtator_same_pos_n"]
 STR_META_COLS = [
     "inferred_disease",
     "inferred_tissue",
     "inference_confidence",
+    "inference_source",
+    "hgmd_match",
+    "hgmd_disease",
+    "pubtator_match",
+    "pubtator_disease",
     "report_file",
 ]
 META_COLS = INT_META_COLS + STR_META_COLS
@@ -204,6 +233,62 @@ def _parse_inference(soup: BeautifulSoup) -> dict:
     return out
 
 
+# Curated Database Annotations 區塊：每張卡片的 head 開頭是資料庫名，
+# 有 .dbann-hit 代表完全命中，.dbann-disease.dbann-none 代表沒有疾病可列。
+DB_CARD_PREFIX = {"HGMD": "hgmd", "PubTator": "pubtator"}
+_SAME_POS_RE = re.compile(r"\((\d+)\s+other")
+
+
+def _parse_db_annotations(soup: BeautifulSoup) -> dict:
+    """從 Curated Database Annotations 區塊取出 HGMD / PubTator 的命中狀態。
+
+    這一區塊跟 Track B 無關：文獻有寫出疾病、推論被跳過時它一樣會出現，
+    所以四個 *_match 欄位對每一列都應該有值。
+    """
+    out: dict = {}
+    for name, prefix in DB_CARD_PREFIX.items():
+        out[f"{prefix}_match"] = None
+        out[f"{prefix}_disease"] = None
+        out[f"{prefix}_same_pos_n"] = 0
+
+    for card in soup.select(".dbann-db"):
+        head_el = card.select_one(".dbann-db-head")
+        if head_el is None:
+            continue
+        head = head_el.get_text(" ", strip=True)
+        prefix = next((p for n, p in DB_CARD_PREFIX.items() if head.startswith(n)), None)
+        if prefix is None:
+            continue
+
+        meta = card.select_one(".dbann-db-meta")
+        meta_text = meta.get_text(" ", strip=True) if meta else ""
+        same_pos = _SAME_POS_RE.search(meta_text)
+        n_same = int(same_pos.group(1)) if same_pos else 0
+        out[f"{prefix}_same_pos_n"] = n_same
+
+        if card.select_one(".dbann-hit") is not None:
+            out[f"{prefix}_match"] = "exact"
+            dis = card.select_one(".dbann-disease")
+            if dis is not None and "dbann-none" not in (dis.get("class") or []):
+                out[f"{prefix}_disease"] = dis.get_text(" ", strip=True) or None
+        else:
+            out[f"{prefix}_match"] = "same_position" if n_same else "none"
+
+    return out
+
+
+_SOURCE_RE = re.compile(r"Inference source:\s*(\S+)")
+
+
+def _parse_inference_source(soup: BeautifulSoup) -> Optional[str]:
+    """取出是哪一層做的決定；報告沒有這一行（例如未跑 Track B）時為 None。"""
+    node = soup.find(string=_SOURCE_RE)
+    if node is None:
+        return None
+    m = _SOURCE_RE.search(str(node))
+    return m.group(1) if m else None
+
+
 def parse_report(html_path: Path) -> Optional[dict]:
     """解析 HTML 報告。
 
@@ -240,6 +325,8 @@ def parse_report(html_path: Path) -> Optional[dict]:
     result["n_articles"] = n_articles
 
     result.update(_parse_inference(soup))
+    result["inference_source"] = _parse_inference_source(soup)
+    result.update(_parse_db_annotations(soup))
     return result
 
 
@@ -265,7 +352,61 @@ def run_main_py(
     except Exception as exc:  # noqa: BLE001
         print(f"  [error] {variant_id} 執行失敗: {exc}", flush=True)
         return False
+    if result.returncode < 0:
+        # 被訊號終止（例如記憶體不足時的 OOM killer 送 SIGKILL），Python 來不及印 traceback
+        import signal as _signal
+        try:
+            name = _signal.Signals(-result.returncode).name
+        except ValueError:
+            name = str(-result.returncode)
+        print(f"  [error] main.py 被訊號 {name} 終止（記憶體不足時常見）", flush=True)
+    elif result.returncode != 0:
+        print(f"  [error] main.py exit code {result.returncode}", flush=True)
     return result.returncode == 0
+
+
+def load_in_process_pipeline(need_llm: bool):
+    """匯入 main.py 當作函式庫使用；回傳 (main 模組, logger)。"""
+    os.chdir(PROJECT_ROOT)
+    import main as pipeline  # main 會先 pre-import vLLM，必須早於任何 torch 初始化
+
+    logger = pipeline.setup_logging()
+    if need_llm:
+        wait_for_gpu_headroom(pipeline)
+    return pipeline, logger
+
+
+def wait_for_gpu_headroom(pipeline, max_wait: int = 900, poll: int = 15) -> None:
+    """等上一個程序釋放顯存。GB10 統一記憶體釋放要一點時間，剛重啟時常常還不夠。"""
+    deadline = time.time() + max_wait
+    while True:
+        free, total, occupants = pipeline.gpu_headroom()
+        if free is None:
+            return
+        needed = total * pipeline.LLM_GPU_MEMORY_UTILIZATION
+        if free >= needed:
+            print(f"[info] GPU 可用 {free:.1f} GiB（需要 {needed:.1f} GiB）", flush=True)
+            return
+        if time.time() >= deadline:
+            print(f"[warn] 等了 {max_wait}s 顯存仍不足（{free:.1f} / {needed:.1f} GiB），"
+                  f"直接開始；佔用者: {occupants or '未知'}", flush=True)
+            return
+        print(f"[info] 等待顯存釋放：{free:.1f} / {needed:.1f} GiB", flush=True)
+        time.sleep(poll)
+
+
+def run_in_process(pipeline, logger, variant_id: str, extra_args: list[str]) -> int:
+    """在本程序內跑一顆變異；回傳 main.run_pipeline 的 exit code。"""
+    print(f"  [run] in-process main.run_pipeline {variant_id} {' '.join(extra_args)}",
+          flush=True)
+    args = pipeline.build_arg_parser().parse_args([variant_id, *extra_args])
+    try:
+        return pipeline.run_pipeline(args, logger)
+    except KeyboardInterrupt:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        print(f"  [error] {variant_id} 執行失敗: {exc}", flush=True)
+        return 1
 
 
 def read_table(path: Path) -> pd.DataFrame:
@@ -399,7 +540,8 @@ def main() -> int:
     parser.add_argument(
         "--parse-only",
         action="store_true",
-        help="只解析已存在的 HTML 報告，不跑 main.py（用來補回先前產生過的結果）",
+        help="只解析已存在的 HTML 報告，不跑 main.py（用來補回先前產生過的結果）。"
+        "搭配 --force 可把新增欄位補寫到已完成的列",
     )
     parser.add_argument(
         "--force",
@@ -432,10 +574,44 @@ def main() -> int:
         action="store_true",
         help="轉傳給 main.py：跳過本地 LLM 擷取（Track B 會走 rule-based fallback）",
     )
+
+    parser.add_argument(
+        "--no-reuse",
+        action="store_true",
+        help=("永不沿用 outputs/ 既有的報告，一律重跑 main.py。"
+              "中斷後續跑時要加，否則尚未處理的列會沿用舊引擎產生的報告"),
+    )
+    parser.add_argument(
+        "--require-llm",
+        action="store_true",
+        help=("轉傳給 main.py：LLM 該跑卻跑不起來時直接讓該筆失敗，"
+              "而不是產生一份沒有 AI Analysis 的報告。長時間批次建議加上"),
+    )
     parser.add_argument(
         "--dry-run",
         action="store_true",
         help="只列出待處理的變異與既有報告狀態，不執行也不寫檔",
+    )
+    parser.add_argument(
+        "--in-process",
+        action="store_true",
+        help=("在本程序內呼叫 main.run_pipeline，LLM 只載入一次（需搭配 --skip-evo2）。"
+              "長時間批次請透過 run_batch_inprocess.sh 執行以便自動續跑"),
+    )
+    parser.add_argument(
+        "--restart-every",
+        type=int,
+        default=0,
+        metavar="N",
+        help=f"in-process 模式下跑滿 N 筆就存檔並以 exit {EXIT_PERIODIC_RESTART} 結束，"
+        "由外層重啟 (預設 0 = 不重啟)。注意 --limit 會在每次重啟後重新計算",
+    )
+    parser.add_argument(
+        "--max-consecutive-failures",
+        type=int,
+        default=5,
+        metavar="N",
+        help=f"in-process 模式下連續失敗 N 筆就存檔並以 exit {EXIT_ENGINE_RESTART} 結束 (預設 5)",
     )
     args = parser.parse_args()
 
@@ -470,6 +646,8 @@ def main() -> int:
         extra_args.append("--skip-evo2")
     if args.skip_clinical_extraction:
         extra_args.append("--skip-clinical-extraction")
+    if args.require_llm:
+        extra_args.append("--require-llm")
 
     total_rows = len(df)
     start = max(0, args.start)
@@ -525,14 +703,17 @@ def main() -> int:
           flush=True)
 
     if args.dry_run:
+        # dry-run 的統計要跟實際迴圈用同一個沿用條件，否則 --no-reuse / --force
+        # 之下會把「其實要重跑」的列報成「可直接解析」。
+        reuse_ok = args.parse_only or (not args.force and not args.no_reuse)
         have = 0
         for idx, variant_id in todo:
-            report = find_existing_report(variant_id, preferred_tags)
+            report = find_existing_report(variant_id, preferred_tags) if reuse_ok else None
             if report is not None:
                 have += 1
             print(f"  row {idx}: {variant_id} -> "
                   f"{report.name if report else '(需要跑 main.py)'}", flush=True)
-        print(f"\n[dry-run] 其中 {have} 筆已有報告可直接解析，"
+        print(f"\n[dry-run] 其中 {have} 筆可沿用既有報告，"
               f"{len(todo) - have} 筆需要跑 main.py", flush=True)
         return 0
 
@@ -541,6 +722,20 @@ def main() -> int:
         save_table(df, out_path)
         return 0
 
+    pipeline = None
+    pipeline_logger = None
+    if args.in_process and not args.parse_only:
+        if not args.skip_evo2:
+            # Evo2 與 vLLM 放不進同一塊記憶體；逐筆子程序模式才能在兩者間釋放
+            print("[error] --in-process 必須搭配 --skip-evo2", file=sys.stderr)
+            return 1
+        if args.timeout is not None:
+            print("[warn] --in-process 模式無法中斷執行中的 vLLM，--timeout 將被忽略",
+                  flush=True)
+        pipeline, pipeline_logger = load_in_process_pipeline(
+            need_llm=not args.skip_clinical_extraction
+        )
+
     signal.signal(signal.SIGINT, _signal_handler)
     save_table(df, out_path)
 
@@ -548,9 +743,16 @@ def main() -> int:
     parsed_existing = 0
     ran_main = 0
     failed = 0
+    failed_at_last_success = 0
+    exit_code: Optional[int] = None
 
     for n, (idx, variant_id) in enumerate(todo, 1):
         if _stop_requested:
+            break
+        if pipeline is not None and failed - failed_at_last_success >= args.max_consecutive_failures:
+            print(f"\n[fatal] 連續失敗 {failed - failed_at_last_success} 筆，存檔後結束"
+                  f"（exit {EXIT_ENGINE_RESTART}），交由外層重啟續跑", flush=True)
+            exit_code = EXIT_ENGINE_RESTART
             break
 
         print(f"\n[{n}/{len(todo)}] row {idx} variant = {variant_id}", flush=True)
@@ -559,7 +761,12 @@ def main() -> int:
         report_path = find_existing_report(variant_id, preferred_tags)
         result: Optional[dict] = None
 
-        if report_path is not None and not args.force:
+        # 沿用既有報告的條件。三個旗標各管一件事：
+        #   --force      連已完成的列也重新處理（上面決定 todo 時用）
+        #   --no-reuse   一律重跑 main.py，不吃 outputs/ 現有的報告
+        #   --parse-only 相反，一律沿用既有報告、絕不跑 main.py
+        reuse_ok = args.parse_only or (not args.force and not args.no_reuse)
+        if report_path is not None and reuse_ok:
             print(f"  [reuse] 找到既有報告 {report_path.name}", flush=True)
             result = parse_report(report_path)
             if result is not None:
@@ -572,7 +779,17 @@ def main() -> int:
                 print("  [skip] --parse-only 模式且沒有可用既有報告", flush=True)
                 continue
 
-            ok = run_main_py(variant_id, timeout=args.timeout, extra_args=extra_args)
+            if pipeline is not None:
+                code = run_in_process(pipeline, pipeline_logger, variant_id, extra_args)
+                if code == pipeline.EXIT_LLM_ENGINE_DEAD or pipeline.llm_engine_dead():
+                    failed += 1
+                    print(f"\n[fatal] vLLM 引擎已壞，{variant_id} 未寫入；存檔後結束"
+                          f"（exit {EXIT_ENGINE_RESTART}），交由外層重啟續跑", flush=True)
+                    exit_code = EXIT_ENGINE_RESTART
+                    break
+                ok = code == 0
+            else:
+                ok = run_main_py(variant_id, timeout=args.timeout, extra_args=extra_args)
             if not ok:
                 failed += 1
                 print(f"  [error] main.py 失敗，跳過 {variant_id}", flush=True)
@@ -608,7 +825,16 @@ def main() -> int:
                        f" / {result.get('inferred_tissue')}"
                        f" ({result.get('inference_confidence')})")
         print(f"  [ok] {variant_id} 完成 ({dt:.1f}s) -> {detail}", flush=True)
+        failed_at_last_success = failed
 
+        if (pipeline is not None and args.restart_every > 0
+                and ran_main >= args.restart_every and n < len(todo)):
+            print(f"\n[info] 已跑滿 {ran_main} 筆，存檔後結束（exit {EXIT_PERIODIC_RESTART}），"
+                  "交由外層重啟續跑", flush=True)
+            exit_code = EXIT_PERIODIC_RESTART
+            break
+
+    save_table(df, out_path)
     print("\n========== 完成 ==========", flush=True)
     print(f"已處理: {processed} 筆", flush=True)
     print(f"  - 解析既有報告: {parsed_existing}", flush=True)
@@ -616,6 +842,8 @@ def main() -> int:
     print(f"略過 (已有結果): {skipped}", flush=True)
     print(f"失敗: {failed}", flush=True)
     print(f"輸出: {out_path}", flush=True)
+    if exit_code is not None:
+        return exit_code
     return 0 if failed == 0 else 2
 
 

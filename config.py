@@ -46,8 +46,8 @@ TTN_SEQUENCE_END = 178525989
 # PubMed / ClinVar / NCBI API 認證
 # email 是 NCBI 必要欄位；API Key 可提高速率限制（3→10 req/s）
 # 在 .env 中設定 PUBMED_EMAIL / PUBMED_API_KEY，或透過 shell 環境變數傳入
-PUBMED_EMAIL = os.getenv("PUBMED_EMAIL", "ryan910702@gmail.com")
-_raw_api_key = os.getenv("PUBMED_API_KEY", "987512860b8bf8e96a09d672b03ff32e2c08")
+PUBMED_EMAIL = os.getenv("PUBMED_EMAIL", "")
+_raw_api_key = os.getenv("PUBMED_API_KEY", "")
 PUBMED_API_KEY = _raw_api_key if _raw_api_key not in ("", "your_api_key_here") else ""
 PUBMED_MAX_RESULTS = 50
 ENABLE_FULL_TEXT_FETCH = True
@@ -88,6 +88,9 @@ LOCAL_LLM_MODEL = "nvidia/Gemma-4-31B-IT-NVFP4"
 # LOCAL_LLM_MODEL = "meta-llama/Llama-3.2-8B-Instruct"  # Llama 3.2 8B（約需 16GB）
 # LOCAL_LLM_MODEL = "google/gemma-3-27b-it"
 LOCAL_LLM_TENSOR_PARALLEL = 1  # 單 GPU 使用 1，多 GPU 可增加（例如 2 或 4）
+# vLLM 會嘗試佔用「總顯存 × 這個比例」，不足就直接 CUDA out of memory。
+# main.py 的前置檢查用同一個數字判斷現在載不載得起來，兩邊必須一致。
+LLM_GPU_MEMORY_UTILIZATION = 0.85
 LOCAL_LLM_MAX_MODEL_LEN = 32768  # vLLM 最大模型長度（單個 prompt 上限，tokens）
 # 注意：n=5 self-consistency 時會 sample 5 次，KV cache 是 5 倍。
 # DGX Spark 128GB unified memory，MedGemma-27B BF16 weights ≈ 54GB，
@@ -124,14 +127,36 @@ LLM_ALIAS_MIN_DIGIT_RUN = 5
 # inference（非 citation）的推論說明。
 ENABLE_MECHANISTIC_INFERENCE = True
 INFERENCE_TOP_K_ANALOGS = 8  # 每次檢索的類比變異數量
-# HGMD 類比資料庫（已含 POS / REF / ALT / DNA(c.) / PROT(p.) / PHEN / phenotype）
-HGMD_KB_PATH = PROJECT_ROOT / "HGMD_TTN_processed (1).xlsx"
-# TTN 結構 band 的 genomic POS 分箱邊界（GRCh38, chr2；來自 pipeline_figures.ipynb §5）
+# 舊的 HGMD 類比資料庫（含 POS / REF / ALT / DNA(c.) / PROT(p.) / PHEN / phenotype）。
+# INFERENCE_HGMD_CSV_PATH 設定後就不再作為類比庫，只剩 variant_db_lookup 用它
+# 的 acc_num → REF/ALT 對照來做精確比對。
+HGMD_KB_PATH = DATA_DIR / "HGMD_TTN_processed.xlsx"
+
+# --- 推論的資料來源（pipeline 用到的資料都放在 data/）-----------------------
+INFERENCE_DATA_DIR = DATA_DIR  # 舊名稱，保留給仍引用它的程式
+# 類比／計數用的 HGMD 完整匯出（2,193 筆，含 disease / mutype / rankscore）。
+# 這份沒有 REF/ALT，所以引擎的 exact 比對會關閉，改由 Step 5.5 的查表負責。
+INFERENCE_HGMD_CSV_PATH = INFERENCE_DATA_DIR / "HGMD_latest.csv"
+# cardiodb：364 個外顯子的 Hg38 座標、結構 band、心肌／骨骼肌實測 PSI。
+# 設定後取代轉錄本模型成為 exon / band / PSI 來源（涵蓋 364 vs 舊表的 323）。
+INFERENCE_CARDIODB_PATH = INFERENCE_DATA_DIR / "cardiodb.xlsx"
+
+# 第 3 層的決策方式：
+#   "hierarchical" 階層式收縮 全庫 → band → PSI 類別 → exon（預設）
+#   "analogy"      距離加權類比投票（原本的做法，保留可切換）
+INFERENCE_PREDICT_MODE = "hierarchical"
+# 每一層往上一層收縮的強度（m-estimate 的等效樣本數）。值越大代表越不信任
+# 該層自己的計數。1,926 顆變異分到 364 個外顯子、平均 5.3 顆，m_exon=4 讓
+# 典型外顯子的估計約一半來自自身、一半來自 PSI 類別的先驗。
+INFERENCE_M_EXON = 4.0
+INFERENCE_M_BUCKET = 4.0
+INFERENCE_M_BAND = 8.0
+# TTN 結構 band 的 genomic POS 分箱邊界（GRCh38, chr2；來自 research/pipeline_figures.ipynb §5）
 # pd.cut(POS, bins=TTN_BAND_EDGES, labels=TTN_BAND_LABELS) → 低 POS 到高 POS
 TTN_BAND_EDGES = [178525989, 178535982, 178618584, 178775356, 178807423]
 TTN_BAND_LABELS = ["M-band", "A-band", "I-band", "Z-disk"]
 # transcript interval 檔（用來判斷變異影響哪些 isoform）
-TRANSCRIPT_INTERVAL_PATH = PROJECT_ROOT / "transcript_interval.xlsx"
+TRANSCRIPT_INTERVAL_PATH = DATA_DIR / "transcript_interval.xlsx"
 # TTN RefSeq 轉錄本外顯子模型：讓輸入可以是 HGVS（c./p./g.）而不只是 chr-pos-ref-alt。
 # 由 build_ttn_transcript_model.py 從 NCBI RefSeq GFF3 產生（離線換算，不需 VEP）。
 TTN_TRANSCRIPT_MODEL_PATH = DATA_DIR / "ttn_transcript_model.json"
@@ -142,11 +167,15 @@ HGVS_ALLOW_NETWORK = False
 # 純查表、不做推論；命中就把資料庫原文列在報告的 Curated Database Annotations 區塊。
 ENABLE_DATABASE_ANNOTATIONS = True
 # HGMD 完整匯出（含 disease / mutype / inheritance / pmid；REF/ALT 靠 acc_num 接 HGMD_KB_PATH）
-HGMD_FULL_CSV_PATH = PROJECT_ROOT / "TTN_all_mutaion_20260703.csv"
-# PubTator 文獻探勘出的 TTN 變異（只有 HGVS，座標靠 hgvs_resolver 離線換算）
-PUBTATOR_VARIANTS_CSV_PATH = PROJECT_ROOT / "pubtator_ttn_variants_all.csv"
+HGMD_FULL_CSV_PATH = INFERENCE_DATA_DIR / "HGMD_latest.csv"
+# PubTator 文獻探勘出的 TTN 變異。這一版多了 ClinVar 標註欄（position /
+# chromosome / clinvar_match_status）：唯一命中的 2,142 列直接有權威座標，
+# 其餘仍靠 hgvs_resolver 離線換算。
+PUBTATOR_VARIANTS_CSV_PATH = DATA_DIR / "pubtator" / "pubtator_ttn_variants_clinvar_annotated.csv"
 # PubTator HGVS → 座標的解析快取（第一次建索引後就不用重算）
 PUBTATOR_COORD_CACHE_PATH = OUTPUT_DIR / "pubtator_hgvs_coord_cache.json"
+# PubMind 文獻探勘出的 TTN 變異（parsed_variants 為正股 allele，比對時取互補）
+PUBMIND_JSON_PATH = DATA_DIR / "pubmind_ttn.json"
 
 # TTN Info
 TTN_GENE_INFO = {

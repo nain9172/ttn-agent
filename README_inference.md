@@ -1,7 +1,7 @@
 # Track B：無文獻證據時的 TTN 變異表型推論
 
 > 簡報用說明文件。對應程式 `utils/mechanistic_inference.py`、
-> 評估 `eval_inference_data.py`、圖表 `inference_benchmark_figures.ipynb`。
+> 評估 `research/eval_inference_data.py`、圖表 `research/inference_benchmark_figures.ipynb`。
 
 ---
 
@@ -45,8 +45,8 @@ Track B 回答一個較弱但仍有臨床意義的問題：
 | 角色 | 檔案 | 規模 |
 |---|---|---|
 | 計數來源（類比庫） | `TTN_all_mutaion_20260703.csv`（HGMD） | 2,172 顆，其中 1,926 顆可定位到外顯子 |
-| 外顯子座標 / band / PSI | `cardiodb.xlsx` | 364 個外顯子 |
-| Ground truth | `pubtator_ttn_variants_clinvar_annotated.csv` | 419 顆（有座標且原文判 P/LP） |
+| 外顯子座標 / band / PSI | `data/cardiodb.xlsx` | 364 個外顯子 |
+| Ground truth | `data/pubtator/pubtator_ttn_variants_clinvar_annotated.csv` | 419 顆（有座標且原文判 P/LP） |
 
 **PSI**（percent spliced-in）是該外顯子在某組織的轉錄本中被保留的比例。
 cardiodb 對 36 個外顯子沒有骨骼肌 PSI（exon 148、150、172–205，全在 I-band），
@@ -369,14 +369,14 @@ $m_{\text{exon}}$ 與 $m_{\text{bucket}}$ 在 1～16 之間掃描，PubTator 命
 
 ```bash
 # 評估
-conda run -n gm4 python eval_inference_data.py
+conda run -n gm4 python research/eval_inference_data.py
 
 # 方法比較
-conda run -n gm4 python compare_exon_psi_methods.py
+conda run -n gm4 python research/compare_exon_psi_methods.py
 
 # 全部圖表
 conda run -n gm4 jupyter nbconvert --to notebook --execute \
-    --inplace inference_benchmark_figures.ipynb
+    --inplace research/inference_benchmark_figures.ipynb
 ```
 
 ```python

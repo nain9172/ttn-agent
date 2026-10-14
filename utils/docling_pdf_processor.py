@@ -216,68 +216,6 @@ class DoclingPDFProcessor:
         logger.debug(f"提取 {section_name} 章節: {len(section_content)} 字元")
         return section_content
     
-    def extract_supplementary_links(self, markdown_content: str, pmid: Optional[str] = None) -> List[Dict[str, str]]:
-        """
-        提取 Supplementary Data 連結
-        
-        Args:
-            markdown_content: Markdown 內容
-            pmid: PubMed ID（可選，用於從網頁抓取）
-            
-        Returns:
-            Supplementary 連結列表 [{"text": "...", "url": "..."}]
-        """
-        links = []
-        
-        # 方法 1: 從 Markdown 內容提取
-        for pattern in self.SUPPLEMENTARY_LINK_PATTERNS:
-            matches = re.findall(pattern, markdown_content, re.IGNORECASE)
-            for match in matches:
-                if isinstance(match, tuple):
-                    text = match[0] if len(match) > 0 else ""
-                    url = match[1] if len(match) > 1 else match[0]
-                else:
-                    text = "Supplementary Data"
-                    url = match
-                
-                if url and url.startswith('http'):
-                    links.append({
-                        "name": text.strip() if text else "Supplementary Data",  # 使用 'name' 統一欄位名稱
-                        "url": url.strip(),
-                        "type": "unknown"  # 添加 type 欄位
-                    })
-        
-        # 方法 2: 如果提供 PMID，從 PMC 網頁抓取（更準確）
-        if pmid and len(links) == 0:
-            try:
-                from utils.supplementary_downloader import SupplementaryDownloader
-                downloader = SupplementaryDownloader()
-                web_links = downloader.scrape_pmc_supplementary_links(pmid)
-                
-                for web_link in web_links:
-                    links.append({
-                        "name": web_link['name'],  # 使用 'name' 而不是 'text'
-                        "url": web_link['url'],
-                        "type": web_link.get('type', 'unknown')
-                    })
-                
-                if web_links:
-                    logger.info(f"從 PMC 網頁抓取到 {len(web_links)} 個 Supplementary 連結")
-                    
-            except Exception as e:
-                logger.debug(f"無法從網頁抓取 supplementary links: {e}")
-        
-        # 移除重複
-        seen_urls = set()
-        unique_links = []
-        for link in links:
-            if link['url'] not in seen_urls:
-                seen_urls.add(link['url'])
-                unique_links.append(link)
-        
-        logger.info(f"提取到 {len(unique_links)} 個 Supplementary 連結")
-        return unique_links
-    
     def extract_figures(self, markdown_content: str) -> List[str]:
         """
         提取圖片描述和連結

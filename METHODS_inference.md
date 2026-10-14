@@ -1,7 +1,7 @@
 # Track B：類比式機制推理（Analogy-Based Mechanistic Inference）
 
 > 論文方法章節草稿。對應程式：`utils/mechanistic_inference.py`、
-> 評估：`benchmark_inference.py`、圖表：`inference_benchmark_figures.ipynb`。
+> 評估：`research/benchmark_inference.py`、圖表：`research/inference_benchmark_figures.ipynb`。
 
 ---
 
@@ -376,12 +376,12 @@ HGMD 評估採 `loo_scope = "position"`：預測前將**查詢變異所在位置
 
 ```bash
 # 主要結果與消融
-conda run -n gm4 python benchmark_inference.py --truth hgmd
-conda run -n gm4 python benchmark_inference.py --truth pubtator
+conda run -n gm4 python research/benchmark_inference.py --truth hgmd
+conda run -n gm4 python research/benchmark_inference.py --truth pubtator
 
 # 全部圖表（含 §8.2、§8.3 消融）
 conda run -n gm4 jupyter nbconvert --to notebook --execute \
-    --inplace inference_benchmark_figures.ipynb
+    --inplace research/inference_benchmark_figures.ipynb
 ```
 
 | 參數 | 值 | 位置 |

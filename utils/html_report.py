@@ -279,6 +279,9 @@ class HTMLReportGenerator:
             font-size: 0.85em; background: #2e7d32; color: #fff; letter-spacing: 0.3px;
         }}
         .dbann-pubtator .dbann-hit {{ background: #1565c0; }}
+        .dbann-pubmind {{ border-left-color: #6a1b9a; }}
+        .dbann-pubmind .dbann-hit {{ background: #6a1b9a; }}
+        .dbann-level {{ color: #6a1b9a; font-size: 0.85em; }}
         .dbann-miss {{
             display: inline-block; padding: 2px 7px; border-radius: 3px; margin-left: 6px;
             font-size: 0.85em; background: #bdbdbd; color: #fff; letter-spacing: 0.3px;
@@ -293,6 +296,11 @@ class HTMLReportGenerator:
             border-bottom: 2px solid #e6efe7; padding-top: 0;
         }}
         .dbann-evidence-label {{ font-style: normal; font-weight: bold; color: #1b5e20; }}
+        .dbann-fixed {{ table-layout: fixed; }}
+        .dbann-fixed td {{ overflow-wrap: anywhere; }}
+        .dbann-pmid-cell {{ white-space: nowrap; }}
+        .dbann-ref-note {{ color: #777; font-size: 0.85em; white-space: normal; }}
+        .dbann-caption {{ color: #555; font-size: 0.85em; margin: -2px 0 8px; line-height: 1.6; }}
         .dbann-details {{ margin-top: 20px; }}
         .dbann-details summary {{ cursor: pointer; color: #33691e; font-size: 0.9em; padding: 8px 0; }}
         """
@@ -329,7 +337,7 @@ class HTMLReportGenerator:
             <div class="info-card"><div class="label">Prediction</div><div class="value">{pred}</div></div>
         </div></section>"""
 
-    # ── Curated database annotations (HGMD / PubTator) ────────────────────
+    # ── Curated database annotations (HGMD / PubTator / PubMind) ────────────────────
 
     @staticmethod
     def _pubmed_link(pmid: Any, label: Optional[str] = None) -> str:
@@ -369,11 +377,177 @@ class HTMLReportGenerator:
             return "—"
         return html.escape(text.replace("_", " ").replace("/", " / "))
 
+    # 三個資料庫的明細表共用同一組欄位；各資料庫特有的資訊都收在 Details 欄。
+    DBANN_COLUMNS = ("Disease (as recorded)", "Variant (as written)", "Classification", "Details", "PMID")
+    # 固定欄寬，讓三張表上下對齊
+    DBANN_WIDTHS = ("22%", "20%", "15%", "25%", "18%")
+
+    # HGMD 的分類代碼 → 可讀說明
+    HGMD_TAGS = {
+        "DM": "DM (disease-causing)",
+        "DM?": "DM? (likely disease-causing)",
+        "DP": "DP (disease-associated polymorphism)",
+        "DFP": "DFP (disease-associated polymorphism, functional evidence)",
+        "FP": "FP (functional polymorphism)",
+        "R": "R (retired record)",
+    }
+
+    @staticmethod
+    def _clean_text(value: Any) -> str:
+        text = str(value or "").strip()
+        return "" if text.lower() in ("none", "nan", "null", "-", "not specified") else text
+
+    @classmethod
+    def _pmid_cell(cls, pmid: Any, note: Optional[str] = None, pmcid: Optional[str] = None) -> str:
+        """統一的文獻欄：PMID 連結為主，作者／期刊／年份等次要資訊放在下一行。"""
+        pmid_str = cls._clean_text(pmid)
+        pmc_str = cls._clean_text(pmcid)
+        if pmid_str:
+            main = cls._pubmed_link(pmid_str)
+        elif pmc_str:
+            main = (
+                f'<a href="https://pmc.ncbi.nlm.nih.gov/articles/{html.escape(pmc_str)}/" '
+                f'target="_blank" rel="noopener">{html.escape(pmc_str)}</a>'
+                ' <span class="dbann-ref-note">(no PMID)</span>'
+            )
+        else:
+            main = '<span class="dbann-ref-note">No PMID</span>'
+        note = cls._clean_text(note)
+        if note:
+            main += f'<div class="dbann-ref-note">{html.escape(note)}</div>'
+        return main
+
+    @classmethod
+    def _db_table(cls, title: str, rows: List[Dict[str, str]], caption: str = "") -> str:
+        """rows 的每一項：disease / variant / classification / details / pmid 為已轉義的 HTML，
+        evidence 為純文字（可省略），會以整列附在下方。"""
+        if not rows:
+            return ""
+        body = ""
+        n_cols = len(cls.DBANN_COLUMNS)
+        for r in rows:
+            body += f"""
+                <tr>
+                    <td><b>{r['disease']}</b></td>
+                    <td>{r['variant']}</td>
+                    <td>{r['classification']}</td>
+                    <td>{r['details']}</td>
+                    <td class="dbann-pmid-cell">{r['pmid']}</td>
+                </tr>"""
+            evidence = cls._clean_text(r.get("evidence"))
+            if evidence:
+                if len(evidence) > 400:
+                    evidence = evidence[:400] + "…"
+                body += (
+                    f'<tr class="dbann-evidence"><td colspan="{n_cols}">'
+                    f'<span class="dbann-evidence-label">Evidence:</span> '
+                    f'&ldquo;{html.escape(evidence)}&rdquo;</td></tr>'
+                )
+        head = "".join(f"<th>{c}</th>" for c in cls.DBANN_COLUMNS)
+        cols = "".join(f'<col style="width:{w}">' for w in cls.DBANN_WIDTHS)
+        caption_html = f'<div class="dbann-caption">{caption}</div>' if caption else ""
+        return f"""
+            <h4 class="dbann-subhead">{html.escape(title)}</h4>
+            {caption_html}
+            <table class="dbann-table dbann-fixed">
+                <colgroup>{cols}</colgroup>
+                <thead><tr>{head}</tr></thead>
+                <tbody>{body}</tbody>
+            </table>"""
+
+    @classmethod
+    def _classification_cell(cls, value: Any) -> str:
+        """文獻探勘來源的大小寫不一（pathogenic / Pathogenic），統一成句首大寫。"""
+        text = cls._clean_text(value)
+        return html.escape(text[:1].upper() + text[1:]) if text else "—"
+
+    @staticmethod
+    def _join_bits(*bits: str) -> str:
+        """把已轉義的片段用 · 串起來，空的略過。"""
+        kept = [b for b in bits if b and b != "—"]
+        return " · ".join(kept) if kept else "—"
+
+    @staticmethod
+    def _year_desc(rec: Dict) -> int:
+        try:
+            return -int(str(rec.get("year") or 0).split(".")[0])
+        except ValueError:
+            return 0
+
+    def _hgmd_row(self, r: Dict) -> Dict[str, str]:
+        tag = self._clean_text(r.get("tag"))
+        clinvar = self._clinvar_sig_text(r.get("clinvar_clnsig"))
+        cid = str(r.get("clinvar_id") or "").split(".")[0]
+        if clinvar != "—" and cid and cid.lower() not in ("none", "nan", "null"):
+            clinvar = (
+                f'<a href="https://www.ncbi.nlm.nih.gov/clinvar/variation/{html.escape(cid)}/" '
+                f'target="_blank" rel="noopener">{clinvar}</a>'
+            )
+        protein = self._clean_text(r.get("descr") or r.get("amino"))
+        note = " ".join(b for b in (self._clean_text(r.get("author")), self._clean_text(r.get("year"))) if b)
+        journal = self._clean_text(r.get("journal"))
+        return {
+            "disease": self._db_cell(r.get("disease")),
+            "variant": self._join_bits(self._hgmd_hgvs_cell(r), html.escape(f"p.{protein}") if protein else ""),
+            "classification": html.escape(self.HGMD_TAGS.get(tag, tag)) or "—",
+            "details": self._join_bits(
+                self._db_cell(r.get("mutype")),
+                f"Inheritance: {self._db_cell(r.get('inheritance'))}" if self._clean_text(r.get("inheritance")) else "",
+                f"ClinVar: {clinvar}" if clinvar != "—" else "",
+            ),
+            "pmid": self._pmid_cell(r.get("pmid"), " · ".join(b for b in (note, journal) if b)),
+            "evidence": self._clean_text(r.get("comments")),
+        }
+
+    def _pubtator_row(self, r: Dict) -> Dict[str, str]:
+        patients = self._clean_text(r.get("patient_count"))
+        onset = self._clean_text(r.get("age_onset"))
+        tissue = self._clean_text(r.get("tissue"))
+        note = " ".join(b for b in (self._clean_text(r.get("journal")), self._clean_text(r.get("year"))) if b)
+        return {
+            "disease": self._db_cell(r.get("disease")),
+            "variant": self._db_cell(r.get("hgvs_c") or r.get("variant_text")),
+            "classification": self._classification_cell(r.get("pathogenicity")),
+            "details": self._join_bits(
+                html.escape(f"Tissue: {tissue}") if tissue else "",
+                html.escape(f"Onset: {onset}") if onset else "",
+                html.escape(f"{patients} patient(s)") if patients else "",
+            ),
+            "pmid": self._pmid_cell(r.get("pmid"), note),
+            "evidence": self._clean_text(r.get("evidence_sentence")),
+        }
+
+    def _pubmind_rows(self, record: Dict) -> List[Dict[str, str]]:
+        """PubMind 一筆變異紀錄底下有多篇文獻，逐篇展開成一列。"""
+        variant = html.escape(str(record.get("label") or "—"))
+        if record.get("level") == "protein":
+            variant += ' <span class="dbann-level">(protein-level: amino-acid change only)</span>'
+        rows = []
+        for pub in record.get("publications") or []:
+            section = self._clean_text(pub.get("section"))
+            rows.append({
+                "disease": self._db_cell(pub.get("disease")),
+                "variant": variant,
+                "classification": self._classification_cell(pub.get("pathogenicity")),
+                "details": html.escape(f"Section: {section}") if section else "—",
+                "pmid": self._pmid_cell(pub.get("pmid"), pub.get("pmcid") if pub.get("pmid") else None,
+                                        pmcid=pub.get("pmcid")),
+                "evidence": self._clean_text(pub.get("evidence")),
+            })
+        return rows
+
+    @staticmethod
+    def _card_meta(n_records: int, pmids: set, extra: List[str]) -> str:
+        """三張摘要卡共用的說明列：紀錄數 · PMID 數 · 分類摘要。"""
+        bits = [f"{n_records} record(s)", f"{len(pmids)} PMID(s)"] + [b for b in extra if b]
+        return " · ".join(bits)
+
     def _generate_database_section(self, db_annotations: Optional[Any]) -> str:
-        """把 HGMD / PubTator 對這顆變異登記的疾病直接列出來。
+        """把 HGMD / PubTator / PubMind 對這顆變異登記的疾病直接列出來。
 
         這一軌是「查表」而非推論：命中就照實呈現資料庫原文，
-        所以視覺上用綠/藍（hard record），與 Track B 的琥珀色推論明確區隔。
+        所以視覺上用綠/藍/紫（hard record），與 Track B 的琥珀色推論明確區隔。
+        三個資料庫的摘要卡與明細表格式一致，每一列都標出 PMID。
         """
         if db_annotations is None:
             return ""
@@ -384,174 +558,127 @@ class HTMLReportGenerator:
         pubtator = data.get("pubtator_exact") or []
         hgmd_pos = data.get("hgmd_same_position") or []
         pubtator_pos = data.get("pubtator_same_position") or []
+        pubmind = data.get("pubmind_exact") or []
+        pubmind_checked = bool(data.get("pubmind_checked"))
 
-        # ── HGMD 摘要卡
-        if hgmd:
-            diseases = data.get("hgmd_diseases") or []
-            disease_text = " · ".join(html.escape(str(d)) for d, _ in diseases) or "Not specified"
-            tags = sorted({str(r.get("tag")) for r in hgmd if r.get("tag")})
-            mutypes = sorted({str(r.get("mutype")) for r in hgmd if r.get("mutype")})
-            inherit = sorted({str(r.get("inheritance")) for r in hgmd if r.get("inheritance")})
-            meta_bits = [b for b in (
-                "/".join(tags), "/".join(mutypes), "/".join(inherit)
-            ) if b]
-            hgmd_card = f"""
-                <div class="dbann-db dbann-hgmd">
-                    <div class="dbann-db-head">HGMD <span class="dbann-hit">EXACT VARIANT MATCH</span></div>
-                    <div class="dbann-disease">{disease_text}</div>
-                    <div class="dbann-db-meta">{html.escape(' · '.join(meta_bits)) if meta_bits else '&nbsp;'}</div>
-                </div>"""
-        else:
-            note = (
-                f"No entry for this variant ({len(hgmd_pos)} other HGMD variant(s) at the same position)"
-                if hgmd_pos else "This variant is not catalogued in HGMD"
-            )
-            hgmd_card = f"""
-                <div class="dbann-db dbann-empty">
-                    <div class="dbann-db-head">HGMD <span class="dbann-miss">NO MATCH</span></div>
-                    <div class="dbann-disease dbann-none">—</div>
-                    <div class="dbann-db-meta">{html.escape(note)}</div>
-                </div>"""
-
-        # ── PubTator 摘要卡
-        if pubtator:
-            diseases = data.get("pubtator_diseases") or []
-            disease_text = " · ".join(
-                f"{html.escape(str(d))}" + (f" <span class=\"dbann-count\">×{n}</span>" if n > 1 else "")
-                for d, n in diseases
+        def disease_html(counts) -> str:
+            return " · ".join(
+                html.escape(str(d)) + (f' <span class="dbann-count">×{n}</span>' if n > 1 else "")
+                for d, n in counts
             ) or "Not specified"
-            pmids = sorted({str(r.get("pmid")) for r in pubtator if r.get("pmid")})
-            paths = sorted({str(r.get("pathogenicity")) for r in pubtator if r.get("pathogenicity")})
-            meta = f"{len(pubtator)} report(s) across {len(pmids)} publication(s)"
-            if paths:
-                meta += f" · {'/'.join(paths)}"
-            pubtator_card = f"""
-                <div class="dbann-db dbann-pubtator">
-                    <div class="dbann-db-head">PubTator (literature-mined) <span class="dbann-hit">EXACT VARIANT MATCH</span></div>
-                    <div class="dbann-disease">{disease_text}</div>
+
+        def hit_card(css: str, title: str, label: str, diseases: str, meta: str) -> str:
+            return f"""
+                <div class="dbann-db {css}">
+                    <div class="dbann-db-head">{title} <span class="dbann-hit">{label}</span></div>
+                    <div class="dbann-disease">{diseases}</div>
                     <div class="dbann-db-meta">{html.escape(meta)}</div>
                 </div>"""
-        else:
-            note = (
-                f"No mention of this variant ({len(pubtator_pos)} other variant(s) reported at the same position)"
-                if pubtator_pos else "This variant is not mentioned in the PubTator-mined TTN corpus"
-            )
-            pubtator_card = f"""
+
+        def miss_card(title: str, note: str) -> str:
+            return f"""
                 <div class="dbann-db dbann-empty">
-                    <div class="dbann-db-head">PubTator (literature-mined) <span class="dbann-miss">NO MATCH</span></div>
+                    <div class="dbann-db-head">{title} <span class="dbann-miss">NO MATCH</span></div>
                     <div class="dbann-disease dbann-none">—</div>
                     <div class="dbann-db-meta">{html.escape(note)}</div>
                 </div>"""
 
-        # ── HGMD 明細表
-        hgmd_table = ""
+        def pmids_of(records) -> set:
+            return {self._clean_text(r.get("pmid")) for r in records} - {""}
+
+        # ── 摘要卡
         if hgmd:
-            rows = ""
-            for r in hgmd:
-                clinvar_cell = self._clinvar_sig_text(r.get("clinvar_clnsig"))
-                cid = str(r.get("clinvar_id") or "").split(".")[0]
-                if cid and cid.lower() not in ("none", "nan", "null", ""):
-                    clinvar_cell = (
-                        f'<a href="https://www.ncbi.nlm.nih.gov/clinvar/variation/{html.escape(cid)}/" '
-                        f'target="_blank" rel="noopener">{clinvar_cell}</a>'
-                    )
-                ref_label = None
-                if r.get("author"):
-                    ref_label = f"{r.get('author')} {r.get('year') or ''}".strip()
-                rows += f"""
-                <tr>
-                    <td><b>{self._db_cell(r.get('disease'))}</b></td>
-                    <td>{self._hgmd_hgvs_cell(r)}</td>
-                    <td>{self._db_cell(r.get('amino') or r.get('descr'))}</td>
-                    <td>{self._db_cell(r.get('mutype'))}</td>
-                    <td>{self._db_cell(r.get('tag'))}</td>
-                    <td>{self._db_cell(r.get('inheritance'))}</td>
-                    <td>{clinvar_cell}</td>
-                    <td>{self._pubmed_link(r.get('pmid'), ref_label)}</td>
-                </tr>"""
-            hgmd_table = f"""
-            <h4 class="dbann-subhead">HGMD entries for this variant</h4>
-            <table class="dbann-table">
-                <thead><tr>
-                    <th>Disease (as recorded)</th><th>HGVS (c.)</th><th>Protein / change</th>
-                    <th>Type</th><th>Class</th><th>Inheritance</th><th>ClinVar</th><th>Reference</th>
-                </tr></thead>
-                <tbody>{rows}</tbody>
-            </table>"""
+            tags = sorted({self._clean_text(r.get("tag")) for r in hgmd} - {""})
+            mutypes = sorted({self._clean_text(r.get("mutype")) for r in hgmd} - {""})
+            inherit = sorted({self._clean_text(r.get("inheritance")) for r in hgmd} - {""})
+            hgmd_card = hit_card(
+                "dbann-hgmd", "HGMD", "EXACT VARIANT MATCH",
+                disease_html(data.get("hgmd_diseases") or []),
+                self._card_meta(len(hgmd), pmids_of(hgmd), ["/".join(tags), "/".join(mutypes), "/".join(inherit)]),
+            )
+        else:
+            hgmd_card = miss_card("HGMD", (
+                f"No entry for this variant ({len(hgmd_pos)} other HGMD variant(s) at the same position)"
+                if hgmd_pos else "This variant is not catalogued in HGMD"
+            ))
 
-        # ── PubTator 明細表（新的排前面）
-        pubtator_table = ""
         if pubtator:
-            def _year_key(rec):
-                try:
-                    return -int(str(rec.get("year") or 0))
-                except ValueError:
-                    return 0
+            paths = sorted({self._clean_text(r.get("pathogenicity")) for r in pubtator} - {""})
+            pubtator_card = hit_card(
+                "dbann-pubtator", "PubTator (literature-mined)", "EXACT VARIANT MATCH",
+                disease_html(data.get("pubtator_diseases") or []),
+                self._card_meta(len(pubtator), pmids_of(pubtator), ["/".join(paths)]),
+            )
+        else:
+            pubtator_card = miss_card("PubTator (literature-mined)", (
+                f"No mention of this variant ({len(pubtator_pos)} other variant(s) reported at the same position)"
+                if pubtator_pos else "This variant is not mentioned in the PubTator-mined TTN corpus"
+            ))
 
-            rows = ""
-            for r in sorted(pubtator, key=_year_key):
-                evidence = str(r.get("evidence_sentence") or "").strip()
-                evidence_row = ""
-                if evidence and evidence.lower() not in ("none", "nan", "not specified"):
-                    if len(evidence) > 400:
-                        evidence = evidence[:400] + "…"
-                    evidence_row = (
-                        f'<tr class="dbann-evidence"><td colspan="7">'
-                        f'<span class="dbann-evidence-label">Evidence:</span> '
-                        f'&ldquo;{html.escape(evidence)}&rdquo;</td></tr>'
-                    )
-                rows += f"""
-                <tr>
-                    <td><b>{self._db_cell(r.get('disease'))}</b></td>
-                    <td>{self._db_cell(r.get('hgvs_c') or r.get('variant_text'))}</td>
-                    <td>{self._db_cell(r.get('pathogenicity'))}</td>
-                    <td>{self._db_cell(r.get('tissue'))}</td>
-                    <td>{self._db_cell(r.get('age_onset'))}</td>
-                    <td>{self._db_cell(r.get('patient_count'))}</td>
-                    <td>{self._pubmed_link(r.get('pmid'), f"{r.get('journal') or 'PubMed'} {r.get('year') or ''}".strip())}</td>
-                </tr>{evidence_row}"""
-            pubtator_table = f"""
-            <h4 class="dbann-subhead">PubTator-mined reports for this variant</h4>
-            <table class="dbann-table">
-                <thead><tr>
-                    <th>Disease (as reported)</th><th>Variant as written</th><th>Pathogenicity</th>
-                    <th>Tissue</th><th>Onset</th><th>Patients</th><th>Reference</th>
-                </tr></thead>
-                <tbody>{rows}</tbody>
-            </table>"""
+        pubmind_card = ""
+        if pubmind:
+            pubs = [p for r in pubmind for p in (r.get("publications") or [])]
+            sigs = sorted({self._clean_text(r.get("sig")) for r in pubmind} - {""})
+            pubmind_card = hit_card(
+                "dbann-pubmind", "PubMind (literature-mined)",
+                "EXACT VARIANT MATCH" if any(r.get("level") == "dna" for r in pubmind) else "PROTEIN-LEVEL MATCH",
+                disease_html(data.get("pubmind_diseases") or []),
+                self._card_meta(len(pubs), pmids_of(pubs), ["/".join(sigs)]),
+            )
+        elif pubmind_checked:
+            pubmind_card = miss_card(
+                "PubMind (literature-mined)", "This variant is not recorded in the PubMind TTN variant set"
+            )
+
+        # ── 明細表（格式一致：Disease / Variant / Classification / Details / PMID）
+        hgmd_table = self._db_table(
+            "HGMD entries for this variant",
+            [self._hgmd_row(r) for r in sorted(hgmd, key=self._year_desc)],
+        )
+        pubtator_table = self._db_table(
+            "PubTator-mined reports for this variant",
+            [self._pubtator_row(r) for r in sorted(pubtator, key=self._year_desc)],
+        )
+        pubmind_rows, captions = [], []
+        for r in sorted(pubmind, key=lambda rec: -(rec.get("papers") or 0)):
+            pubmind_rows.extend(self._pubmind_rows(r))
+            score = f" (score {r['score']:.2f})" if r.get("score") is not None else ""
+            confidence = self._clean_text(r.get("confidence"))
+            captions.append(" · ".join(b for b in (
+                f"<b>{html.escape(str(r.get('pvid') or ''))}</b> {html.escape(str(r.get('label') or ''))}",
+                f"overall: {html.escape(str(r.get('sig') or '—'))}{score}",
+                f"confidence: {html.escape(confidence)}" if confidence else "",
+            ) if b))
+        pubmind_table = self._db_table(
+            "PubMind records for this variant", pubmind_rows, "<br>".join(captions)
+        )
 
         # ── 同位置但不同 allele（折疊，避免誤讀為同一顆變異）
         same_pos_block = ""
         if hgmd_pos or pubtator_pos:
             rows = ""
-            for r in hgmd_pos:
+            for source, row in (
+                [("HGMD", self._hgmd_row(r)) for r in hgmd_pos]
+                + [("PubTator", self._pubtator_row(r)) for r in pubtator_pos]
+            ):
                 rows += f"""
                 <tr>
-                    <td>HGMD</td>
-                    <td>{self._hgmd_hgvs_cell(r)}</td>
-                    <td>{self._db_cell(r.get('mutype'))}</td>
-                    <td><b>{self._db_cell(r.get('disease'))}</b></td>
-                    <td>{self._pubmed_link(r.get('pmid'))}</td>
-                </tr>"""
-            for r in pubtator_pos:
-                rows += f"""
-                <tr>
-                    <td>PubTator</td>
-                    <td>{self._db_cell(r.get('hgvs_c') or r.get('variant_text'))}</td>
-                    <td>{self._db_cell(r.get('pathogenicity'))}</td>
-                    <td><b>{self._db_cell(r.get('disease'))}</b></td>
-                    <td>{self._pubmed_link(r.get('pmid'))}</td>
+                    <td>{source}</td>
+                    <td><b>{row['disease']}</b></td>
+                    <td>{row['variant']}</td>
+                    <td>{row['classification']}</td>
+                    <td class="dbann-pmid-cell">{row['pmid']}</td>
                 </tr>"""
             same_pos_block = f"""
             <details class="dbann-details">
                 <summary>Other variants recorded at this same genomic position ({len(hgmd_pos) + len(pubtator_pos)}) — different allele, shown for context only</summary>
                 <table class="dbann-table">
-                    <thead><tr><th>Source</th><th>Variant</th><th>Type / call</th><th>Disease</th><th>Reference</th></tr></thead>
+                    <thead><tr><th>Source</th><th>Disease (as recorded)</th><th>Variant (as written)</th><th>Classification</th><th>PMID</th></tr></thead>
                     <tbody>{rows}</tbody>
                 </table>
             </details>"""
 
-        has_hit = bool(hgmd or pubtator)
+        has_hit = bool(hgmd or pubtator or pubmind)
         if has_hit:
             note = (
                 "The diseases below are <b>recorded verbatim</b> in the source databases for this exact "
@@ -560,22 +687,25 @@ class HTMLReportGenerator:
             )
         else:
             note = (
-                "This variant was <b>not found</b> in either curated source, so no database-recorded disease "
+                "This variant was <b>not found</b> in any curated source, so no database-recorded disease "
                 "can be reported for it. Any disease shown elsewhere in this report comes from literature "
                 "screening or inference."
             )
 
         section_class = "dbann-section" if has_hit else "dbann-section dbann-section-empty"
+        badge = "HGMD · PUBTATOR · PUBMIND LOOKUP" if pubmind_checked else "HGMD · PUBTATOR LOOKUP"
         return f"""
         <section class="section {section_class}">
-            <h2>Curated Database Annotations <span class="dbann-badge">HGMD · PUBTATOR LOOKUP</span></h2>
+            <h2>Curated Database Annotations <span class="dbann-badge">{badge}</span></h2>
             <div class="dbann-note">{note}</div>
             <div class="dbann-headline">
                 {hgmd_card}
                 {pubtator_card}
+                {pubmind_card}
             </div>
-            {pubtator_table}
             {hgmd_table}
+            {pubtator_table}
+            {pubmind_table}
             {same_pos_block}
         </section>"""
 
@@ -1017,5 +1147,3 @@ class HTMLReportGenerator:
     def _generate_footer(self) -> str:
         return f"<footer><p>Generated by TTN Variant AI Agent</p></footer>"
 
-    def _get_javascript(self) -> str:
-        return ""

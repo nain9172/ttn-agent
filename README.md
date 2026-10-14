@@ -1,343 +1,113 @@
 # TTN Variant AI Agent
 
-A comprehensive AI agent for analyzing TTN (Titin) gene variants, combining pathogenicity prediction (Evo2), literature mining (PubMed), and protein domain visualization.
-
-## 🌟 Features
-
-- **Evo2 Pathogenicity Prediction**: Uses state-of-the-art Evo2 model for variant impact assessment
-- **PubMed Literature Mining**: Automatically searches and extracts relevant clinical information
-- **Protein Domain Visualization**: Generates detailed schematics showing variant location across TTN isoforms
-- **Comprehensive HTML Reports**: Beautiful, interactive reports with all analysis results
-
-## 📋 Requirements
-
-- Python 3.8+
-- Reference genome (GRCh38)
-- Internet connection (for PubMed searches)
-
-## 🚀 Quick Start
-
-### 1. Installation
+## 安裝環境
 
 ```bash
-# Run setup script
-chmod +x setup.sh
-./setup.sh
-
-# Activate environment
-source venv/bin/activate
+./setup_env.sh                           # 建立或修補 gm4 conda 環境（包含 flash-attn）
+conda activate gm4
 ```
 
-### 2. Basic Usage
+`setup_env.sh` 只負責建立環境，不會下載資料或執行任何分析，而且可以重複執行：已經裝好的部分會跳過，只補上缺少的。
+用 `--env NAME` 可以指定其他環境名稱。`setup_and_run.sh` 的 `env` 步驟就是呼叫這個腳本。
+
+在 repo 根目錄建立 `.env` 檔，填入你的 NCBI 聯絡資訊。這個檔案不會進 git。NCBI 規定要附上 email；
+API key 可以把請求速率從每秒 3 次提高到 10 次。
+
+```
+PUBMED_EMAIL=you@example.com
+PUBMED_API_KEY=your_ncbi_api_key
+```
+
+
+
+
+## 網頁介面
+
+報告網站可以把還沒有報告的變異送到 DGX Spark，由 Spark 跑完整 pipeline，新報告會自動加進網站。
+
+**在 Spark 上（只需一次）：** clone 這個 repo，建立好 `gm4` 環境並準備好模型，確認 `python main.py <variant>` 能正常執行，再檢查任務腳本：
 
 ```bash
-# Analyze a variant
-python main.py 2-178612477-T-A
-
-# View the generated report
-# Opens in outputs/variant_report_*.html
+~/miniconda3/envs/gm4/bin/python ~/ttn-agent/spark_job.py check
 ```
 
-### 3. Example Variants
+**在 Windows 電腦上：** 把site資料夾下載並打開 `TTN-Site.exe`（ARM 筆電請用 `TTN-Site-arm64.exe`）。瀏覽器會打開網站，最上方有 **Analyze variants on your DGX Spark** 面板。
+
+1. 填入 Spark 的 IP(140.xxx.xxx.xxx) 和你的使用者名稱，按 **Save & test connection**。
+2. 第一次連線時，把畫面上顯示的指紋和在 Spark 上執行 `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` 的結果比對，一致後按 **Trust this Spark**。
+3. 如果還沒有 SSH 金鑰，按 **Set up SSH key…** 並輸入一次 Spark 密碼。TTN-Site 會建立 `%USERPROFILE%\.ssh\id_ed25519` 並安裝到 Spark 上，密碼不會被儲存。
+4. 以 `2-<position>-<ref>-<alt>` 格式輸入變異，一行一個，也可以載入 CSV 或文字檔，然後按 **Run on Spark**。
+   已經有報告的變異只會顯示連結；勾選 **Re-run variants already in this site** 可以對它們重新跑完整 pipeline。
+   新報告會取代舊報告；如果重跑失敗，舊報告會保留。
+
+請讓 TTN-Site 的視窗保持開著。任務完成時 Windows 會跳出通知，新報告會出現在表格中並帶有 **Spark** 標籤。
+這些報告存在網站資料夾的 `data/local-reports.js`，所以直接打開 `index.html` 也看得到
+
+==================================主要用以上這些==================================
+## 快速開始：一個腳本跑完全部(包含下載ClinVar資料、reference sequence，執行PubTator文獻挖掘，把生成報告整理成網站)
 
 ```bash
-# Pathogenic example
-python main.py 2-178527121-A-G
-
-# Benign example
-python main.py 2-178527628-C-T
+./setup_and_run.sh --limit 5      # 先用前 5 顆 ClinVar 變異試跑
+./setup_and_run.sh                # 完整執行（建議在 tmux 裡跑，需要好幾天）
 ```
 
-## 📖 Detailed Installation
+## 使用方式
 
-### Prerequisites
+### 單一變異
 
 ```bash
-# Check Python version
-python3 --version  # Should be 3.8+
-
-# Install system dependencies (Ubuntu/Debian)
-sudo apt-get install python3-venv python3-pip
-
-# macOS
-brew install python3
+python main.py 2-178527121-A-G                    # chr-pos-ref-alt（GRCh38，TTN 轉錄方向的鹼基）
+python main.py "NM_001267550.2:c.29800T>C"         # 也接受 HGVS c./p./g.
+python main.py 2-178527121-A-G --skip-evo2         # 跳過 Evo2（較快）
+python main.py 2-178527121-A-G --skip-clinical-extraction   # 不用 LLM；Track B 改用規則式推論
 ```
 
-### Manual Installation
+其他選項：`--output PATH`、`--llm-backend {vllm,transformers,ollama}`、`--llm-model NAME`，
+以及 `--require-llm`（LLM 無法執行時直接失敗，而不是產生沒有 LLM 分析的報告）。
+
+### 批次執行
 
 ```bash
-# 1. Create virtual environment
-python3 -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
-
-# 2. Install dependencies
-pip install -r requirements.txt
-
-# 3. Install Evo2
-pip install git+https://github.com/ArcInstitute/evo2.git
-
-# 4. Download reference genome
-mkdir -p data
-cd data
-wget https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/001/405/GCF_000001405.40_GRCh38.p14/GCF_000001405.40_GRCh38.p14_genomic.fna.gz
-gunzip GCF_000001405.40_GRCh38.p14_genomic.fna.gz
-cd ..
-
-# 5. Configure PubMed (optional but recommended)
-export PUBMED_EMAIL="your_email@example.com"
+python batch_run_variants.py --input data/clinvar_ttn.csv
+./run_batch_inprocess.sh --input data/clinvar_ttn.csv --skip-evo2 --require-llm   # LLM 只載入一次，出錯會自動重啟
 ```
 
-## 💻 Usage
+輸入檔需要有 `input` 欄（`chr-pos-ref-alt`），或是 `chr`/`position`/`ref`/`alt` 這幾欄。每跑完一顆就會寫回結果，
+中斷後重跑會從斷點繼續。`outputs/` 裡已有報告的變異會直接沿用；修改過分析引擎後要加 `--force` 才會重跑。
 
-### Command Line Interface
+## 一次性初始化：Evo2 分數表
+
+報告網站可以查詢還沒有報告的變異的 Evo2 分數，這需要先算好 TTN 上所有 SNV 的分數表
+（281,435 個位置 × 3 種替代鹼基，8,192 bp 窗口，計分方式與 `main.py` 相同）。clone 之後執行一次：
 
 ```bash
-python main.py <variant> [OPTIONS]
-
-Arguments:
-  variant              Variant in format: chr-pos-ref-alt
-                      Example: 2-178612477-T-A
-
-Options:
-  --output PATH       Output HTML file path
-  --skip-evo2        Skip Evo2 prediction (faster)
-  --help             Show help message
+conda activate gm4
+./init_evo2_table.sh            # 缺 TTN 序列時會先下載，然後在背景開始計算
+./init_evo2_table.sh --status   # 查看進度
+./init_evo2_table.sh --stop     # 目前這批算完後停止；重新執行第一行指令即可續算
 ```
 
-### Input Format
+在 GB10 上全部算完約需 31 天，期間會一直佔用 GPU，所以不要同時跑 vLLM 批次。外顯子與剪接區（±10 bp）會先算，約需 14 天。
+每次停止或算完都會寫出網站用的 `outputs/evo2_table/evo2_table.js`；也可以執行 `./init_evo2_table.sh --export` 手動更新。
 
-Variants can be specified with different separators:
-- `2-178612477-T-A` (hyphen)
-- `2_178612477_T_A` (underscore)
-- `2:178612477:T:A` (colon)
+分數和執行環境有關：gm3（FP8）和 gm4 的分數約差 1e-4，足以讓接近門檻的變異判定翻轉。請使用與 `main.py` 相同的環境。
+所用的套件版本記錄在 `outputs/evo2_table/meta.json`。](https://www.ncbi.nlm.nih.gov/research/litvar2/)
 
-Format: `chromosome-position-reference-alternate`
+## 專案結構
 
-### Examples
-
-**Standard Analysis:**
-```bash
-python main.py 2-178527121-A-G
-```
-
-**Fast Mode (skip Evo2):**
-```bash
-python main.py 2-178527121-A-G --skip-evo2
-```
-
-**Custom Output:**
-```bash
-python main.py 2-178527121-A-G --output my_analysis.html
-```
-
-### Batch Processing
-
-Process multiple variants from a file:
-
-```bash
-# Create input file (CSV or text)
-cat > variants.txt << EOF
-2-178527121-A-G
-2-178527148-A-T
-2-178527628-C-T
-EOF
-
-# Run batch analysis
-python batch_analyze.py variants.txt
-
-# Results in outputs/batch_TIMESTAMP/
-```
-
-## 📊 Output
-
-### HTML Report Sections
-
-1. **Variant Summary**
-   - Genomic coordinates (GRCh38)
-   - Reference/alternate alleles
-   - Gene information
-
-2. **Evo2 Pathogenicity Prediction**
-   - Prediction: PATHOGENIC or BENIGN
-   - Delta score (variant - reference)
-   - Confidence level
-   - Interpretation guide
-
-3. **Protein Domain Localization**
-   - Visual schematic of TTN protein
-   - Variant location across domains (Z-disk, I-band, A-band, M-band)
-   - Multiple transcript isoforms (N2BA, N2B, Novex-1/2/3)
-
-4. **Literature Review (PubMed)**
-   - Relevant articles
-   - Phenotype (cardiac/skeletal)
-   - Inheritance pattern
-   - Age of onset
-   - Links to papers
-
-### Understanding Predictions
-
-**Evo2 Delta Score:**
-- **< 0** → PATHOGENIC (variant disrupts protein function)
-- **≥ 0** → BENIGN (variant maintains protein function)
-
-**Confidence:**
-| Absolute Delta | Confidence |
-|---------------|------------|
-| > 0.005       | High       |
-| 0.001-0.005   | Medium     |
-| < 0.001       | Low        |
-
-### Output Files
-
-```
-outputs/
-├── variant_report_20240101_120000.html  # Main report
-├── images/
-│   └── titin_schematic_*.png           # Protein schematic
-└── ttn_agent.log                        # Detailed logs
-```
-
-## 🔧 Configuration
-
-Edit `config.py` to customize:
-
-```python
-# Model selection
-EVO2_MODEL = "evo2_1b_base"  # Fast (16GB RAM)
-# EVO2_MODEL = "evo2_7b_base"  # Accurate (64GB RAM)
-
-# PubMed settings
-PUBMED_EMAIL = "your@email.com"
-PUBMED_MAX_RESULTS = 20
-
-# Report styling
-REPORT_HEADER_COLOR = "#2C3E50"
-REPORT_ACCENT_COLOR = "#3498DB"
-```
-
-## 🧪 Testing
-
-Run the test suite:
-
-```bash
-python test_agent.py
-```
-
-This tests:
-- Module imports
-- Variant parser
-- Evo2 predictor
-- PubMed search
-- Image generator
-- Complete pipeline
-
-## 🐛 Troubleshooting
-
-### Common Issues
-
-**"Reference genome not found"**
-```bash
-cd data
-wget https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/001/405/GCF_000001405.40_GRCh38.p14/GCF_000001405.40_GRCh38.p14_genomic.fna.gz
-gunzip GCF_000001405.40_GRCh38.p14_genomic.fna.gz
-```
-
-**"Out of memory"**
-```python
-# Use smaller model in config.py
-EVO2_MODEL = "evo2_1b_base"
-
-# Or skip Evo2
-python main.py <variant> --skip-evo2
-```
-
-**"PubMed search failed"**
-```python
-# Set email in config.py
-PUBMED_EMAIL = "your@email.com"
-
-# Or as environment variable
-export PUBMED_EMAIL="your@email.com"
-```
-
-**"Failed to load Evo2 model"**
-```bash
-pip uninstall evo2
-pip install git+https://github.com/ArcInstitute/evo2.git
-```
-
-## 📚 Documentation
-
-- **QUICKSTART.md**: Fast setup guide
-- **USER_GUIDE.md**: Comprehensive manual
-- **This README**: Overview
-
-## 🔬 How It Works
-
-1. **Variant Parsing**: Validates and standardizes input
-2. **Evo2 Prediction**: 
-   - Extracts 8kb window around variant
-   - Scores reference and variant sequences
-   - Calculates delta score
-3. **PubMed Search**: 
-   - Searches for relevant literature
-   - Extracts clinical information
-4. **Visualization**: 
-   - Maps variant to protein domains
-   - Generates schematic for all isoforms
-5. **Report Generation**: 
-   - Compiles all results
-   - Generates HTML report
-
-## ⚠️ Important Notes
-
-### Limitations
-
-- **Research Use Only**: Not for clinical decisions
-- **SNVs Only**: Currently supports single nucleotide variants
-- **TTN Gene**: Designed specifically for TTN variants
-- **Approximate Positions**: Protein positions are estimates
-
-### Requirements
-
-- 16GB RAM recommended for Evo2
-- Internet connection for PubMed
-- GRCh38 reference genome (~1GB)
-
-## 🤝 Contributing
-
-Contributions welcome! Please:
-1. Fork the repository
-2. Create a feature branch
-3. Submit a pull request
-
-## 📝 License
-
-This project is for research and educational purposes.
-
-## 🙏 Acknowledgments
-
-- **Arc Institute**: Evo2 model
-- **NCBI**: PubMed database
-- **CardioDB**: TTN domain information
-
-## 📧 Support
-
-For issues or questions:
-- Check `outputs/ttn_agent.log`
-- Run `python test_agent.py`
-- Review documentation
-
-## 🔗 References
-
-1. [Evo2 GitHub](https://github.com/ArcInstitute/evo2)
-2. [TTN Gene - GeneCards](https://www.genecards.org/cgi-bin/carddisp.pl?gene=TTN)
-3. [CardioDB TTN Info](https://www.cardiodb.org/titin/titin_transcripts.php)
-4. [PubMed](https://pubmed.ncbi.nlm.nih.gov/)
-
----
-
-**Version**: 1.0.0  
-**Last Updated**: 2024  
-**Status**: Production Ready
+| 路徑 | 說明 |
+|---|---|
+| `main.py` | 對單一變異執行完整 pipeline，輸出 `outputs/<variant>_<model>.html` |
+| `batch_run_variants.py`、`run_batch_inprocess.sh` | 從 CSV/XLSX 批次執行，可中斷續跑；每份報告的結果會寫回表格 |
+| `build_site.py` | 把 `outputs/` 的報告打包成 `site/` 網站 |
+| `spark_job.py`、`launcher/` | Spark 端的任務佇列，以及從網站分析新變異用的 Windows 版 `TTN-Site.exe`（Go） |
+| `setup_and_run.sh` | 一鍵完成安裝設定與完整執行（見「快速開始」） |
+| `setup_env.sh` | 只建立 conda 環境（`environment.yml`、flash-attn wheel、環境檢查） |
+| `score_evo2_for_variants.py`、`backfill_evo2_scores.py` | 批次計算 Evo2 分數，並寫回以 `--skip-evo2` 產生的報告 |
+| `backfill_database_annotations.py` | 不重跑 pipeline，直接重新產生既有報告的資料庫比對區塊 |
+| `init_evo2_table.sh`、`precompute_evo2_table.py` | 一次性預先計算 TTN 上所有 SNV 的 Evo2 分數 |
+| `build_ttn_transcript_model.py` | 建立 `data/ttn_transcript_model.json`（HGVS ↔ 基因組座標用的 RefSeq 外顯子模型） |
+| `config.py` | 所有設定：模型、門檻、資料路徑、功能開關 |
+| `utils/` | pipeline 的各個模組 |
+| `scripts/data_prep/` | 輸入資料：下載 ClinVar TTN、PubTator harvest 與新文獻檢查、ClinVar 標註、HGMD ↔ ClinVar ID |
+| `research/` | 評估、實驗、論文與簡報圖表、notebook；pipeline 不會用到 |

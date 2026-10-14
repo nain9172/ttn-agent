@@ -1,7 +1,7 @@
 """把 Curated Database Annotations 區塊回填進 outputs/ 既有的 HTML 報告。
 
 報告本身已經有 ClinVar / Evo2 / 文獻 / 推理的內容，這裡只是多加一段
-「這顆變異在 HGMD 與 PubTator 裡登記的疾病」，所以不需要重跑整個 pipeline
+「這顆變異在 HGMD、PubTator 與 PubMind 裡登記的疾病」，所以不需要重跑整個 pipeline
 （不必載入 LLM、不必重算 Evo2），直接查表 + 注入 HTML 即可。
 
 用法：
@@ -81,6 +81,7 @@ def main() -> None:
         hgmd_kb=config.HGMD_KB_PATH,
         pubtator_csv=config.PUBTATOR_VARIANTS_CSV_PATH,
         cache_path=config.PUBTATOR_COORD_CACHE_PATH,
+        pubmind_json=config.PUBMIND_JSON_PATH,
     )
     generator = HTMLReportGenerator()
     css = generator._get_css()
@@ -102,6 +103,8 @@ def main() -> None:
             stats["HGMD 精確命中"] += 1
         if hits.pubtator_exact:
             stats["PubTator 精確命中"] += 1
+        if hits.pubmind_exact:
+            stats["PubMind 命中"] += 1
         if not hits.has_exact:
             stats["兩邊都沒精確命中"] += 1
 

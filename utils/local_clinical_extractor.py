@@ -112,7 +112,10 @@ class LocalClinicalExtractor:
     def _init_vllm(self):
         from vllm import LLM, SamplingParams
 
-        gpu_memory_utilization = 0.85
+        try:
+            from config import LLM_GPU_MEMORY_UTILIZATION as gpu_memory_utilization
+        except ImportError:
+            gpu_memory_utilization = 0.85
         stop_tokens = (
             ["<end_of_turn>", "\n\n\n"] if self.is_medgemma else ["\n\n\n", "```\n\n"]
         )
@@ -465,71 +468,6 @@ class LocalClinicalExtractor:
 
             enriched.append(article)
         return enriched
-
-    def _extract_single(
-        self, article: Dict, variant_id: str, clinvar_info: Optional[Dict]
-    ) -> Dict:
-        """Single-article extraction (kept for backward compatibility; not used by batch_extract)."""
-        raw_text = (
-            article.get("text_for_llm")
-            or article.get("full_text")
-            or article.get("abstract")
-            or ""
-        )
-        # gate_text：給 gating 用的完整 markdown（見 batch_extract 註解）
-        gate_text = article.get("gate_text") or raw_text
-        aliases = get_variant_aliases(variant_id, clinvar_info)
-
-        # A: deterministic alias gate — decide presence in code, not LLM
-        if LLM_REQUIRE_DETERMINISTIC_ALIAS:
-            present, _matched = self._alias_present_in_text(
-                aliases, gate_text, article
-            )
-            if not present:
-                res = self._get_empty_result(
-                    "Target variant alias not found in article "
-                    "(deterministic exact match)"
-                )
-                res["extraction_source"] = "deterministic_no_alias"
-                return res
-
-        context = self._prepare_context(raw_text, aliases, article)
-
-        if len(context.strip()) < 50:
-            return self._get_empty_result("Text too short")
-
-        llm_result = None
-        if not ENABLE_EASY_PROMPT:
-            prompt = self._build_prompt(context, aliases, variant_id)
-            pmid = article.get("pmid", "unknown")
-            try:
-                if self.backend == "vllm":
-                    raw = self._generate_vllm(prompt)
-                else:
-                    raw = self._generate_ollama(prompt)
-
-                self._log_prompt_response(pmid, prompt, raw, variant_id)
-                data = self._robust_json_parse(raw)
-                data["raw_llm_output"] = raw
-                data["extraction_source"] = "llm"
-                llm_result = data
-            except Exception as e:
-                logger.error(f"LLM extraction error for PMID {pmid}: {e}")
-
-        if llm_result is None or llm_result.get("disease") in ("Not specified", None, ""):
-            regex_result = self._regex_extract(raw_text, aliases, article)
-            if regex_result.get("disease") not in ("Not specified", None):
-                if llm_result:
-                    merged = llm_result.copy()
-                    for key in ("disease", "tissue_affected", "age_onset", "inheritance"):
-                        if merged.get(key) in ("Not specified", None, ""):
-                            merged[key] = regex_result.get(key, "Not specified")
-                    merged["extraction_source"] = "llm+regex"
-                    return merged
-                else:
-                    return regex_result
-
-        return llm_result if llm_result else self._get_empty_result("All methods failed")
 
     # ── Context preparation ───────────────────────────────────────────────────
 

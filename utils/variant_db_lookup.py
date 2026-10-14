@@ -1,4 +1,4 @@
-"""把輸入變異對回 HGMD / PubTator 兩個知識庫，取出「這顆變異在該資料庫裡登記的疾病」。
+"""把輸入變異對回 HGMD / PubTator / PubMind 三個知識庫，取出「這顆變異在該資料庫裡登記的疾病」。
 
 跟 Track B 的類比推理（mechanistic_inference）不同：這裡不做任何推論，
 只做查表，命中就把資料庫原本寫的疾病照實列出來。
@@ -11,8 +11,9 @@ HGMD 原始 CSV 只有 startCoord/endCoord 沒有 REF/ALT，所以 exact 比對�
 acc_num 接到已處理過的 KB（HGMD_TTN_processed）拿 REF/ALT；沒有 KB 對應的
 （多為 frameshift / gross indel）只能做 same_position。
 
-PubTator 完全沒有座標，靠 utils.hgvs_resolver 離線把 c./p. HGVS 換成座標，
-結果快取在 outputs/ 以免每次重算。
+PubTator 原本完全沒有座標，靠 utils.hgvs_resolver 離線把 c./p. HGVS 換成座標，
+結果快取在 outputs/ 以免每次重算。data/pubtator/ 這一版另外帶了 ClinVar 標註
+欄位，唯一命中且落在 chr2 的列直接有權威座標，優先採用；其餘仍走 resolver。
 """
 
 from __future__ import annotations
@@ -26,13 +27,18 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 
+from utils.pubmind_lookup import DEFAULT_PUBMIND_JSON, PubMindLookup
+from utils.pubmind_lookup import disease_counts as pubmind_disease_counts
+
 logger = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
-DEFAULT_HGMD_CSV = PROJECT_ROOT / "TTN_all_mutaion_20260703.csv"
-DEFAULT_HGMD_KB = PROJECT_ROOT / "HGMD_TTN_processed (1).xlsx"
-DEFAULT_PUBTATOR_CSV = PROJECT_ROOT / "pubtator_ttn_variants_all.csv"
+DATA = PROJECT_ROOT / "data"
+
+DEFAULT_HGMD_CSV = DATA / "HGMD_latest.csv"
+DEFAULT_HGMD_KB = DATA / "HGMD_TTN_processed.xlsx"
+DEFAULT_PUBTATOR_CSV = DATA / "pubtator" / "pubtator_ttn_variants_clinvar_annotated.csv"
 DEFAULT_CACHE = PROJECT_ROOT / "outputs" / "pubtator_hgvs_coord_cache.json"
 
 # indel 區間超過這個長度就不做 same_position 比對（gross deletion 動輒數 kb，
@@ -76,25 +82,22 @@ class DatabaseHits:
     hgmd_same_position: List[Dict[str, Any]] = field(default_factory=list)
     pubtator_exact: List[Dict[str, Any]] = field(default_factory=list)
     pubtator_same_position: List[Dict[str, Any]] = field(default_factory=list)
+    pubmind_exact: List[Dict[str, Any]] = field(default_factory=list)
+    # PubMind 資料沒載入時為 False，報告就不顯示 PubMind 卡片
+    pubmind_checked: bool = False
 
     @property
     def has_exact(self) -> bool:
         return bool(self.hgmd_exact or self.pubtator_exact)
-
-    @property
-    def has_any(self) -> bool:
-        return bool(
-            self.hgmd_exact
-            or self.hgmd_same_position
-            or self.pubtator_exact
-            or self.pubtator_same_position
-        )
 
     def hgmd_diseases(self) -> List[Tuple[str, int]]:
         return _disease_counts(self.hgmd_exact, "disease")
 
     def pubtator_diseases(self) -> List[Tuple[str, int]]:
         return _disease_counts(self.pubtator_exact, "disease")
+
+    def pubmind_diseases(self) -> List[Tuple[str, int]]:
+        return pubmind_disease_counts(self.pubmind_exact)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -104,6 +107,9 @@ class DatabaseHits:
             "pubtator_same_position": self.pubtator_same_position,
             "hgmd_diseases": self.hgmd_diseases(),
             "pubtator_diseases": self.pubtator_diseases(),
+            "pubmind_exact": self.pubmind_exact,
+            "pubmind_checked": self.pubmind_checked,
+            "pubmind_diseases": self.pubmind_diseases(),
         }
 
 
@@ -127,6 +133,7 @@ class VariantDatabaseLookup:
         pubtator_csv: Path = DEFAULT_PUBTATOR_CSV,
         cache_path: Optional[Path] = DEFAULT_CACHE,
         resolver: Any = None,
+        pubmind_json: Optional[Path] = DEFAULT_PUBMIND_JSON,
     ) -> None:
         self.hgmd_csv = Path(hgmd_csv)
         self.hgmd_kb = Path(hgmd_kb)
@@ -143,6 +150,7 @@ class VariantDatabaseLookup:
 
         self._load_hgmd()
         self._load_pubtator()
+        self.pubmind = PubMindLookup(pubmind_json) if pubmind_json else None
 
     # ── HGMD ──────────────────────────────────────────────────────────────
 
@@ -304,13 +312,23 @@ class VariantDatabaseLookup:
                 cache[cache_key] = coord
                 cache_dirty = True
 
-            if not coord:
+            # ClinVar 唯一命中的座標比離線 resolver 權威，優先採用。限定 chr2：
+            # 用 rsID 對到 ClinVar 時偶爾會連到別條染色體的變異，那是錯配。
+            cv_pos = None
+            if str(_clean(getattr(row, "chromosome", None)) or "") == "2":
+                cv_pos = _as_int(getattr(row, "position", None))
+
+            if not coord and cv_pos is None:
                 n_failed += 1
                 continue
             n_resolved += 1
 
+            # variant_id 需要 REF/ALT，只有 resolver 給得出來；ClinVar 欄位只有位置。
+            pos = cv_pos if cv_pos is not None else (coord or {}).get("pos")
+            pos_source = "clinvar_annotation" if cv_pos is not None else "hgvs_resolver"
+
             record = {
-                "variant_id": coord.get("variant_id"),
+                "variant_id": (coord or {}).get("variant_id"),
                 "hgvs_c": hgvs,
                 "variant_text": variant_text,
                 "rsid": rsid,
@@ -326,12 +344,13 @@ class VariantDatabaseLookup:
                 "journal": _clean(getattr(row, "journal", None)),
                 "title": _clean(getattr(row, "title", None)),
                 "pubmed_link": _clean(getattr(row, "pubmed_link", None)),
-                "resolved_by": coord.get("resolved_by"),
-                "resolve_confidence": coord.get("confidence"),
+                "resolved_by": (coord or {}).get("resolved_by"),
+                "resolve_confidence": (coord or {}).get("confidence"),
+                "pos_source": pos_source,
+                "clinvar_variation_id": _clean_id(getattr(row, "ClinVar_Variation_ID", None)),
             }
 
-            vid = coord.get("variant_id")
-            pos = coord.get("pos")
+            vid = (coord or {}).get("variant_id")
             if vid:
                 self.pubtator_by_variant.setdefault(vid, []).append(record)
             if pos:
@@ -393,6 +412,10 @@ class VariantDatabaseLookup:
         if variant_id:
             hits.hgmd_exact = list(self.hgmd_by_variant.get(variant_id, []))
             hits.pubtator_exact = list(self.pubtator_by_variant.get(variant_id, []))
+            parts = variant_id.split("-")
+            if self.pubmind is not None and self.pubmind.loaded and len(parts) == 4:
+                hits.pubmind_checked = True
+                hits.pubmind_exact = self.pubmind.lookup(int(parts[1]), parts[2], parts[3])
 
         if pos is not None:
             exact_accs = {r.get("acc_num") for r in hits.hgmd_exact}

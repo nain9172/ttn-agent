@@ -15,7 +15,6 @@ lib64/
 parts/
 sdist/
 var/
-wheels/
 *.egg-info/
 .installed.cfg
 *.egg
@@ -143,3 +142,17 @@ inference_optimization_results.ipynb
 compare_evo2_carbon_clinvar.ipynb
 test_inference_strategies.ipynb
 RELATED_WORK.canvas.tsx
+
+# TTN-Site 啟動程式的編譯結果（用 launcher/build.sh 產生）
+launcher/dist/
+
+# research/experiments：論文全文語料（著作權）、含 HGMD 紀錄的評估集與逐筆結果不放上公開 repo
+research/experiments/corpus/
+research/experiments/runs*/
+research/experiments/round1_random60/
+research/experiments/executed/
+research/experiments/llm_eval_set*.csv
+research/experiments/exp3_cases_*.csv
+# 輸出內含 HGMD 紀錄的 notebook
+research/exp2_medgemma_vs_gemma4.ipynb
+research/exp3_hallucination_guards.ipynb

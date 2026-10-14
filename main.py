@@ -48,31 +48,47 @@ try:
         TTN_TRANSCRIPT_MODEL_PATH,
         HGVS_ALLOW_NETWORK,
         REFERENCE_GENOME_PATH,
+        LLM_GPU_MEMORY_UTILIZATION,
+        INFERENCE_HGMD_CSV_PATH,
+        INFERENCE_CARDIODB_PATH,
+        INFERENCE_PREDICT_MODE,
+        INFERENCE_M_EXON,
+        INFERENCE_M_BUCKET,
+        INFERENCE_M_BAND,
     )
 except ImportError:
     ENABLE_MECHANISTIC_INFERENCE = False
     INFERENCE_TOP_K_ANALOGS = 8
     HGMD_KB_PATH = None
+    INFERENCE_HGMD_CSV_PATH = None
+    INFERENCE_CARDIODB_PATH = None
+    INFERENCE_PREDICT_MODE = "analogy"
+    INFERENCE_M_EXON = 4.0
+    INFERENCE_M_BUCKET = 4.0
+    INFERENCE_M_BAND = 8.0
     TTN_BAND_EDGES = [178525989, 178535982, 178618584, 178775356, 178807423]
     TTN_BAND_LABELS = ["M-band", "A-band", "I-band", "Z-disk"]
     TRANSCRIPT_INTERVAL_PATH = None
     TTN_TRANSCRIPT_MODEL_PATH = None
     HGVS_ALLOW_NETWORK = False
     REFERENCE_GENOME_PATH = None
+    LLM_GPU_MEMORY_UTILIZATION = 0.85
 
-# 資料庫查表：HGMD / PubTator 對這顆變異登記的疾病（純查表，非推論）
+# 資料庫查表：HGMD / PubTator / PubMind 對這顆變異登記的疾病（純查表，非推論）
 try:
     from config import (
         ENABLE_DATABASE_ANNOTATIONS,
         HGMD_FULL_CSV_PATH,
         PUBTATOR_VARIANTS_CSV_PATH,
         PUBTATOR_COORD_CACHE_PATH,
+        PUBMIND_JSON_PATH,
     )
 except ImportError:
     ENABLE_DATABASE_ANNOTATIONS = False
     HGMD_FULL_CSV_PATH = None
     PUBTATOR_VARIANTS_CSV_PATH = None
     PUBTATOR_COORD_CACHE_PATH = None
+    PUBMIND_JSON_PATH = None
 
 # 設定 Triton PTXAS 環境變數（用於 vLLM 編譯）
 os.environ['TRITON_PTXAS_PATH'] = TRITON_PTXAS_PATH
@@ -139,6 +155,119 @@ def setup_logging():
     return logging.getLogger(__name__)
 
 
+def gpu_headroom() -> tuple:
+    """回傳 (可用 GiB, 總量 GiB, 佔用者字串)；查不到時為 (None, None, "")。
+
+    這台機器是 GB10 統一記憶體，nvidia-smi 的 memory.free 會回 [N/A]，
+    只有 torch.cuda.mem_get_info 給得出正確數字，所以以它為準；
+    佔用者名單再從 nvidia-smi 的 compute-apps 取得，純粹是為了讓錯誤訊息有用。
+    """
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return (None, None, "")
+        free, total = torch.cuda.mem_get_info(0)
+    except Exception:  # noqa: BLE001
+        return (None, None, "")
+
+    occupants = ""
+    try:
+        import subprocess
+
+        out = subprocess.run(
+            ["nvidia-smi", "--query-compute-apps=pid,used_memory", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=10,
+        ).stdout.strip()
+        rows = []
+        for line in out.splitlines():
+            pid = line.split(",")[0].strip()
+            who = subprocess.run(["ps", "-o", "user=,cmd=", "-p", pid],
+                                 capture_output=True, text=True, timeout=5).stdout.strip()
+            rows.append(f"{line.strip()} ({who[:80] or 'unknown'})")
+        occupants = "; ".join(rows)
+    except Exception:  # noqa: BLE001
+        pass
+    return (free / 2**30, total / 2**30, occupants)
+
+
+# ── 共用 LLM（batch_run_variants.py --in-process）────────────────────────────
+# 模型載入一次要 4–5 分鐘；同一個程序內跑多顆變異時，Step 4.5 與 Track B
+# 都從這裡拿同一個 extractor，不再逐筆重載。
+_SHARED_EXTRACTOR = None
+_SHARED_EXTRACTOR_KEY = None
+
+# run_pipeline 的回傳碼：vLLM 引擎已壞，此程序內無法再產出有 LLM 結果的報告
+EXIT_LLM_ENGINE_DEAD = 3
+
+_FATAL_LLM_ERROR_NAMES = {"EngineDeadError", "OutOfMemoryError"}
+
+
+def _is_fatal_llm_error(exc) -> bool:
+    """引擎掛掉或 CUDA 出錯時，同一個程序內救不回來（沿 __cause__/__context__ 往上找）。"""
+    seen = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        if type(exc).__name__ in _FATAL_LLM_ERROR_NAMES or "CUDA error" in str(exc):
+            return True
+        exc = exc.__cause__ or exc.__context__
+    return False
+
+
+def _watch_llm_engine(extractor) -> None:
+    """包住 llm.generate，記下致命錯誤。
+
+    batch_extract 與 Track B 都會吞掉 generate 的例外並退回規則式結果；
+    單筆 subprocess 時只影響一筆，in-process 時卻會讓之後每一筆都默默少了
+    LLM 結果，所以要在這裡留下記號，由 run_pipeline 決定中止。
+    """
+    extractor.engine_dead = False
+    llm = getattr(extractor, "llm", None)
+    if llm is None:
+        return
+    original_generate = llm.generate
+
+    def generate(*args, **kwargs):
+        try:
+            return original_generate(*args, **kwargs)
+        except Exception as e:
+            if _is_fatal_llm_error(e):
+                extractor.engine_dead = True
+            raise
+
+    llm.generate = generate
+
+
+def llm_engine_dead() -> bool:
+    return _SHARED_EXTRACTOR is not None and getattr(_SHARED_EXTRACTOR, "engine_dead", False)
+
+
+def llm_loaded(backend: str, model: str) -> bool:
+    return _SHARED_EXTRACTOR is not None and _SHARED_EXTRACTOR_KEY == (backend, model)
+
+
+def get_shared_extractor(backend: str, model: str):
+    """同一程序內只載入一次 LLM；之後的呼叫直接回傳同一個 extractor。"""
+    global _SHARED_EXTRACTOR, _SHARED_EXTRACTOR_KEY
+    if llm_loaded(backend, model):
+        if llm_engine_dead():
+            raise RuntimeError("shared vLLM engine is dead; restart the process")
+        return _SHARED_EXTRACTOR
+
+    from utils.local_clinical_extractor import LocalClinicalExtractor
+
+    extractor = LocalClinicalExtractor(
+        backend=backend,
+        model_name=model,
+        tensor_parallel_size=LOCAL_LLM_TENSOR_PARALLEL,
+        max_model_len=LOCAL_LLM_MAX_MODEL_LEN,
+        max_context_length=LOCAL_LLM_MAX_CONTEXT_LENGTH,
+    )
+    _watch_llm_engine(extractor)
+    _SHARED_EXTRACTOR, _SHARED_EXTRACTOR_KEY = extractor, (backend, model)
+    return extractor
+
+
 def _any_article_mentions_variant(pubmed_results) -> bool:
     """判斷是否有任何文獻「直接提到」輸入變異（決定是否需要走 Track B 推理）。
 
@@ -201,11 +330,7 @@ def _parse_variant_input(raw: str, logger) -> dict:
         return info
 
 
-def main():
-    """Main pipeline orchestrator"""
-    logger = setup_logging()
-    
-    # Parse command line arguments
+def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description='TTN Variant AI Agent - Comprehensive variant analysis'
     )
@@ -246,9 +371,24 @@ def main():
         default=None,
         help='Override LLM model (default: from config.py)'
     )
-    
-    args = parser.parse_args()
-    
+    parser.add_argument(
+        '--require-llm',
+        action='store_true',
+        help=('Abort with a non-zero exit code if clinical extraction was expected '
+              'but the LLM could not run (e.g. the GPU is busy). Without this the run '
+              'continues and the report is labelled no-llm.')
+    )
+    return parser
+
+
+def main():
+    logger = setup_logging()
+    args = build_arg_parser().parse_args()
+    return run_pipeline(args, logger)
+
+
+def run_pipeline(args: argparse.Namespace, logger) -> int:
+    """Main pipeline orchestrator（batch_run_variants.py --in-process 會直接呼叫）"""
     logger.info(f"Starting TTN Variant AI Agent for variant: {args.variant}")
     
     try:
@@ -393,7 +533,11 @@ def main():
         aggregated_stats = None
         clinical_extractor = None  # 供 Track B（Step 4.6）重用已載入的 LLM
         backend = args.llm_backend or LOCAL_LLM_BACKEND
+        model = args.llm_model or LOCAL_LLM_MODEL
         vllm_ok = _VLLM_PRELOAD_OK if backend == "vllm" else True
+        # 只有真的跑完 batch_extract + aggregate_stats 才算成功；報告檔名依此命名。
+        clinical_extraction_ok = False
+        gpu_blocked = False
         if pubmed_results and ENABLE_LOCAL_CLINICAL_EXTRACTION and not args.skip_clinical_extraction:
             logger.info("=" * 70)
             logger.info("Step 4.5: Extracting clinical information with local LLM...")
@@ -405,25 +549,37 @@ def main():
                     "Check that vLLM is installed and compatible with the current PyTorch build."
                 )
 
+            # 顯存不夠時 vLLM 會丟出一長串 CUDA out of memory 堆疊，看不出是誰佔走的。
+            # 這裡先擋下來，直接說明還差多少、現在是誰在用。
+            # 模型已在本程序載入時，顯存本來就被自己佔著，不能再檢查。
+            free_gib, total_gib, occupants = (
+                (None, None, "") if llm_loaded(backend, model) else gpu_headroom()
+            )
+            if free_gib is not None:
+                needed = total_gib * LLM_GPU_MEMORY_UTILIZATION
+                logger.info(f"GPU headroom: {free_gib:.1f} / {total_gib:.1f} GiB free "
+                            f"(vLLM will request {needed:.1f} GiB)")
+                if free_gib < needed:
+                    logger.error(
+                        f"Not enough free GPU memory to load {LOCAL_LLM_MODEL}: "
+                        f"{free_gib:.1f} GiB free but {needed:.1f} GiB required."
+                    )
+                    if occupants:
+                        logger.error(f"GPU currently held by: {occupants}")
+                    gpu_blocked = True
+
             try:
-                from utils.local_clinical_extractor import LocalClinicalExtractor
-                
-                # 使用命令行參數或配置檔案的設定（backend 已在外層定義）
-                model = args.llm_model or LOCAL_LLM_MODEL
-                
+                if gpu_blocked:
+                    raise RuntimeError("insufficient free GPU memory (pre-flight check)")
+
+                # 使用命令行參數或配置檔案的設定（backend / model 已在外層定義）
                 logger.info(f"Using LLM backend: {backend}")
                 logger.info(f"Using model: {model}")
                 logger.info(f"Tensor parallel size: {LOCAL_LLM_TENSOR_PARALLEL}")
                 logger.info(f"Max model length: {LOCAL_LLM_MAX_MODEL_LEN} tokens")
                 logger.info(f"Max context length: {LOCAL_LLM_MAX_CONTEXT_LENGTH} chars")
                 
-                extractor = LocalClinicalExtractor(
-                    backend=backend,
-                    model_name=model,
-                    tensor_parallel_size=LOCAL_LLM_TENSOR_PARALLEL,
-                    max_model_len=LOCAL_LLM_MAX_MODEL_LEN,
-                    max_context_length=LOCAL_LLM_MAX_CONTEXT_LENGTH
-                )
+                extractor = get_shared_extractor(backend, model)
                 clinical_extractor = extractor  # 保留給 Track B 重用
                 
                 # 批次擷取臨床資訊
@@ -445,6 +601,7 @@ def main():
                 logger.info(f"  Affected tissues: {aggregated_stats['tissue_affected']}")
                 logger.info(f"  Cardiac phenotypes: {aggregated_stats['cardiac_phenotypes']}")
                 logger.info(f"  Skeletal phenotypes: {aggregated_stats['skeletal_phenotypes']}")
+                clinical_extraction_ok = True
                 
             except ImportError as e:
                 logger.warning(f"Could not import local clinical extractor: {e}")
@@ -452,6 +609,17 @@ def main():
             except Exception as e:
                 logger.error(f"Error during clinical extraction: {e}", exc_info=True)
                 logger.warning("Continuing without clinical extraction...")
+
+            if not clinical_extraction_ok:
+                # 這裡曾經是個沉默的陷阱：擷取失敗後流程照跑，報告卻仍以模型名
+                # 命名，看起來像是 LLM 分析過。批次跑時會產出一整批標錯的報告。
+                logger.error(
+                    "Clinical extraction did not complete — the report will be "
+                    "labelled 'no-llm' and will contain no AI Analysis section."
+                )
+                if args.require_llm:
+                    logger.error("--require-llm was set, aborting instead of writing a report.")
+                    return 1
         elif not pubmed_results:
             logger.info("Step 4.5: Skipped (no PubMed results)")
         elif not ENABLE_LOCAL_CLINICAL_EXTRACTION:
@@ -481,6 +649,14 @@ def main():
                     transcript_model_path=TTN_TRANSCRIPT_MODEL_PATH,
                     reference_fasta_path=REFERENCE_GENOME_PATH,
                     allow_network=HGVS_ALLOW_NETWORK,
+                    # 新資料來源：cardiodb 的 364 個外顯子（座標／band／實測 PSI）
+                    # 與 HGMD 完整匯出（2,193 筆）。兩者皆為 None 時退回舊行為。
+                    cardiodb_path=INFERENCE_CARDIODB_PATH,
+                    hgmd_csv_path=INFERENCE_HGMD_CSV_PATH,
+                    predict_mode=INFERENCE_PREDICT_MODE,
+                    m_exon=INFERENCE_M_EXON,
+                    m_bucket=INFERENCE_M_BUCKET,
+                    m_band=INFERENCE_M_BAND,
                 )
 
                 # 若 Step 4.5 沒建過 LLM（例如完全無文獻），這裡按需載入一次
@@ -492,17 +668,8 @@ def main():
                     and vllm_ok
                 ):
                     try:
-                        from utils.local_clinical_extractor import LocalClinicalExtractor
-
-                        model = args.llm_model or LOCAL_LLM_MODEL
                         logger.info(f"Loading LLM for inference (backend={backend}, model={model})...")
-                        inference_extractor = LocalClinicalExtractor(
-                            backend=backend,
-                            model_name=model,
-                            tensor_parallel_size=LOCAL_LLM_TENSOR_PARALLEL,
-                            max_model_len=LOCAL_LLM_MAX_MODEL_LEN,
-                            max_context_length=LOCAL_LLM_MAX_CONTEXT_LENGTH,
-                        )
+                        inference_extractor = get_shared_extractor(backend, model)
                         clinical_extractor = inference_extractor
                     except Exception as e:
                         logger.warning(f"Could not load LLM for inference, using rule-based fallback: {e}")
@@ -532,12 +699,18 @@ def main():
         else:
             logger.info("Step 4.6: Skipped (literature evidence for the variant is available)")
 
+        if llm_engine_dead():
+            # 擷取與推論都已吞掉錯誤、退回規則式結果；照常出報告會混進一份
+            # 看似有跑 LLM 的結果，所以不寫報告，交給呼叫端重啟程序。
+            logger.error("vLLM engine died while processing this variant — not writing a report.")
+            return EXIT_LLM_ENGINE_DEAD
+
         # Step 5: Generate Protein Schematic (with integrated transcript intervals)
         logger.info("Step 5: Generating protein schematic...")
         image_gen = ImageGenerator()
         
         # Check for transcript intervals file
-        xlsx_file = PROJECT_ROOT / "transcript_interval.xlsx"
+        xlsx_file = TRANSCRIPT_INTERVAL_PATH
         xlsx_path = str(xlsx_file) if xlsx_file.exists() else None
         
         if xlsx_path:
@@ -551,7 +724,7 @@ def main():
         # Step 5.5: Curated database lookup（HGMD / PubTator 有沒有這顆變異、登記什麼疾病）
         db_annotations = None
         if ENABLE_DATABASE_ANNOTATIONS:
-            logger.info("Step 5.5: Looking up HGMD / PubTator for this variant...")
+            logger.info("Step 5.5: Looking up HGMD / PubTator / PubMind for this variant...")
             try:
                 from utils.variant_db_lookup import get_shared_lookup
 
@@ -560,6 +733,7 @@ def main():
                     hgmd_kb=HGMD_KB_PATH,
                     pubtator_csv=PUBTATOR_VARIANTS_CSV_PATH,
                     cache_path=PUBTATOR_COORD_CACHE_PATH,
+                    pubmind_json=PUBMIND_JSON_PATH,
                 )
                 db_annotations = db_lookup.lookup(
                     chrom=str(variant_info['chrom']),
@@ -569,7 +743,8 @@ def main():
                 )
                 logger.info(
                     f"  HGMD: {db_annotations.hgmd_diseases() or 'no match'} "
-                    f"| PubTator: {db_annotations.pubtator_diseases() or 'no match'}"
+                    f"| PubTator: {db_annotations.pubtator_diseases() or 'no match'} "
+                    f"| PubMind: {db_annotations.pubmind_diseases() or 'no match'}"
                 )
             except Exception as e:
                 logger.error(f"Error during database lookup: {e}", exc_info=True)
@@ -587,7 +762,7 @@ def main():
             variant_id = f"{variant_info['chrom']}-{variant_info['pos']}-{variant_info['ref']}-{variant_info['alt']}"
             
             # 取得 LLM 模型名稱並簡化（去除路徑前綴）
-            if ENABLE_LOCAL_CLINICAL_EXTRACTION and not args.skip_clinical_extraction and pubmed_results:
+            if clinical_extraction_ok:
                 model_name = args.llm_model or LOCAL_LLM_MODEL
                 model_name_short = model_name.split('/')[-1] if '/' in model_name else model_name
                 # 清理模型名稱中的特殊字元，確保檔名合法

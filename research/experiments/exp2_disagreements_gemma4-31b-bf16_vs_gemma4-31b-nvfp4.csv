@@ -1,0 +1,3 @@
+input,pmid,disease_gemma4-31b-bf16,tissue_affected_gemma4-31b-bf16,extraction_source_gemma4-31b-bf16,disease_gemma4-31b-nvfp4,tissue_affected_gemma4-31b-nvfp4,extraction_source_gemma4-31b-nvfp4
+2-178546041-C-T,34839411,Hereditary Myopathy with Early Respiratory Failure (HMERF),Skeletal,llm_vote(n=5/5),Not specified,Not specified,llm_vote(n=5/5)+regex+ungrounded
+2-178546041-C-T,34670883,Not specified,Not specified,llm_vote(n=5/5)+regex+ungrounded,Hereditary Myopathy with Early Respiratory Failure (HMERF),Skeletal,llm_vote(n=5/5)

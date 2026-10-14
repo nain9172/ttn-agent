@@ -1,7 +1,7 @@
 """
 Evo2 Predictor Module
 Uses Evo2 model to predict variant pathogenicity
-Based on the notebook: TTN_predict.ipynb
+Scoring follows the original TTN_predict notebook (not kept in this repo).
 """
 
 import logging

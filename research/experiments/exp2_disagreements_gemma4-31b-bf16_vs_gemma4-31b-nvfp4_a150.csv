@@ -1,0 +1,6 @@
+input,pmid,disease_gemma4-31b-bf16,tissue_affected_gemma4-31b-bf16,extraction_source_gemma4-31b-bf16,disease_gemma4-31b-nvfp4,tissue_affected_gemma4-31b-nvfp4,extraction_source_gemma4-31b-nvfp4
+2-178546041-C-T,34839411,Hereditary Myopathy with Early Respiratory Failure (HMERF),Skeletal,llm_vote(n=5/5),Not specified,Not specified,llm_vote(n=5/5)+regex+ungrounded
+2-178546041-C-T,34670883,Not specified,Not specified,llm_vote(n=5/5)+regex+ungrounded,Hereditary Myopathy with Early Respiratory Failure (HMERF),Skeletal,llm_vote(n=5/5)
+2-178546102-T-C,34108290,Hereditary Myopathy with Early Respiratory Failure (HMERF),Skeletal,llm_vote(n=5/5),Not specified,Not specified,llm_vote(n=5/5)+regex+ungrounded
+2-178546102-T-C,39841822,Hereditary Myopathy with Early Respiratory Failure (HMERF),Both,llm_vote(n=5/5),Dilated Cardiomyopathy (DCM),Cardiac,llm_vote(n=5/5)
+2-178622768-G-A,23975875,Not specified,Not specified,llm_vote(n=5/5)+regex+ungrounded,Centronuclear Myopathy (CNM),Skeletal,llm_vote(n=5/5)

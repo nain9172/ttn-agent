@@ -1,4 +1,4 @@
-FROM nvidia/cuda:12.8.0-devel-ubuntu22.04
+FROM nvidia/cuda:13.0.0-devel-ubuntu24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -15,14 +15,14 @@ ENV PATH=/opt/conda/bin:$PATH
 
 WORKDIR /app
 
-COPY env.yaml .
+COPY environment.yml .
 
-RUN conda env create -f env.yaml && conda clean -afy
+RUN conda env create -f environment.yml && conda clean -afy
 
-SHELL ["conda", "run", "-n", "gm3", "/bin/bash", "-c"]
+SHELL ["conda", "run", "-n", "gm4", "/bin/bash", "-c"]
 
-ENV CONDA_DEFAULT_ENV=gm3
-ENV PATH=/opt/conda/envs/gm3/bin:$PATH
+ENV CONDA_DEFAULT_ENV=gm4
+ENV PATH=/opt/conda/envs/gm4/bin:$PATH
 
 COPY . .
 

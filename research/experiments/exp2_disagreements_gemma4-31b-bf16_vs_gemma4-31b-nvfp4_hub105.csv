@@ -1,0 +1,4 @@
+input,pmid,disease_gemma4-31b-bf16,tissue_affected_gemma4-31b-bf16,extraction_source_gemma4-31b-bf16,disease_gemma4-31b-nvfp4,tissue_affected_gemma4-31b-nvfp4,extraction_source_gemma4-31b-nvfp4
+2-178614226-C-T,34819141,Not specified,Not specified,llm_vote(n=5/5)+regex+ungrounded,Left Ventricular Noncompaction (LVNC),Cardiac,llm_vote(n=5/5)
+2-178532705-G-A,25961035,Tibial Muscular Dystrophy (TMD),Skeletal,llm_vote(n=5/5),Dilated Cardiomyopathy (DCM),Cardiac,llm_vote(n=5/5)
+2-178630318-A-G,25214167,Core Myopathy (CM),Skeletal,llm_vote(n=5/5),Cardiomyopathy (CM),Cardiac,llm_vote(n=5/5)

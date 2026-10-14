@@ -97,31 +97,6 @@ class EnhancedPubMedSearcher:
         """獲取互補鹼基（用於負鏈基因）"""
         return self.COMPLEMENT.get(base.upper(), base)
     
-    def _get_doi_from_pubmed(self, pmid: str) -> Optional[str]:
-        """從 PubMed 獲取 DOI"""
-        try:
-            handle = Entrez.efetch(
-                db="pubmed",
-                id=pmid,
-                rettype="medline",
-                retmode="xml"
-            )
-            article = Entrez.read(handle)
-            handle.close()
-            
-            # 提取 DOI
-            if article and 'PubmedArticle' in article:
-                article_ids = article['PubmedArticle'][0]['PubmedData']['ArticleIdList']
-                for article_id in article_ids:
-                    if article_id.attributes['IdType'] == 'doi':
-                        return str(article_id)
-            
-            return None
-            
-        except Exception as e:
-            logger.debug(f"Error getting DOI for PMID {pmid}: {e}")
-            return None
-    
     def _try_fetch_full_text(self, pmid: str, doi: Optional[str] = None) -> Optional[str]:
         """
         嘗試獲取全文
@@ -557,11 +532,3 @@ class EnhancedPubMedSearcher:
         meta['docling_content'] = docling_content
         return meta
 
-    def _parse_article_enhanced(self, article: Dict, variant_info: Dict[str, str], variant_aliases: Optional[List[str]] = None) -> Dict:
-        """解析文章並嘗試獲取全文（保留以向後相容；新流程請使用 _parse_article_metadata + _enrich_with_full_text）"""
-        meta = self._parse_article_metadata(article)
-        if meta is None:
-            return None
-        if self.try_full_text:
-            return self._enrich_with_full_text(meta, variant_aliases)
-        return meta

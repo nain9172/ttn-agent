@@ -389,15 +389,6 @@ class TTNTranscriptModel:
                 return i, b
         return None
 
-    def r_to_genomic(self, tid: str, r: int) -> Optional[int]:
-        found = self._block_for_r(tid, r)
-        if not found:
-            return None
-        _, b = found
-        if self._tx(tid)["strand"] == "-":
-            return b["g_end"] - (r - b["r_start"])
-        return b["g_start"] + (r - b["r_start"])
-
     def c_to_genomic(
         self,
         tid: str,

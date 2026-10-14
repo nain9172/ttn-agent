@@ -239,13 +239,15 @@ class MechanisticInference:
         m_exon: float = 4.0,
         m_bucket: float = 4.0,
         m_band: float = 8.0,
+        cardiodb_path: Optional[str] = None,
+        hgmd_csv_path: Optional[str] = None,
     ):
         self.kb_path = str(kb_path)
         self.band_edges = list(band_edges)
         self.band_labels = list(band_labels)
         self.top_k = int(top_k)
         # 規則式投票時「距離 → 權重」的形狀。預設為每 distance_scale bp 減半；
-        # 這兩個參數可調，是為了讓 test_inference_strategies.ipynb 掃描不同策略。
+        # 這兩個參數可調，是為了讓 research/test_inference_strategies.ipynb 掃描不同策略。
         self.distance_scale = float(distance_scale)
         self.distance_weight_mode = str(distance_weight_mode)
         # "band"：只用 4 格結構 band 過濾類比（改動前的行為，保留供對照）
@@ -301,6 +303,16 @@ class MechanisticInference:
         self.m_bucket = float(m_bucket)
         self.m_band = float(m_band)
         self._hier_cache = None
+        # cardiodb.xlsx：364 個外顯子的 Hg38 座標、結構 band、心肌／骨骼肌實測 PSI。
+        # 設定後即取代轉錄本模型成為 exon / band / PSI 的來源（涵蓋率 364 vs 323，
+        # 且 band 直接來自該表而非座標切點）。未設定時完全維持原本行為。
+        self.cardiodb_path = str(cardiodb_path) if cardiodb_path else None
+        # HGMD 完整匯出 CSV（2,193 筆），取代舊的 xlsx 知識庫作為類比／計數來源。
+        # 這份沒有 REF/ALT 欄，所以 hgmd_lookup 的 exact 比對會關閉，改由
+        # main.py Step 5.5 的 variant_db_lookup 負責（那裡靠 acc_num 接回 REF/ALT）。
+        self.hgmd_csv_path = str(hgmd_csv_path) if hgmd_csv_path else None
+        self._cardio_rows = None   # list[dict]，依 lo 遞增
+        self._cardio_band = None   # dict[exon -> band]
         self.transcript_interval_path = (
             str(transcript_interval_path) if transcript_interval_path else None
         )
@@ -320,6 +332,63 @@ class MechanisticInference:
 
     # ── 載入 HGMD 類比庫 ──────────────────────────────────────────────────────
 
+    # HGMD mutype → (vclass, vgroup)。直接用 HGMD 自己的分類，比正則可靠。
+    _MUTYPE_MAP = {
+        "frameshift": ("frameshift", "truncating"),
+        "nonsense": ("nonsense", "truncating"),
+        "canonical-splice": ("splice", "truncating"),
+        "exonic-splice": ("splice", "truncating"),
+        "gross": ("gross", "truncating"),
+        "missense": ("missense", "missense"),
+        "inframe": ("inframe", "missense"),
+        "noncoding": ("noncoding", "unknown"),
+    }
+
+    def _load_kb_from_csv(self) -> List[Dict[str, Any]]:
+        """解析 HGMD 完整匯出 CSV（含 disease / mutype / rankscore / clinvarID）。
+
+        沒有 REF/ALT 欄，所以 ref/alt 留空，比對一律走同位置（見 hgmd_lookup）。
+        """
+        import pandas as pd
+
+        from utils.disease_normalizer import (
+            canonical_labels,
+            is_vague_disease,
+            tissue_of_labels,
+        )
+
+        df = pd.read_csv(self.hgmd_csv_path, low_memory=False)
+        rows: List[Dict[str, Any]] = []
+        for r in df.itertuples():
+            try:
+                pos = int(r.startCoord)
+            except (TypeError, ValueError):
+                continue
+            disease = str(getattr(r, "disease", "") or "").strip()
+            vclass, vgroup = self._MUTYPE_MAP.get(
+                str(getattr(r, "mutype", "") or "").strip(), ("unknown", "unknown")
+            )
+            rank = getattr(r, "rankscore", None)
+            cvid = getattr(r, "clinvarID", None)
+            rows.append({
+                "pos": pos,
+                "ref": "", "alt": "",
+                "dna": str(getattr(r, "hgvs", "") or ""),
+                "prot": str(getattr(r, "amino", "") or ""),
+                "phen": disease,
+                # 引擎內部用小寫組織標籤；tissue_of_labels 回傳 "Cardiac" 這種首字大寫
+                "phenotype": tissue_of_labels(canonical_labels(disease)).lower(),
+                "rankscore": None if rank is None or pd.isna(rank) else float(rank),
+                "rsid": str(getattr(r, "dbsnp", "") or ""),
+                "clinvar_id": None if cvid is None or pd.isna(cvid) else str(cvid),
+                "phen_vague": is_vague_disease(disease),
+                "band": self.assign_band(pos),
+                "exon": self.assign_exon(pos),
+                "vclass": vclass, "vgroup": vgroup,
+            })
+        logger.info(f"Loaded {len(rows)} HGMD variants from {self.hgmd_csv_path}")
+        return rows
+
     def _load_kb(self) -> List[Dict[str, Any]]:
         if self._kb is not None:
             return self._kb
@@ -327,6 +396,10 @@ class MechanisticInference:
         import pandas as pd
 
         from utils.disease_normalizer import is_vague_disease
+
+        if self.hgmd_csv_path:
+            self._kb = self._load_kb_from_csv()
+            return self._kb
 
         df = pd.read_excel(self.kb_path)
         rows: List[Dict[str, Any]] = []
@@ -445,12 +518,76 @@ class MechanisticInference:
     # ── Step 2: band / 類型 / isoform ────────────────────────────────────────
 
     def assign_band(self, pos: int) -> str:
-        """把 genomic POS 分箱到結構 band（等同 notebook 的 pd.cut）。"""
+        """把 genomic POS 分箱到結構 band。
+
+        有 cardiodb 時以該表登記的 band 為準（外顯子層級）；落在內含子或
+        表外的位置退回 band_edges 的座標切點。
+        """
+        if self.cardiodb_path:
+            self._load_cardio()
+            exon = self.assign_exon(pos)
+            if exon is not None:
+                band = (self._cardio_band or {}).get(int(exon))
+                if band:
+                    return band
         # band_edges 為遞增邊界；label i 對應區間 [edges[i], edges[i+1]]
         idx = bisect_right(self.band_edges, pos) - 1
         if idx < 0 or idx >= len(self.band_labels):
             return "outside"
         return self.band_labels[idx]
+
+    def _load_cardio(self) -> List[Dict[str, Any]]:
+        """讀 cardiodb.xlsx：每個外顯子的 Hg38 區間、結構 band、兩個組織的 PSI。
+
+        回傳依 lo 遞增排序的 list[dict]；未設定路徑或讀取失敗時回傳空 list，
+        呼叫端一律退回轉錄本模型的原本行為。
+        """
+        if self._cardio_rows is not None:
+            return self._cardio_rows
+
+        self._cardio_rows = []
+        self._cardio_band = {}
+        if not self.cardiodb_path:
+            return self._cardio_rows
+        try:
+            import os
+
+            import pandas as pd
+
+            if not os.path.exists(self.cardiodb_path):
+                logger.warning(f"找不到 cardiodb，改用轉錄本模型：{self.cardiodb_path}")
+                return self._cardio_rows
+
+            # 第 0 列是 isoform 名稱標頭，不是資料。欄名含空白，itertuples 會把它們
+            # 改寫成 _1.._16 而容易對錯位置，所以用 iterrows + 欄名存取。
+            df = pd.read_excel(self.cardiodb_path).iloc[1:]
+            rows: List[Dict[str, Any]] = []
+            for _, r in df.iterrows():
+                try:
+                    ex = int(r["Exon number"])
+                    a, b = int(r["Hg38 start"]), int(r["Hg38 end"])
+                except (TypeError, ValueError, KeyError):
+                    continue
+                # cardiodb 對 36 個外顯子沒有骨骼肌 PSI（exon 148/150/172-205，全在
+                # I-band 且心肌 PSI 也都 <90%）。缺值視為 0，它們因此落入 both-low，
+                # 語意上正確：這些是兩個組織都幾乎不收錄的替代性剪接外顯子。
+                ph, ps = r.get("PSI in heart"), r.get("PSI in skeletal")
+                rows.append({
+                    "exon": ex,
+                    "lo": min(a, b), "hi": max(a, b),
+                    "band": str(r.get("Band") or "").strip(),
+                    "psi_heart": 0.0 if pd.isna(ph) else float(ph),
+                    "psi_skeletal": 0.0 if pd.isna(ps) else float(ps),
+                })
+            rows.sort(key=lambda x: x["lo"])
+            self._cardio_rows = rows
+            self._cardio_band = {r["exon"]: r["band"] for r in rows if r["band"]}
+            logger.info(f"Loaded {len(rows)} exons from cardiodb ({self.cardiodb_path})")
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"讀取 cardiodb 失敗，改用轉錄本模型：{e}")
+            self._cardio_rows = []
+            self._cardio_band = {}
+        return self._cardio_rows
 
     def _load_exons(self) -> List[tuple]:
         """載入 meta transcript 的外顯子區間，回傳 (g_start, g_end, 文獻外顯子編號)。
@@ -458,6 +595,14 @@ class MechanisticInference:
         依 g_start 遞增排序（TTN 在負鏈，所以外顯子編號是遞減的），供 bisect 查找。
         """
         if self._exons is not None:
+            return self._exons
+
+        # cardiodb 優先：涵蓋 364 個外顯子且座標直接來自該表
+        cardio = self._load_cardio()
+        if cardio:
+            spans = [(r["lo"], r["hi"], r["exon"]) for r in cardio]
+            self._exons = spans
+            self._exon_starts = [s[0] for s in spans]
             return self._exons
 
         self._exons = []
@@ -533,6 +678,24 @@ class MechanisticInference:
         取不到轉錄本模型時回傳空 dict，呼叫端一律退回原本的 band 行為。
         """
         if self._exon_inclusion is not None:
+            return self._exon_inclusion
+
+        # cardiodb 優先：364 個外顯子全部有實測 PSI，不需要 isoform 收錄度代理，
+        # 也就沒有 psi:absent 這個桶。
+        cardio = self._load_cardio()
+        if cardio:
+            self._exon_inclusion = {
+                r["exon"]: {
+                    "psi_heart": r["psi_heart"],
+                    "psi_skeletal": r["psi_skeletal"],
+                    "band": r["band"],
+                    "meta_only": 0,
+                    "n_inc": None,
+                    "bucket": "psi:" + self._psi_bucket(r["psi_heart"], r["psi_skeletal"], 0),
+                    "source": "cardiodb",
+                }
+                for r in cardio
+            }
             return self._exon_inclusion
 
         self._exon_inclusion = {}
@@ -658,13 +821,6 @@ class MechanisticInference:
         if h:
             return "cardiac-high"
         return "both-low"
-
-    @staticmethod
-    def _inclusion_bucket(n_inc: int) -> str:
-        for lo, hi, name in INCLUSION_BUCKETS:
-            if lo <= n_inc <= hi:
-                return name
-        return "high"
 
     def exon_inclusion(self, pos: int) -> Optional[Dict[str, Any]]:
         """回傳該位置所在外顯子的 isoform 收錄度；落在內含子或無模型時為 None。"""
@@ -982,6 +1138,12 @@ class MechanisticInference:
             return {"exact": None, "same_position": []}
         same_pos = [dict(r) for r in kb if r["pos"] == p]
         exact = None
+        # HGMD 完整匯出 CSV 沒有 REF/ALT 欄，庫內與查詢的 ref/alt 都是空字串，
+        # 直接比字串會讓同位置的任何變異都被當成完全命中（實測 PubTator 有 49.2%
+        # 中招，等於把答案讀回來）。這條路一律只回報同位置，exact 交給 main.py
+        # Step 5.5 的 variant_db_lookup 處理，那裡靠 acc_num 接回 REF/ALT。
+        if self.hgmd_csv_path:
+            return {"exact": None, "same_position": same_pos}
         if ref is not None and alt is not None:
             rr, aa = str(ref).upper(), str(alt).upper()
             for r in same_pos:
@@ -1289,7 +1451,6 @@ Respond with ONLY a JSON object:
 
         if extractor is None:
             result["inference"] = self._rule_based_fallback(features)
-            result["inference"]["source"] = "rule_based_fallback"
             logger.info("Mechanistic inference: no LLM available -> rule-based fallback")
             return result
 
@@ -1300,7 +1461,7 @@ Respond with ONLY a JSON object:
         except Exception as e:
             logger.error(f"Mechanistic LLM inference failed: {e}", exc_info=True)
             result["inference"] = self._rule_based_fallback(features)
-            result["inference"]["source"] = "rule_based_fallback_after_error"
+            result["inference"]["source"] += "+after_llm_error"
             return result
 
         result["inference"] = self._finalize_inference(extractor, features, prompt, raw)
@@ -1328,7 +1489,6 @@ Respond with ONLY a JSON object:
             out = []
             for f in features:
                 inf = self._rule_based_fallback(f)
-                inf["source"] = "rule_based_fallback"
                 out.append({
                     "mode": "inference",
                     "evidence_strength": "inferred_no_literature",
@@ -1349,7 +1509,7 @@ Respond with ONLY a JSON object:
         for f, prompt, raw in zip(features, prompts, raws):
             if raw is None:
                 inf = self._rule_based_fallback(f)
-                inf["source"] = "rule_based_fallback_after_error"
+                inf["source"] += "+after_llm_error"
             else:
                 inf = self._finalize_inference(extractor, f, prompt, raw)
             results.append({
@@ -1394,7 +1554,7 @@ Respond with ONLY a JSON object:
         except Exception as e:
             logger.error(f"Mechanistic inference post-processing failed: {e}", exc_info=True)
             data = self._rule_based_fallback(features)
-            data["source"] = "rule_based_fallback_after_error"
+            data["source"] += "+after_llm_error"
             return data
 
     # ── LLM 生成（推論專用的 sampling / schema）──────────────────────────────
@@ -1850,4 +2010,5 @@ Respond with ONLY a JSON object:
             "differential_diagnoses": differential,
             "rationale": rationale,
             "analog_variants_used": used,
+            "source": "analogy_voting",
         }

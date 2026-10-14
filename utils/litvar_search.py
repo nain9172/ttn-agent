@@ -419,17 +419,3 @@ class LitVarSearcher:
         return articles
     
     # Keep old methods for backward compatibility
-    def search_variant(self, variant_query: str, max_results: int = 50) -> List[Dict]:
-        """Legacy method"""
-        if variant_query.startswith('rs'):
-            pmids = self.search_by_rsid(variant_query)
-            if pmids:
-                return self.fetch_article_details(pmids[:max_results])
-        return []
-    
-    def _generate_variant_queries(self, variant_info: Dict, clinvar_info: Optional[Dict] = None) -> List[str]:
-        """Legacy method"""
-        queries = []
-        if clinvar_info and clinvar_info.get('rsid'):
-            queries.append(clinvar_info['rsid'])
-        return queries
