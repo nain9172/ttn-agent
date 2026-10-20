@@ -26,6 +26,7 @@ import base64
 import hashlib
 import html as html_mod
 import json
+import os
 import logging
 import re
 import shutil
@@ -34,6 +35,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from utils import variant_ids
 from utils.pubmind_lookup import PubMindLookup
 from utils.pubmind_lookup import disease_counts as pubmind_disease_counts
 
@@ -70,6 +72,9 @@ TISSUE_COLORS = {
 
 # ── report parsing ────────────────────────────────────────────────────────────
 
+# docker 服務（web_server.py）建站時設定 TTN_SERVER_MODE=1
+SERVER_MODE = os.environ.get("TTN_SERVER_MODE") == "1"
+
 RE_STYLE = re.compile(r"<style>(.*?)</style>", re.S)
 RE_IMG = re.compile(r'<img src="data:image/png;base64,([A-Za-z0-9+/=]+)"([^>]*)>')
 RE_GENERATED = re.compile(r"Generated: (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})")
@@ -84,6 +89,10 @@ RE_ARTICLE_LINK = re.compile(r'<a href="(https://pubmed\.ncbi\.nlm\.nih\.gov/\d+
 RE_ARTICLE_META = re.compile(r'<div class="article-meta">(.*?) \((.*?)\) \| PMID: (\d+)</div>', re.S)
 RE_INFERENCE_SECTION = re.compile(
     r'<section class="section inference-section">(.*?)</section>', re.S
+)
+RE_INHERITANCE = re.compile(
+    r'class="section inference-section inherit-section">.*?Inferred inheritance</div>\s*<div[^>]*>(.*?)</div>'
+    r'.*?Confidence</div>\s*<div[^>]*>(.*?)</div>', re.S
 )
 RE_INFERENCE_SOURCE = re.compile(r"Inference source: (.*?)</p>", re.S)
 RE_TAG = re.compile(r"<[^>]+>")
@@ -222,12 +231,15 @@ def parse_report(path: Path) -> Optional[Dict]:
     if "_" not in stem:
         logger.warning("skipping %s (cannot split variant/model)", path.name)
         return None
-    variant_id, model = stem.rsplit("_", 1)
-    parts = variant_id.split("-")
+    internal_id, model = stem.rsplit("_", 1)
+    parts = internal_id.split("-")
     if len(parts) != 4 or not parts[1].isdigit():
-        logger.warning("skipping %s (unexpected variant id %r)", path.name, variant_id)
+        logger.warning("skipping %s (unexpected variant id %r)", path.name, internal_id)
         return None
-    chrom, pos, ref, alt = parts
+    # outputs/ 檔名是內部（TTN 轉錄方向）ID；網站上一律顯示基因組正股（VCF / ClinVar 慣例）
+    chrom, pos, tx_ref, tx_alt = parts
+    variant_id = variant_ids.to_display(internal_id)
+    ref, alt = variant_ids.complement(tx_ref), variant_ids.complement(tx_alt)
 
     evo2: Dict = {}
     box = RE_PREDICTION_BOX.search(source)
@@ -255,6 +267,9 @@ def parse_report(path: Path) -> Optional[Dict]:
     generated = RE_GENERATED.search(source)
     clinvar = RE_CLINVAR.search(source)
     inference = parse_inference(source)
+    inh = RE_INHERITANCE.search(source)
+    inheritance = {"mode": collapse_ws(strip_tags(inh.group(1))), "confidence": collapse_ws(strip_tags(inh.group(2)))} \
+        if inh else None
     databases = parse_databases(source)
 
     # 檔名後綴 no-llm 指的是「沒有文獻可讓 LLM 擷取臨床資訊」，但這種變異會走
@@ -269,11 +284,15 @@ def parse_report(path: Path) -> Optional[Dict]:
 
     return {
         "variant_id": variant_id,
+        "internal_id": internal_id,
         "model": model,
         "chrom": chrom,
         "pos": int(pos),
         "ref": ref,
         "alt": alt,
+        "tx_ref": tx_ref,
+        "tx_alt": tx_alt,
+        "hgvs_c": (variant_ids.hgvs_c(int(pos), tx_ref, tx_alt) or "").split(":", 1)[-1],
         "generated": generated.group(1) if generated else "",
         "clinvar_id": clinvar.group(1) if clinvar else "",
         "evo2": evo2,
@@ -284,6 +303,7 @@ def parse_report(path: Path) -> Optional[Dict]:
         "dominant_tissue": dominant,
         "diseases": [d for d, _ in diseases.most_common(6)],
         "inference": inference,
+        "inheritance": inheritance,
         "band": ((inference or {}).get("band") or "").strip() or band_from_pos(int(pos)),
         "db": databases,
         "source_file": path.name,
@@ -348,6 +368,7 @@ def make_nav(meta: Dict, prev: Optional[Dict], nxt: Optional[Dict]) -> str:
     return (
         '<nav class="report-nav">'
         '<a class="nav-btn nav-home" href="../index.html">&#8592; All reports</a>'
+        '<a class="nav-btn nav-info" href="../info.html">&#9432; Information</a>'
         f'<span class="nav-title">{html_mod.escape(meta["variant_id"])}'
         f'<span class="nav-model">{html_mod.escape(meta["model"])}</span></span>'
         f'{link(prev, "&#8249; Prev", "nav-prev")}{link(nxt, "Next &#8250;", "nav-next")}'
@@ -373,7 +394,7 @@ REPORT_NAV_CSS = """/* Navigation bar injected into each report by build_site.py
     border-radius: 10px;
     padding: 10px 16px;
     box-shadow: 0 4px 18px rgba(0, 0, 0, 0.15);
-    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+    font-family: 'Segoe UI', 'Noto Sans', 'Noto Sans TC', 'Microsoft JhengHei', -apple-system, BlinkMacSystemFont, Roboto, 'Helvetica Neue', Arial, sans-serif;
 }
 .report-nav .nav-title {
     font-weight: 700;
@@ -421,7 +442,7 @@ SITE_CSS = """/* TTN variant report index */
 }
 * { margin: 0; padding: 0; box-sizing: border-box; }
 body {
-    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+    font-family: 'Segoe UI', 'Noto Sans', 'Noto Sans TC', 'Microsoft JhengHei', -apple-system, BlinkMacSystemFont, Roboto, 'Helvetica Neue', Arial, sans-serif;
     color: var(--ink);
     background: #f4f6fa;
     line-height: 1.55;
@@ -435,7 +456,8 @@ header.site {
 header.site .inner { max-width: 1400px; margin: 0 auto; }
 header.site h1 { font-size: 1.9em; letter-spacing: -0.01em; }
 header.site p { opacity: 0.88; margin-top: 6px; }
-header.site .site-nav { margin-top: 12px; }
+/* stats 卡片用負 margin 疊在 header 上，連結列下方要留出空間 */
+header.site .site-nav { margin: 14px 0 40px; display: flex; flex-wrap: wrap; gap: 8px; }
 header.site .site-nav a {
     color: #fff; text-decoration: none; font-weight: 600; font-size: 0.9em;
     border: 1px solid rgba(255, 255, 255, 0.45); border-radius: 999px; padding: 5px 14px;
@@ -504,21 +526,22 @@ main { max-width: 1400px; margin: 0 auto; padding: 22px 24px 60px; }
 .toolbar button.reset:hover { color: var(--ink); border-color: var(--muted); }
 .result-count { color: var(--muted); font-size: 0.9em; margin: 14px 0 8px; }
 
-.table-wrap { background: #fff; border-radius: 12px; box-shadow: 0 6px 20px rgba(31, 45, 68, 0.07); overflow: hidden; }
+/* 欄位多，窄螢幕改成左右捲動而不是把右邊的欄位切掉 */
+.table-wrap { background: #fff; border-radius: 12px; box-shadow: 0 6px 20px rgba(31, 45, 68, 0.07); overflow-x: auto; }
 table { width: 100%; border-collapse: collapse; font-size: 0.92em; }
 thead th {
     background: #f7f9fc; color: var(--muted); text-align: left;
-    padding: 12px 14px; font-size: 0.85em; text-transform: uppercase;
+    padding: 11px 10px; font-size: 0.82em; text-transform: uppercase;
     letter-spacing: 0.04em; border-bottom: 1px solid var(--line); white-space: nowrap;
 }
 thead th.sortable { cursor: pointer; user-select: none; }
 thead th.sortable:hover { color: var(--ink); }
 thead th .arrow { opacity: 0; margin-left: 4px; }
 thead th.sorted .arrow { opacity: 1; }
-tbody td { padding: 11px 14px; border-bottom: 1px solid #f1f4f8; vertical-align: middle; }
+tbody td { padding: 10px 10px; border-bottom: 1px solid #f1f4f8; vertical-align: middle; }
 tbody tr:hover { background: #f9fbff; }
 tbody tr:last-child td { border-bottom: none; }
-td.variant a { font-weight: 700; text-decoration: none; white-space: nowrap; font-family: ui-monospace, 'SFMono-Regular', Menlo, monospace; }
+td.variant a { font-weight: 700; text-decoration: none; white-space: nowrap; font-variant-numeric: tabular-nums; }
 td.variant a:hover { text-decoration: underline; }
 td.variant .sub { display: block; color: var(--muted); font-size: 0.85em; font-family: inherit; }
 td.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
@@ -527,7 +550,10 @@ td.num { text-align: right; font-variant-numeric: tabular-nums; white-space: now
 .pill.pathogenic { background: #fdecea; color: #c0392b; }
 .pill.benign { background: #e8f8ef; color: #1e8449; }
 .pill.na { background: #eef1f6; color: var(--muted); }
-.pill.model { background: #eef1f6; color: #55637a; font-weight: 600; }
+.pill.model {
+    background: #eef1f6; color: #55637a; font-weight: 600;
+    max-width: 120px; overflow: hidden; text-overflow: ellipsis; vertical-align: middle;
+}
 .pill.db-hgmd { background: #e8f5e9; color: #1b5e20; }
 .pill.db-pubtator { background: #e3f0fc; color: #10508f; }
 .pill.db-pubmind { background: #f3e8fd; color: #6a1b9a; }
@@ -554,14 +580,18 @@ td.num { text-align: right; font-variant-numeric: tabular-nums; white-space: now
 .mention-strong { font-weight: 700; color: #1e8449; }
 .mention-zero { color: var(--muted); }
 .diseases {
-    color: var(--muted); font-size: 0.88em; max-width: 320px;
+    color: var(--muted); font-size: 0.88em; min-width: 140px; max-width: 240px;
     /* 這一欄常被擠窄，不夾行會把整列拉得很高 */
     display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
 }
-.inference-cell { font-size: 0.88em; }
+.inference-cell { font-size: 0.88em; min-width: 140px; max-width: 220px; }
+.pill.inh { background: #fff3cd; color: #8a5a00; border: 1px dashed #d39e00; }
 .inference-cell .dis { display: block; color: #8a5a00; font-weight: 600; }
 .empty { padding: 60px 20px; text-align: center; color: var(--muted); }
 footer.site { max-width: 1400px; margin: 0 auto; padding: 0 24px 40px; color: var(--muted); font-size: 0.85em; }
+@media (max-width: 1300px) {
+    .hide-md { display: none; }
+}
 @media (max-width: 900px) {
     .stats { margin-top: 16px; }
     .hide-sm { display: none; }
@@ -608,6 +638,8 @@ footer.site { max-width: 1400px; margin: 0 auto; padding: 0 24px 40px; color: va
 .state.running { color: #b26a00; }
 .state.done { color: #1e8449; }
 .state.failed { color: #c0392b; }
+.state.cancelled { color: var(--muted); }
+.analyze .an-cancel { border: 0; background: #eef1f6; color: #3d4d63; border-radius: 6px; padding: 2px 8px; font-size: 0.85em; cursor: pointer; margin-top: 4px; }
 .an-offline { color: var(--muted); font-size: 0.85em; margin: -8px 0 16px; }
 """
 
@@ -619,13 +651,16 @@ SITE_JS = r"""(function () {
   var TISSUES = ['cardiac', 'skeletal', 'both', 'not_specified'];
   var TISSUE_LABELS = { cardiac: 'Cardiac', skeletal: 'Skeletal', both: 'Both', not_specified: 'Not specified' };
   var TISSUE_SHORT = { cardiac: 'Card', skeletal: 'Skel', both: 'Both', not_specified: 'NS' };
+  var INH_SHORT = { 'Autosomal dominant': 'AD', 'Autosomal recessive': 'AR', 'AD or AR (allelic)': 'AD/AR', 'Uncertain': 'AD/AR ?' };
 
   function mergeReports(records) {
     records.forEach(function (r) {
       r.local = true;
       if (r.pos != null) prepare(r);
       for (var i = DATA.length - 1; i >= 0; i--) {
-        if (DATA[i].variant_id === r.variant_id) DATA.splice(i, 1);
+        // 舊版的本機報告以轉錄方向 ID 當 variant_id
+        if (DATA[i].variant_id === r.variant_id || DATA[i].variant_id === r.internal_id ||
+            DATA[i].internal_id === r.variant_id) DATA.splice(i, 1);
       }
       DATA.push(r);
     });
@@ -637,7 +672,7 @@ SITE_JS = r"""(function () {
   mergeReports(window.__TTN_LOCAL_REPORTS__ || []);
 
   function prepare(r) {
-    var bits = [r.variant_id, r.model, r.ref + '>' + r.alt, String(r.pos), r.clinvar_id];
+    var bits = [r.variant_id, r.internal_id, r.hgvs_c, r.model, r.ref + '>' + r.alt, String(r.pos), r.clinvar_id];
     bits = bits.concat(r.diseases || []);
     if (r.inference) bits.push(r.inference.disease, r.inference.tissue, r.inference.band, r.inference.differential);
     if (r.band) bits.push(r.band);
@@ -841,19 +876,27 @@ SITE_JS = r"""(function () {
       : '<span class="pill na">N/A</span>';
     var delta = evo2.delta != null ? evo2.delta.toFixed(4) : '—';
     var inf = '<span class="mention-zero">—</span>';
+    var inh = '';
+    if (r.inheritance && r.inheritance.mode) {
+      var short = INH_SHORT[r.inheritance.mode] || r.inheritance.mode;
+      inh = ' <span class="pill inh" title="Inferred mode of inheritance: ' + esc(r.inheritance.mode) + ' (' +
+        esc(r.inheritance.confidence || '') + ' confidence). Inference, not recorded data.">' + esc(short) + '</span>';
+    }
     if (r.inference) {
       var conf = (r.inference.confidence || '').toLowerCase();
       inf = '<div class="inference-cell"><span class="dis">' + esc(r.inference.disease || 'Uncertain') + '</span>' +
-        '<span class="pill conf-' + (conf || 'low') + '">' + esc(r.inference.confidence || 'Low') + '</span></div>';
+        '<span class="pill conf-' + (conf || 'low') + '">' + esc(r.inference.confidence || 'Low') + '</span>' + inh + '</div>';
+    } else if (inh) {
+      inf = '<div class="inference-cell">' + inh + '</div>';
     }
     var mention = r.n_mention
       ? '<span class="mention-strong">' + r.n_mention + '</span>'
       : '<span class="mention-zero">0</span>';
     return '<tr>' +
       '<td class="variant"><a href="reports/' + esc(r.file) + '">' + esc(r.variant_id) + '</a>' +
-      '<span class="sub">chr' + esc(r.chrom) + ':' + r.pos.toLocaleString() + ' ' + esc(r.ref) + '&rarr;' + esc(r.alt) + '</span></td>' +
-      '<td class="hide-sm"><span class="pill model">' + esc(r.model) + '</span>' +
-        (r.local ? ' <span class="pill local" title="Analyzed on your DGX Spark">Spark</span>' : '') + '</td>' +
+        (r.local ? ' <span class="pill local" title="Analyzed on your DGX Spark">Spark</span>' : '') +
+      '<span class="sub">' + (r.hgvs_c ? esc(r.hgvs_c) : 'chr' + esc(r.chrom) + ':' + r.pos.toLocaleString()) + '</span></td>' +
+      '<td class="hide-sm hide-md"><span class="pill model" title="' + esc(r.model) + '">' + esc(r.model) + '</span></td>' +
       '<td>' + pred + '</td>' +
       '<td class="num">' + delta + '</td>' +
       '<td class="num">' + r.n_articles + '</td>' +
@@ -1034,8 +1077,11 @@ SITE_JS = r"""(function () {
   // 給 assets/launcher.js 用：合併新報告後重畫表格
   window.TTN = {
     addReports: function (records) { mergeReports(records); render(); },
+    // 正股或轉錄方向寫法都找得到（同一位置只有一種寫法的 ref 對得上參考序列，不會混淆）
     find: function (id) {
-      for (var i = 0; i < DATA.length; i++) if (DATA[i].variant_id === id) return DATA[i];
+      for (var i = 0; i < DATA.length; i++) {
+        if (DATA[i].variant_id === id || DATA[i].internal_id === id) return DATA[i];
+      }
       return null;
     }
   };
@@ -1060,6 +1106,13 @@ LAUNCHER_JS = r"""(function () {
   var FIELDS = { host: 'an-host', user: 'an-user', port: 'an-port', key_path: 'an-key', repo: 'an-repo', python: 'an-python' };
   var known = {};      // job_id -> 是否已合併（用來偵測「剛完成」）
   var firstLoad = true;
+  // server：網站由 docker 服務（web_server.py）提供，分析在同一台伺服器上跑，不需要 SSH 設定
+  var serverMode = false;
+  function notify(title, body) {
+    if (window.isSecureContext && window.Notification && Notification.permission === 'granted') {
+      new Notification(title, { body: body });
+    }
+  }
 
   function api(method, path, body) {
     return fetch(path, {
@@ -1196,7 +1249,7 @@ LAUNCHER_JS = r"""(function () {
     var todo = preview();
     if (!todo.length) return;
     $('an-submit').disabled = true;
-    msg('an-submit-msg', 'Sending to the Spark…');
+    msg('an-submit-msg', serverMode ? 'Submitting…' : 'Sending to the Spark…');
     var rerun = $('an-rerun').checked;
     api('POST', '/api/submit', { variants: todo, rerun: rerun }).then(function (res) {
       $('an-submit').disabled = false;
@@ -1208,10 +1261,10 @@ LAUNCHER_JS = r"""(function () {
           (rejected.length ? ' Skipped: ' + rejected.join('; ') : ''), rejected.length ? 'err' : 'ok');
         $('an-variants').value = '';
         preview();
-        if (window.Notification && Notification.permission === 'default') Notification.requestPermission();
+        if (window.isSecureContext && window.Notification && Notification.permission === 'default') Notification.requestPermission();
         refreshJobs();
       } else {
-        handleConnResult(res);
+        if (!serverMode) handleConnResult(res);
         msg('an-submit-msg', (res.error || 'Submission failed') + (rejected.length ? ': ' + rejected.join('; ') : ''), 'err');
       }
     }).catch(function (e) { $('an-submit').disabled = false; msg('an-submit-msg', String(e), 'err'); });
@@ -1219,7 +1272,8 @@ LAUNCHER_JS = r"""(function () {
 
   // ── 任務清單 ──
   function stateText(j) {
-    if (j.state === 'done' && !j.merged) return j.merge_error ? 'downloading failed' : 'downloading…';
+    if (j.state === 'done' && !j.merged) return j.merge_error ? (serverMode ? 'done' : 'downloading failed') : 'downloading…';
+    if (j.cancel_requested && (j.state === 'running' || j.state === 'waiting')) return 'cancelling…';
     if (j.state === 'running') return 'running (' + (j.completed || []).length + '/' + j.variants.length + ')';
     if (j.state === 'waiting') return 'waiting for memory';
     return j.state;
@@ -1246,7 +1300,9 @@ LAUNCHER_JS = r"""(function () {
         return '<tr><td>' + esc((j.created || '').replace('T', ' ')) + '<br><span class="hint">' + esc(j.host) + '</span></td>' +
           '<td class="vlist">' + j.variants.map(esc).join('<br>') +
             (j.rerun ? '<br><span class="pill local">re-run</span>' : '') + '</td>' +
-          '<td><span class="state ' + esc(j.state) + '">' + esc(stateText(j)) + '</span></td>' +
+          '<td><span class="state ' + esc(j.state) + '">' + esc(stateText(j)) + '</span>' +
+            (serverMode && /^(queued|running|waiting)$/.test(j.state) && !j.cancel_requested
+              ? '<br><button type="button" class="an-cancel" data-job="' + esc(j.job_id) + '">Cancel</button>' : '') + '</td>' +
           '<td>' + resultCell(j) + '</td></tr>';
       }).join('');
       if (res.poll_error) msg('an-conn', '● ' + res.poll_error, 'err');
@@ -1262,19 +1318,56 @@ LAUNCHER_JS = r"""(function () {
     api('GET', '/api/local-reports').then(function (res) {
       if (res.ok && window.TTN) window.TTN.addReports(res.reports || []);
       finished.forEach(function (j) {
-        var text = (j.reports || []).length + ' variant(s) added to the site';
-        if (window.Notification && Notification.permission === 'granted') {
-          new Notification('TTN analysis finished', { body: text });
-        }
+        notify('TTN analysis finished', (j.reports || []).length + ' variant(s) added to the site');
       });
       preview();
     });
+  }
+
+  $('an-jobs').addEventListener('click', function (e) {
+    var id = e.target.getAttribute && e.target.getAttribute('data-job');
+    if (!id || !confirm('Cancel this analysis?')) return;
+    api('POST', '/api/cancel', { job_id: id }).then(refreshJobs);
+  });
+
+  function serverStatus() {
+    return api('GET', '/api/status').then(function (res) {
+      var st = res.setup || {}, w = res.worker || {};
+      if (!st.ready_for_analysis) {
+        msg('an-conn', '● data setup incomplete', 'err');
+      } else if (!w.alive) {
+        msg('an-conn', '● analysis worker is not running', 'err');
+      } else {
+        msg('an-conn', '● server ready', 'ok');
+      }
+    });
+  }
+
+  function startServerMode() {
+    serverMode = true;
+    $('an-settings').hidden = true;
+    // 舊版建站的 index.html 沒有 an-title / an-hint 的 id，找不到就退回一般選擇器
+    var title = $('an-title');
+    if (title) title.textContent = 'Analyze variants';
+    var hint = $('an-hint') || panel.querySelector('.hint');
+    $('an-submit').textContent = 'Analyze';
+    if (hint) hint.innerHTML = 'Variants are analyzed on this server (Evo2, literature, database lookup, inference) and ' +
+      'added to this site for everyone when they finish. You can close this page meanwhile. ' +
+      '<a href="/setup">Data &amp; setup &rarr;</a>';
+    var nav = document.querySelector('header.site .site-nav');
+    if (nav) nav.insertAdjacentHTML('beforeend', '<a href="/setup">&#9881; Data &amp; setup</a>');
+    serverStatus();
+    preview();
+    refreshJobs();
+    setInterval(refreshJobs, 5000);
+    setInterval(serverStatus, 30000);
   }
 
   // ── 啟動 ──
   api('GET', '/api/ping').then(function (res) {
     if (!res.ok) return;
     panel.hidden = false;
+    if (res.mode === 'server') return startServerMode();
     return api('GET', '/api/config').then(function (res) {
       var c = res.config || {};
       Object.keys(FIELDS).forEach(function (k) { if (c[k] != null) $(FIELDS[k]).value = c[k]; });
@@ -1288,7 +1381,10 @@ LAUNCHER_JS = r"""(function () {
       refreshJobs();
       setInterval(refreshJobs, 5000);
     });
-  }).catch(function () { offline.hidden = false; });
+  }).catch(function (e) {
+    if (!serverMode) offline.hidden = false;
+    if (window.console) console.error(e);
+  });
 })();
 """
 
@@ -1312,8 +1408,8 @@ INDEX_HTML = """<!DOCTYPE html>
     <section class="stats" id="stats"></section>
 
     <section class="analyze" id="analyze" hidden>
-        <h2>Analyze variants on your DGX Spark <span class="an-msg" id="an-conn"></span></h2>
-        <p class="hint">Variants are sent to your DGX Spark over SSH, run through the full pipeline
+        <h2><span id="an-title">Analyze variants on your DGX Spark</span> <span class="an-msg" id="an-conn"></span></h2>
+        <p class="hint" id="an-hint">Variants are sent to your DGX Spark over SSH, run through the full pipeline
             (Evo2, literature, database lookup, inference), and added to this site when they finish.
             Keep the TTN-Site window open until then.</p>
         <details id="an-settings">
@@ -1355,7 +1451,7 @@ INDEX_HTML = """<!DOCTYPE html>
                 </div>
             </div>
         </details>
-        <textarea id="an-variants" placeholder="One variant per line, e.g.&#10;2-178527098-C-T&#10;2-178612477-T-A"></textarea>
+        <textarea id="an-variants" placeholder="One variant per line, GRCh38 genomic (+) strand as in VCF / ClinVar, e.g.&#10;2-178527098-G-A&#10;2-178612477-A-T&#10;(TTN coding-strand alleles are also accepted and converted automatically)"></textarea>
         <div class="an-preview" id="an-preview"></div>
         <div class="an-actions">
             <label class="file">Load CSV / text file…<input type="file" id="an-file" accept=".csv,.txt,.tsv"></label>
@@ -1375,7 +1471,7 @@ INDEX_HTML = """<!DOCTYPE html>
 
     <div class="toolbar">
         <div class="toolbar-row">
-            <input type="search" id="q" placeholder="Search variant, position, disease, band, ClinVar ID…" autocomplete="off">
+            <input type="search" id="q" placeholder="Search variant, c. HGVS, position, disease, band, ClinVar ID…" autocomplete="off">
             <select id="f-pred">
                 <option value="">Evo2: any</option>
                 <option value="pathogenic">Pathogenic</option>
@@ -1430,7 +1526,7 @@ INDEX_HTML = """<!DOCTYPE html>
             <thead>
                 <tr>
                     <th class="sortable" data-sort="pos">Variant<span class="arrow"></span></th>
-                    <th class="sortable hide-sm" data-sort="model">Model<span class="arrow"></span></th>
+                    <th class="sortable hide-sm hide-md" data-sort="model">Model<span class="arrow"></span></th>
                     <th class="sortable" data-sort="pred">Evo2<span class="arrow"></span></th>
                     <th class="sortable num" data-sort="delta" title="Evo2 delta score; sorted by absolute value">&Delta; score<span class="arrow"></span></th>
                     <th class="sortable num" data-sort="articles">Articles<span class="arrow"></span></th>
@@ -1524,9 +1620,9 @@ def select_reports(outputs: Path, include: str) -> List[Path]:
 
 
 INDEX_FIELDS = (
-    "variant_id", "model", "chrom", "pos", "ref", "alt", "generated",
+    "variant_id", "internal_id", "model", "chrom", "pos", "ref", "alt", "tx_ref", "tx_alt", "hgvs_c", "generated",
     "clinvar_id", "evo2", "n_articles", "n_mention", "tissue",
-    "mention_tissue", "dominant_tissue", "diseases", "inference", "db", "pubmind", "band",
+    "mention_tissue", "dominant_tissue", "diseases", "inference", "inheritance", "db", "pubmind", "band",
     "file",
 )
 
@@ -1557,7 +1653,7 @@ def build_patch(report_paths: List[Path], patch_dir: Path,
         meta = parse_report(path)
         if meta is None:
             continue
-        meta["pubmind"] = pubmind_for(pubmind, meta["pos"], meta["ref"], meta["alt"])
+        meta["pubmind"] = pubmind_for(pubmind, meta["pos"], meta["tx_ref"], meta["tx_alt"])
         meta["file"] = report_filename(meta)
         source = path.read_text(encoding="utf-8", errors="replace")
         out = rewrite_report(source, assets_dir, css_names, img_names, make_nav(meta, None, None))
@@ -1567,6 +1663,34 @@ def build_patch(report_paths: List[Path], patch_dir: Path,
         json.dumps(records, ensure_ascii=False, separators=(",", ":")), encoding="utf-8"
     )
     return records
+
+
+def prune_stale(site: Path, current: set) -> int:
+    """刪掉舊建站留下、這次沒有產生的報告與圖檔（例如改用正股 ID 後的舊檔名）。
+
+    TTN-Site 啟動程式從 Spark 合併進來的本機報告（data/local-reports.json）照樣保留，
+    圖檔只刪沒有任何保留報告引用的。
+    """
+    keep = set(current)
+    local = site / "data" / "local-reports.json"
+    if local.exists():
+        try:
+            keep |= {str(r.get("file")) for r in json.loads(local.read_text(encoding="utf-8")) if r.get("file")}
+        except (OSError, ValueError):
+            return 0  # 讀不懂本機紀錄時不冒險刪檔
+    removed = 0
+    used_imgs: set = set()
+    for f in (site / "reports").glob("*.html"):
+        if f.name not in keep:
+            f.unlink()
+            removed += 1
+            continue
+        used_imgs.update(re.findall(r'src="\.\./assets/img/([0-9a-f]+\.png)"', f.read_text(encoding="utf-8", errors="replace")))
+    for img in (site / "assets" / "img").glob("*.png"):
+        if img.name not in used_imgs:
+            img.unlink()
+            removed += 1
+    return removed
 
 
 def build(outputs: Path, site: Path, include: str, inline_images: bool,
@@ -1597,7 +1721,7 @@ def build(outputs: Path, site: Path, include: str, inline_images: bool,
         meta = parse_report(path)
         if meta is None:
             continue
-        meta["pubmind"] = pubmind_for(pubmind, meta["pos"], meta["ref"], meta["alt"])
+        meta["pubmind"] = pubmind_for(pubmind, meta["pos"], meta["tx_ref"], meta["tx_alt"])
         meta["file"] = report_filename(meta)
         parsed.append(meta)
         sources[meta["file"]] = path.read_text(encoding="utf-8", errors="replace")
@@ -1630,9 +1754,16 @@ def build(outputs: Path, site: Path, include: str, inline_images: bool,
     (assets_dir / "site.css").write_text(SITE_CSS, encoding="utf-8")
     (assets_dir / "site.js").write_text(SITE_JS, encoding="utf-8")
     (assets_dir / "launcher.js").write_text(LAUNCHER_JS, encoding="utf-8")
-    # 使用者端啟動程式（launcher/ 用 Go 編譯）；有編譯好的就一起放進 site
-    for exe in sorted((Path(__file__).resolve().parent / "launcher" / "dist").glob("TTN-Site*.exe")):
-        shutil.copy2(exe, site / exe.name)
+    if SERVER_MODE:
+        # docker 服務：Spark 任務的報告都已在 outputs/，這次建站已經收進索引，本機清單歸零
+        (data_dir / "local-reports.json").write_text("[]", encoding="utf-8")
+        (data_dir / "local-reports.js").write_text("window.__TTN_LOCAL_REPORTS__ = [];\n", encoding="utf-8")
+        for exe in site.glob("TTN-Site*.exe"):
+            exe.unlink()
+    else:
+        # 使用者端啟動程式（launcher/ 用 Go 編譯）；有編譯好的就一起放進 site
+        for exe in sorted((Path(__file__).resolve().parent / "launcher" / "dist").glob("TTN-Site*.exe")):
+            shutil.copy2(exe, site / exe.name)
 
     index_records = [index_record(meta) for meta in parsed]
     payload = json.dumps(index_records, ensure_ascii=False, separators=(",", ":"))
@@ -1641,11 +1772,14 @@ def build(outputs: Path, site: Path, include: str, inline_images: bool,
     built = datetime.now().strftime("%Y-%m-%d %H:%M")
     site_meta = {"built": built, "n_reports": len(parsed), "include": include}
     # 驗證摘要頁是另外產生的；重建索引時若不主動補連結就會把入口弄丟。
+    from site_info import info_html
+
+    (site / "info.html").write_text(info_html(), encoding="utf-8")
     nav_extra = (
-        '<p class="site-nav"><a href="validation.html">'
-        "Batch inference validation &rarr;</a></p>"
-        if (site / "validation.html").exists()
-        else ""
+        '<p class="site-nav"><a href="info.html">&#9432; Information: bands, isoforms, scores</a>'
+        + (' <a href="validation.html">Batch inference validation &rarr;</a>'
+           if (site / "validation.html").exists() else "")
+        + "</p>"
     )
     index_html = (
         INDEX_HTML.replace("__TITLE__", "TTN Variant AI Reports")
@@ -1660,6 +1794,10 @@ def build(outputs: Path, site: Path, include: str, inline_images: bool,
         .replace("__META__", json.dumps(site_meta, ensure_ascii=False))
     )
     (site / "index.html").write_text(index_html, encoding="utf-8")
+
+    removed = prune_stale(site, {m["file"] for m in parsed})
+    if removed:
+        logger.info("removed %d stale file(s) from earlier builds", removed)
 
     img_bytes = sum(p.stat().st_size for p in img_dir.glob("*.png"))
     return {

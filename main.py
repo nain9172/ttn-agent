@@ -9,6 +9,7 @@ import sys
 import os
 from pathlib import Path
 from datetime import datetime
+from typing import Optional
 
 from config import (
     OUTPUT_DIR, 
@@ -73,6 +74,11 @@ except ImportError:
     HGVS_ALLOW_NETWORK = False
     REFERENCE_GENOME_PATH = None
     LLM_GPU_MEMORY_UTILIZATION = 0.85
+
+try:
+    from config import ENABLE_INHERITANCE_INFERENCE
+except ImportError:
+    ENABLE_INHERITANCE_INFERENCE = False
 
 # 資料庫查表：HGMD / PubTator / PubMind 對這顆變異登記的疾病（純查表，非推論）
 try:
@@ -246,6 +252,65 @@ def llm_loaded(backend: str, model: str) -> bool:
     return _SHARED_EXTRACTOR is not None and _SHARED_EXTRACTOR_KEY == (backend, model)
 
 
+def release_gpu_cache(need_gib: float) -> None:
+    """釋放檔案快取（scripts/release_page_cache.py），讓 vLLM 的顯存預檢看得到足夠的可用記憶體。"""
+    import logging
+    import subprocess
+
+    logger = logging.getLogger(__name__)
+    env = dict(os.environ, NEED_GIB=f"{need_gib:.1f}")
+    try:
+        out = subprocess.run([sys.executable, str(Path(__file__).parent / "scripts" / "release_page_cache.py")],
+                             env=env, capture_output=True, text=True, timeout=600)
+        logger.info((out.stdout or out.stderr).strip() or "page cache released")
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"Could not release the page cache: {e}")
+
+
+def _main_disease(mechanistic_result, pubmed_results) -> Optional[str]:
+    """遺傳模式推論用的疾病：Track B 的推論疾病，否則取直接提到變異的文獻中最常擷取到的疾病。"""
+    inf = (mechanistic_result or {}).get("inference") or {}
+    disease = str(inf.get("inferred_disease") or "").strip()
+    if disease and disease.lower() != "uncertain":
+        return disease
+    counts = {}
+    for a in pubmed_results or []:
+        d = str(((a.get("clinical_info") or {}).get("disease")) or "").strip()
+        if d and d.lower() not in ("not specified", "n/a", "none", "json parsing failed"):
+            counts[d] = counts.get(d, 0) + 1
+    return max(counts, key=counts.get) if counts else None
+
+
+_MECHANISTIC_ENGINE = None
+
+
+def build_mechanistic_engine():
+    """Track B 與遺傳模式推論共用的查表引擎（外顯子／band／PSI／HGMD 類比）；同一程序只建一次。"""
+    global _MECHANISTIC_ENGINE
+    if _MECHANISTIC_ENGINE is None:
+        from utils.mechanistic_inference import MechanisticInference
+
+        _MECHANISTIC_ENGINE = MechanisticInference(
+            kb_path=HGMD_KB_PATH,
+            band_edges=TTN_BAND_EDGES,
+            band_labels=TTN_BAND_LABELS,
+            top_k=INFERENCE_TOP_K_ANALOGS,
+            transcript_interval_path=TRANSCRIPT_INTERVAL_PATH,
+            transcript_model_path=TTN_TRANSCRIPT_MODEL_PATH,
+            reference_fasta_path=REFERENCE_GENOME_PATH,
+            allow_network=HGVS_ALLOW_NETWORK,
+            # 新資料來源：cardiodb 的 364 個外顯子（座標／band／實測 PSI）
+            # 與 HGMD 完整匯出（2,193 筆）。兩者皆為 None 時退回舊行為。
+            cardiodb_path=INFERENCE_CARDIODB_PATH,
+            hgmd_csv_path=INFERENCE_HGMD_CSV_PATH,
+            predict_mode=INFERENCE_PREDICT_MODE,
+            m_exon=INFERENCE_M_EXON,
+            m_bucket=INFERENCE_M_BUCKET,
+            m_band=INFERENCE_M_BAND,
+        )
+    return _MECHANISTIC_ENGINE
+
+
 def get_shared_extractor(backend: str, model: str):
     """同一程序內只載入一次 LLM；之後的呼叫直接回傳同一個 extractor。"""
     global _SHARED_EXTRACTOR, _SHARED_EXTRACTOR_KEY
@@ -296,13 +361,31 @@ def _any_article_mentions_variant(pubmed_results) -> bool:
 def _parse_variant_input(raw: str, logger) -> dict:
     """接受 `2-178612477-T-A`，也接受文獻慣用的 HGVS（c./p./g.）。
 
-    HGVS 會由 utils/hgvs_resolver 用 TTN 轉錄本外顯子模型離線換算成 GRCh38 座標，
-    ref/alt 依既有慣例為轉錄本方向（TTN 負鏈）。
+    chr-pos-ref-alt 正股（VCF / ClinVar 慣例）與舊的轉錄方向寫法都接受，由
+    utils/variant_ids 用參考序列判斷。回傳的 variant_info 內部一律是轉錄方向
+    （variant_id、ref、alt），另附 display_id / plus_ref / plus_alt 給報告顯示。
+    HGVS 由 utils/hgvs_resolver 用 TTN 轉錄本外顯子模型離線換算成 GRCh38 座標。
     """
+    from utils import variant_ids
     from utils.variant_parser import VariantParseError
 
+    if variant_ids.ID_RE.match(raw or ""):
+        try:
+            v = variant_ids.normalize(raw)
+        except variant_ids.VariantIdError as e:
+            raise VariantParseError(str(e)) from e
+        if v["orientation"] == "transcript":
+            logger.warning(
+                f"輸入 {raw} 是 TTN 轉錄方向的寫法；標準（基因組正股）寫法為 {v['display_id']}，已自動轉換"
+            )
+        info = {
+            "chrom": v["chrom"], "pos": v["pos"], "ref": v["tx_ref"], "alt": v["tx_alt"],
+            "variant_id": v["internal_id"], "input_orientation": v["orientation"],
+        }
+        return variant_ids.add_display_fields(info)
+
     try:
-        return parse_variant(raw)
+        return variant_ids.add_display_fields(parse_variant(raw))
     except VariantParseError as e:
         from utils.hgvs_resolver import HgvsResolveError, HgvsResolver
 
@@ -327,7 +410,7 @@ def _parse_variant_input(raw: str, logger) -> dict:
         )
         for w in info.get("hgvs_warnings") or []:
             logger.warning(f"HGVS 解析提醒：{w}")
-        return info
+        return variant_ids.add_display_fields(info)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -555,6 +638,10 @@ def run_pipeline(args: argparse.Namespace, logger) -> int:
             free_gib, total_gib, occupants = (
                 (None, None, "") if llm_loaded(backend, model) else gpu_headroom()
             )
+            if free_gib is not None and free_gib < total_gib * LLM_GPU_MEMORY_UTILIZATION:
+                # GB10 共用記憶體：Evo2 權重、PDF 等的檔案快取會被算成 GPU 已使用，先清再判斷
+                release_gpu_cache(total_gib * LLM_GPU_MEMORY_UTILIZATION)
+                free_gib, total_gib, occupants = gpu_headroom()
             if free_gib is not None:
                 needed = total_gib * LLM_GPU_MEMORY_UTILIZATION
                 logger.info(f"GPU headroom: {free_gib:.1f} / {total_gib:.1f} GiB free "
@@ -638,26 +725,7 @@ def run_pipeline(args: argparse.Namespace, logger) -> int:
             logger.info("Step 4.6: No literature mentions the variant -> mechanistic inference (Track B)")
             logger.info("=" * 70)
             try:
-                from utils.mechanistic_inference import MechanisticInference
-
-                mi = MechanisticInference(
-                    kb_path=HGMD_KB_PATH,
-                    band_edges=TTN_BAND_EDGES,
-                    band_labels=TTN_BAND_LABELS,
-                    top_k=INFERENCE_TOP_K_ANALOGS,
-                    transcript_interval_path=TRANSCRIPT_INTERVAL_PATH,
-                    transcript_model_path=TTN_TRANSCRIPT_MODEL_PATH,
-                    reference_fasta_path=REFERENCE_GENOME_PATH,
-                    allow_network=HGVS_ALLOW_NETWORK,
-                    # 新資料來源：cardiodb 的 364 個外顯子（座標／band／實測 PSI）
-                    # 與 HGMD 完整匯出（2,193 筆）。兩者皆為 None 時退回舊行為。
-                    cardiodb_path=INFERENCE_CARDIODB_PATH,
-                    hgmd_csv_path=INFERENCE_HGMD_CSV_PATH,
-                    predict_mode=INFERENCE_PREDICT_MODE,
-                    m_exon=INFERENCE_M_EXON,
-                    m_bucket=INFERENCE_M_BUCKET,
-                    m_band=INFERENCE_M_BAND,
-                )
+                mi = build_mechanistic_engine()
 
                 # 若 Step 4.5 沒建過 LLM（例如完全無文獻），這裡按需載入一次
                 inference_extractor = clinical_extractor
@@ -668,6 +736,9 @@ def run_pipeline(args: argparse.Namespace, logger) -> int:
                     and vllm_ok
                 ):
                     try:
+                        free_gib, total_gib, _ = gpu_headroom()
+                        if free_gib is not None and free_gib < total_gib * LLM_GPU_MEMORY_UTILIZATION:
+                            release_gpu_cache(total_gib * LLM_GPU_MEMORY_UTILIZATION)
                         logger.info(f"Loading LLM for inference (backend={backend}, model={model})...")
                         inference_extractor = get_shared_extractor(backend, model)
                         clinical_extractor = inference_extractor
@@ -750,6 +821,34 @@ def run_pipeline(args: argparse.Namespace, logger) -> int:
                 logger.error(f"Error during database lookup: {e}", exc_info=True)
                 logger.warning("Continuing without database annotations...")
 
+        # Step 5.6: 遺傳模式推論（AD / AR）。用到 Step 5.5 的資料庫紀錄，所以放在它之後
+        inheritance_result = None
+        if ENABLE_INHERITANCE_INFERENCE:
+            logger.info("Step 5.6: Inferring mode of inheritance (AD / AR)...")
+            try:
+                from utils.inheritance_inference import InheritanceInference
+
+                mi = build_mechanistic_engine()
+                features = (mechanistic_result or {}).get("features") or mi.build_features(
+                    variant_info, clinvar_info, evo2_result
+                )
+                inheritance_result = InheritanceInference(mi, INFERENCE_HGMD_CSV_PATH).infer(
+                    clinical_extractor if clinical_extractor is not None and not llm_engine_dead() else None,
+                    features,
+                    db_annotations=db_annotations,
+                    pubmed_results=pubmed_results,
+                    predicted_disease=_main_disease(mechanistic_result, pubmed_results),
+                )
+                logger.info(
+                    f"  Inheritance: {inheritance_result['inheritance']} "
+                    f"({inheritance_result['confidence']}, {inheritance_result['source']})"
+                )
+            except Exception as e:
+                logger.error(f"Error during inheritance inference: {e}", exc_info=True)
+            if llm_engine_dead():
+                logger.error("vLLM engine died during inheritance inference — not writing a report.")
+                return EXIT_LLM_ENGINE_DEAD
+
         # Step 6: Generate HTML Report
         logger.info("Step 6: Generating HTML report...")
         report_gen = HTMLReportGenerator()
@@ -790,6 +889,8 @@ def run_pipeline(args: argparse.Namespace, logger) -> int:
                 report_kwargs['mechanistic_result'] = mechanistic_result
             if 'db_annotations' in sig.parameters:
                 report_kwargs['db_annotations'] = db_annotations
+            if 'inheritance_result' in sig.parameters:
+                report_kwargs['inheritance_result'] = inheritance_result
             report_path = report_gen.generate_report(**report_kwargs)
         else:
             # Fallback for older html_report.py version

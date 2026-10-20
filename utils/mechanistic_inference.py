@@ -41,6 +41,7 @@ per-exon 模型算，不能用那份區間表。
 """
 
 import logging
+import os
 import re
 from bisect import bisect_right
 from typing import Any, Dict, List, Optional, Set, Union
@@ -171,6 +172,14 @@ def evo2_confidence_bucket(delta_score) -> str:
     if a >= 1e-3:
         return "Medium"
     return "Low"
+
+
+def _text(value: Any) -> str:
+    """CSV 欄位轉字串；空值（NaN / None / 'NULL'）回空字串，避免報告出現 'nan'。"""
+    if value is None:
+        return ""
+    s = str(value).strip()
+    return "" if s.lower() in ("nan", "none", "null") else s
 
 
 def _classify_variant(prot_hgvs: str, nuc_hgvs: str) -> Dict[str, str]:
@@ -357,6 +366,10 @@ class MechanisticInference:
             tissue_of_labels,
         )
 
+        if not os.path.exists(str(self.hgmd_csv_path)):
+            # 授權檔沒放進來：推論照常進行，只是沒有 HGMD 類比變異
+            logger.warning(f"HGMD CSV not found, inference runs without HGMD analogs: {self.hgmd_csv_path}")
+            return []
         df = pd.read_csv(self.hgmd_csv_path, low_memory=False)
         rows: List[Dict[str, Any]] = []
         for r in df.itertuples():
@@ -373,8 +386,8 @@ class MechanisticInference:
             rows.append({
                 "pos": pos,
                 "ref": "", "alt": "",
-                "dna": str(getattr(r, "hgvs", "") or ""),
-                "prot": str(getattr(r, "amino", "") or ""),
+                "dna": _text(getattr(r, "hgvs", "")),
+                "prot": _text(getattr(r, "amino", "")),
                 "phen": disease,
                 # 引擎內部用小寫組織標籤；tissue_of_labels 回傳 "Cardiac" 這種首字大寫
                 "phenotype": tissue_of_labels(canonical_labels(disease)).lower(),

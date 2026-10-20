@@ -1,0 +1,33 @@
+# 映像只放程式與環境；資料、模型、結果都放在 docker volume。
+# 特別注意：授權資料（HGMD、cardiodb、PubMind 完整版）絕不能進映像。
+
+# 隱藏檔與資料夾（.git、.env、.flash_attn_build/ 等）一律不進映像
+.*
+**/.*
+*.log
+llm_logs/
+**/__pycache__
+**/*.pyc
+
+# 資料與結果（volume）
+data/
+!data/transcript_interval.xlsx
+outputs/
+site/
+models/
+*.zip
+*.tar
+*.tar.gz
+
+# 研究用程式與 notebook（pipeline 不需要；部分 notebook 輸出含 HGMD 紀錄）
+research/
+*.ipynb
+*.pptx
+*.docx
+*.xlsx
+!data/transcript_interval.xlsx
+*.csv
+*.pdf
+
+# Windows 啟動程式的編譯產物
+launcher/dist/

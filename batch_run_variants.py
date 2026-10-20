@@ -64,6 +64,8 @@ from typing import Optional
 import pandas as pd
 from bs4 import BeautifulSoup
 
+from utils import variant_ids as vids
+
 PROJECT_ROOT = Path(__file__).parent.resolve()
 DEFAULT_INPUT = PROJECT_ROOT / "data" / "clinvar_ttn.csv"
 OUTPUT_DIR = PROJECT_ROOT / "outputs"
@@ -440,11 +442,19 @@ def ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _to_internal(v: str) -> str:
+    """正股（VCF）或轉錄方向寫法都接受，一律轉成內部（轉錄方向）ID；無法解析的原樣留給格式檢查。"""
+    try:
+        return vids.internal_id(v)
+    except vids.VariantIdError:
+        return v
+
+
 def build_variant_ids(df: pd.DataFrame, args: argparse.Namespace) -> pd.Series:
-    """取得每列的 chr-pos-ref-alt。有 input 欄就用它，否則從座標欄組出來。"""
+    """取得每列的 chr-pos-ref-alt（內部 ID）。有 input 欄就用它，否則從座標欄組出來。"""
     if INPUT_COL in df.columns:
         print(f"[info] 使用 '{INPUT_COL}' 欄位作為變異來源", flush=True)
-        return df[INPUT_COL].astype(str).str.strip()
+        return df[INPUT_COL].astype(str).str.strip().map(_to_internal)
 
     cols = [args.chrom_col, args.pos_col, args.ref_col, args.alt_col]
     missing = [c for c in cols if c not in df.columns]
@@ -467,7 +477,7 @@ def build_variant_ids(df: pd.DataFrame, args: argparse.Namespace) -> pd.Series:
         + df[args.ref_col].astype(str).str.strip().str.upper()
         + "-"
         + df[args.alt_col].astype(str).str.strip().str.upper()
-    )
+    ).map(_to_internal)
 
 
 def row_is_done(row: pd.Series) -> bool:
@@ -655,7 +665,7 @@ def main() -> int:
     indices = df.index[start:end].tolist()
 
     if args.variant is not None:
-        target = args.variant.strip()
+        target = _to_internal(args.variant.strip())
         match_idx = variant_ids.index[variant_ids == target].tolist()
         if not match_idx:
             print(f"[error] 在表格中找不到變異 {target}", file=sys.stderr)

@@ -468,7 +468,17 @@ func (a *app) mergeLocalRecords(add []map[string]any) error {
 	}
 	for _, r := range add {
 		id, _ := r["variant_id"].(string)
-		if i, ok := byID[id]; ok {
+		i, ok := byID[id]
+		if !ok {
+			// 舊版啟動程式寫入的列以轉錄方向 ID 為 variant_id；新列的 internal_id 就是它
+			if internal, _ := r["internal_id"].(string); internal != "" {
+				i, ok = byID[internal]
+				if ok {
+					byID[id] = i
+				}
+			}
+		}
+		if ok {
 			existing[i] = r
 		} else {
 			byID[id] = len(existing)

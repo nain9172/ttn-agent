@@ -11,9 +11,9 @@ status 為 "criteria provided, multiple submitters, no conflicts"（2 星）。
 輸出（預設 data/clinvar_ttn.csv）可直接給 batch_run_variants.py 與
 score_evo2_for_variants.py 使用：
 
-  input                   chr-pos-ref-alt，ref/alt 為 TTN 轉錄方向（負股）的鹼基，
-                          與報告 variant ID 相同（例：genomic A>G 寫成 T>C）
+  input                   chr-pos-ref-alt，GRCh38 基因組正股（VCF / ClinVar 慣例）
   chr, position, ref, alt 同上，拆開的欄位
+  tx_ref, tx_alt          TTN 轉錄方向（負股）的鹼基，即 outputs/ 報告檔名用的內部寫法
   Name, VariationID, Germline classification, Germline review status, Molecular consequence
   clinvar_label           pathogenic / benign / uncertain / conflicting / other
 
@@ -135,19 +135,20 @@ def main() -> int:
     start_, end_ = config.TTN_SEQUENCE_START, config.TTN_SEQUENCE_END  # 負股：start > end
     df = df[df.pos.between(end_, start_)]
 
-    # 正股 allele → TTN 轉錄方向，並以參考序列確認
+    # 以參考序列（TTN 轉錄方向）確認正股 ref
     seq = "".join(l.strip() for l in config.REFERENCE_GENOME_PATH.read_text().splitlines()
                   if not l.startswith(">")).upper()
-    df["ref"] = df.ref_plus.str.translate(COMPLEMENT)
-    df["alt"] = df.alt_plus.str.translate(COMPLEMENT)
-    ok = df.apply(lambda r: seq[start_ - r.pos] == r.ref, axis=1)
+    df["tx_ref"] = df.ref_plus.str.translate(COMPLEMENT)
+    df["tx_alt"] = df.alt_plus.str.translate(COMPLEMENT)
+    ok = df.apply(lambda r: seq[start_ - r.pos] == r.tx_ref, axis=1)
     if (~ok).any():
         print(f"[clinvar] 略過 {int((~ok).sum())} 筆 ref 與參考序列不符的紀錄", flush=True)
     df = df[ok]
 
     out = pd.DataFrame({
-        "input": "2-" + df.pos.astype(str) + "-" + df.ref + "-" + df.alt,
-        "chr": "2", "position": df.pos, "ref": df.ref, "alt": df.alt,
+        "input": "2-" + df.pos.astype(str) + "-" + df.ref_plus + "-" + df.alt_plus,
+        "chr": "2", "position": df.pos, "ref": df.ref_plus, "alt": df.alt_plus,
+        "tx_ref": df.tx_ref, "tx_alt": df.tx_alt,
         "Name": df.Name, "VariationID": df.VariationID,
         "Germline classification": df["Germline classification"],
         "Germline review status": df["Germline review status"],

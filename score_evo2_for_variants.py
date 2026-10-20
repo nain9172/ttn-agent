@@ -32,6 +32,7 @@ os.environ.setdefault("TRITON_PTXAS_PATH", "/usr/local/cuda/bin/ptxas")
 import pandas as pd
 
 from config import PATHOGENIC_THRESHOLD
+from utils import variant_ids as vids
 
 VARIANT_RE = re.compile(r"^(\w+)-(\d+)-([ACGT]+)-([ACGT]+)$", re.IGNORECASE)
 EVO2_HEADING = "<h2>Evo2 Prediction</h2>"
@@ -43,7 +44,10 @@ def read_inputs(path: Path) -> List[str]:
         raise SystemExit(f"{path} 沒有 input 欄")
     out, seen = [], set()
     for raw in df["input"].dropna():
-        v = str(raw).strip()
+        try:  # 正股或轉錄方向都接受；計分與報告檔名用內部（轉錄方向）ID
+            v = vids.internal_id(str(raw))
+        except vids.VariantIdError:
+            continue
         if VARIANT_RE.match(v) and v not in seen:
             seen.add(v)
             out.append(v)

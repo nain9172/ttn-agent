@@ -90,7 +90,7 @@ LOCAL_LLM_MODEL = "nvidia/Gemma-4-31B-IT-NVFP4"
 LOCAL_LLM_TENSOR_PARALLEL = 1  # 單 GPU 使用 1，多 GPU 可增加（例如 2 或 4）
 # vLLM 會嘗試佔用「總顯存 × 這個比例」，不足就直接 CUDA out of memory。
 # main.py 的前置檢查用同一個數字判斷現在載不載得起來，兩邊必須一致。
-LLM_GPU_MEMORY_UTILIZATION = 0.85
+LLM_GPU_MEMORY_UTILIZATION = float(os.getenv("LLM_GPU_MEMORY_UTILIZATION", "0.85"))
 LOCAL_LLM_MAX_MODEL_LEN = 32768  # vLLM 最大模型長度（單個 prompt 上限，tokens）
 # 注意：n=5 self-consistency 時會 sample 5 次，KV cache 是 5 倍。
 # DGX Spark 128GB unified memory，MedGemma-27B BF16 weights ≈ 54GB，
@@ -126,6 +126,9 @@ LLM_ALIAS_MIN_DIGIT_RUN = 5
 # 檢索同 band、同類型的已知致病變異作為類比證據，由 LLM 生成標示為
 # inference（非 citation）的推論說明。
 ENABLE_MECHANISTIC_INFERENCE = True
+# 遺傳模式（AD / AR）推論：規則（變異類型 × 外顯子 PSI × 疾病 × HGMD 類比）+ LLM 判斷，
+# 報告標示為 inference。驗證見 research/validate_inheritance.py
+ENABLE_INHERITANCE_INFERENCE = True
 INFERENCE_TOP_K_ANALOGS = 8  # 每次檢索的類比變異數量
 # 舊的 HGMD 類比資料庫（含 POS / REF / ALT / DNA(c.) / PROT(p.) / PHEN / phenotype）。
 # INFERENCE_HGMD_CSV_PATH 設定後就不再作為類比庫，只剩 variant_db_lookup 用它

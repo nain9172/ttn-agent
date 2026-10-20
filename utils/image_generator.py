@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
+from matplotlib.colors import to_rgba
 from matplotlib.patches import FancyBboxPatch
 import numpy as np
 import pandas as pd
@@ -21,6 +22,25 @@ from config import (
 )
 
 logger = logging.getLogger(__name__)
+
+# 各結構 band 的基因組範圍（hg38，負股：start > end），取自 data/cardiodb.xlsx 的 364 個外顯子；
+# 相鄰 band 的分界放在中間的 intron
+BAND_GENOMIC = {
+    "Z-disk": (178807423, 178775280),
+    "I-band": (178775279, 178618538),
+    "A-band": (178618537, 178535916),
+    "M-band": (178535915, 178525989),
+}
+# exon 49（LRG / meta-transcript 編號，hg38 178,741,921–178,739,141）：N2BA、N2B 含有，N2A 跳過
+EXON49 = (178741921, 178739141)
+EXON49_ROWS = ("N2BA", "N2B", "N2A")
+ISOFORM_GROUPS = (
+    ("Reference (meta-transcript)", "#7f8c8d", ("Meta",)),
+    ("Cardiac isoforms", "#e74c3c", ("N2BA", "N2B")),
+    ("Skeletal muscle isoform", "#e67e22", ("N2A",)),
+    ("Other isoforms (Novex)", "#95a5a6", ("Nvx1", "Nvx2", "Nvx3")),
+)
+ISOFORM_LABELS = {"Meta": "Meta", "Nvx1": "Novex-1", "Nvx2": "Novex-2", "Nvx3": "Novex-3"}
 
 
 class ImageGenerator:
@@ -55,77 +75,171 @@ class ImageGenerator:
             except Exception as e:
                 logger.warning(f"Failed to load transcript intervals: {e}")
         
-        # Determine number of transcripts to plot
         if transcript_intervals_data:
-            num_transcripts = len(transcript_intervals_data)
+            fig = self._plot_isoform_panel(variant_info, transcript_intervals_data)
         else:
-            num_transcripts = len(TTN_TRANSCRIPTS)
-        
-        # Create figure with proper spacing
-        fig_height = 5 + (num_transcripts * 1.8)
-        fig = plt.figure(figsize=(20, fig_height))
-        
-        # Adjust spacing to prevent overlap (reduced hspace for tighter layout)
-        gs = fig.add_gridspec(
-            num_transcripts + 1, 
-            1, 
-            hspace=0.01,  # 減少間距從 0.8 到 0.3
-            top=0.95,
-            bottom=0.05,
-            left=0.05,
-            right=0.95
-        )
-        
-        # Main title
-        fig.suptitle(
-            f'TTN Variant Location: {variant_info["variant_id"]}\n'
-            f'Genomic Position: chr{variant_info["chrom"]}:{variant_info["pos"]} '
-            f'({variant_info["ref"]}>{variant_info["alt"]})',
-            fontsize=22,
-            fontweight='bold',
-            y=0.97
-        )
-        
-        # Plot domain overview (Top row - Protein Structure)
-        ax_main = fig.add_subplot(gs[0])
-        self._plot_domain_overview(ax_main, relative_pos)
-        
-        # Plot transcripts
-        if transcript_intervals_data:
-            for idx, (transcript_name, intervals) in enumerate(transcript_intervals_data.items()):
-                ax = fig.add_subplot(gs[idx + 1])
-                self._plot_transcript_intervals_aligned(
-                    ax,
-                    transcript_name,
-                    intervals,
-                    genomic_pos
-                )
-        else:
-            # Fallback if no interval file is provided
-            for idx, (transcript_name, transcript_info) in enumerate(TTN_TRANSCRIPTS.items()):
-                ax = fig.add_subplot(gs[idx + 1])
-                self._plot_transcript(
-                    ax,
-                    transcript_name,
-                    transcript_info,
-                    relative_pos,
-                    variant_info
-                )
-        
+            fig = self._plot_simple_panel(variant_info, relative_pos)
+
         # Save figure with tight layout
         output_path = self.output_dir / f"titin_schematic_{variant_info['variant_id']}.png"
-        plt.savefig(
-            output_path, 
-            dpi=300, 
+        fig.savefig(
+            output_path,
+            dpi=200,
             bbox_inches='tight',
             facecolor='white',
-            pad_inches=0.2
+            pad_inches=0.15
         )
-        plt.close()
+        plt.close(fig)
         
         logger.info(f"Schematic saved to: {output_path}")
         return output_path
     
+    def _plot_simple_panel(self, variant_info: Dict, relative_pos: float):
+        """沒有 transcript_interval.xlsx 時的簡易版（舊版畫法）。"""
+        num_transcripts = len(TTN_TRANSCRIPTS)
+        fig = plt.figure(figsize=(20, 5 + num_transcripts * 1.8))
+        gs = fig.add_gridspec(num_transcripts + 1, 1, hspace=0.01, top=0.95, bottom=0.05, left=0.05, right=0.95)
+        fig.suptitle(self._title(variant_info), fontsize=22, fontweight='bold', y=0.97)
+        self._plot_domain_overview(fig.add_subplot(gs[0]), relative_pos)
+        for idx, (name, info) in enumerate(TTN_TRANSCRIPTS.items()):
+            self._plot_transcript(fig.add_subplot(gs[idx + 1]), name, info, relative_pos, variant_info)
+        return fig
+
+    @staticmethod
+    def _title(variant_info: Dict) -> str:
+        from utils import variant_ids
+
+        d = variant_ids.add_display_fields(variant_info)
+        return (
+            f'TTN Variant Location: {d["display_id"]}\n'
+            f'chr{variant_info["chrom"]}:{int(variant_info["pos"]):,} {d["plus_ref"]}>{d["plus_alt"]} (GRCh38 + strand)'
+            f'  ·  TTN coding strand {variant_info["ref"]}>{variant_info["alt"]}'
+        )
+
+    def _plot_isoform_panel(self, variant_info: Dict, intervals_by_tx: Dict[str, List[Tuple[int, int]]]):
+        """一張圖、同一條基因組座標軸：上方是結構 band 總覽，下方是各 isoform 的外顯子區段。
+
+        - 區段依所在 band（Z-disk / I-band / A-band / M-band）上色，與總覽同色
+        - 心肌 isoform（N2BA、N2B）與骨骼肌 isoform（N2A）各用不同顏色的框框起來
+        - 標出 exon 49（N2B 特有區段的外顯子；N2BA、N2B 含有，N2A 跳過）
+        """
+        pos = int(variant_info['pos'])
+        x_var = self._normalize_genomic_position(pos)
+
+        groups = []  # (標籤, 顏色, [transcript...])；沒有列在任何組的放到 Other
+        listed = set()
+        for label, color, names in ISOFORM_GROUPS:
+            present = [n for n in names if n in intervals_by_tx]
+            if present:
+                groups.append((label, color, present))
+                listed.update(present)
+        rest = [n for n in intervals_by_tx if n not in listed]
+        if rest:
+            groups.append(('Other isoforms', '#95a5a6', rest))
+
+        ROW = 0.62        # 每列間距（座標單位）
+        BAR_H = 0.30
+        GROUP_GAP = 0.55  # 組與組之間（含組名）
+        n_rows = sum(len(g[2]) for g in groups)
+        total_h = 2.0 + n_rows * ROW + len(groups) * GROUP_GAP + 0.3
+
+        fig, ax = plt.subplots(figsize=(18, 1.6 + total_h * 1.05))
+        fig.subplots_adjust(left=0.10, right=0.98, top=1 - 1.25 / (1.6 + total_h * 1.05), bottom=0.02)
+        fig.suptitle(self._title(variant_info), fontsize=19, fontweight='bold', y=0.995)
+        ax.set_xlim(-0.115, 1.035)
+        ax.set_ylim(total_h, -0.15)
+        ax.axis('off')
+
+        # ── 總覽：band 長條（基因組比例）
+        y = 0.35
+        for band, (b_start, b_end) in BAND_GENOMIC.items():
+            x0 = self._normalize_genomic_position(b_start)
+            x1 = self._normalize_genomic_position(b_end)
+            ax.add_patch(patches.Rectangle((x0, y - 0.2), x1 - x0, 0.4, facecolor=TTN_DOMAINS[band]['color'],
+                                           edgecolor='black', linewidth=1.2, alpha=0.85))
+            if x1 - x0 > 0.06:
+                ax.text((x0 + x1) / 2, y, band, ha='center', va='center', fontsize=14, fontweight='bold')
+        ax.text(-0.02, y, 'Band', ha='right', va='center', fontsize=15, fontweight='bold')
+        ax.annotate('', xy=(x_var, y - 0.22), xytext=(x_var, y - 0.55),
+                    arrowprops=dict(arrowstyle='-|>', color='red', linewidth=2.5, mutation_scale=22))
+        # 圖例
+        ly = 0.95
+        for i, (band, info) in enumerate(TTN_DOMAINS.items()):
+            lx = 0.0 + i * 0.25
+            ax.add_patch(patches.Rectangle((lx, ly - 0.09), 0.025, 0.18, facecolor=info['color'],
+                                           edgecolor='black', linewidth=1))
+            ax.text(lx + 0.032, ly, f"{band}: exon {info['start']}–{info['end']}", va='center', fontsize=13)
+        ax.text(0.0, 1.3, f'5′  chr2:{TTN_GENE_INFO["start"]:,}', ha='left', va='center', fontsize=11, color='#555')
+        ax.text(0.5, 1.3, 'TTN is on the minus strand: drawn 5′ → 3′ in transcript order (genomic coordinates decrease left → right)',
+                ha='center', va='center', fontsize=11, color='#555')
+        ax.text(1.0, 1.3, f'chr2:{TTN_GENE_INFO["end"]:,}  3′', ha='right', va='center', fontsize=11, color='#555')
+
+        # ── 各 isoform
+        y = 2.0
+        ex49 = (EXON49[0], EXON49[1])
+        ex49_x0 = self._normalize_genomic_position(ex49[0])
+        ex49_x1 = self._normalize_genomic_position(ex49[1])
+        first_row_y = None
+        for label, color, names in groups:
+            y += GROUP_GAP
+            top = y - ROW / 2 + 0.02
+            for name in names:
+                y_row = y
+                if first_row_y is None:
+                    first_row_y = y_row
+                ax.plot([0, 1], [y_row, y_row], color='#cccccc', linewidth=0.8, zorder=1)
+                ax.text(-0.02, y_row, ISOFORM_LABELS.get(name, name), ha='right', va='center', fontsize=15,
+                        fontweight='bold')
+                contains = False
+                has49 = False
+                for a, b in intervals_by_tx[name]:
+                    hi, lo = max(a, b), min(a, b)
+                    contains |= lo <= pos <= hi
+                    has49 |= lo <= ex49[1] and ex49[0] <= hi
+                    self._draw_banded_interval(ax, hi, lo, y_row, BAR_H)
+                if name in EXON49_ROWS:
+                    if has49:
+                        ax.add_patch(patches.Rectangle((ex49_x0, y_row - BAR_H / 2 - 0.05), ex49_x1 - ex49_x0,
+                                                       BAR_H + 0.1, facecolor='#8e44ad', edgecolor='#4a235a',
+                                                       linewidth=1.5, zorder=6))
+                        ax.text(ex49_x0 - 0.004, y_row - BAR_H / 2 - 0.08, 'exon 49', ha='right', va='bottom',
+                                fontsize=12, color='#4a235a', fontweight='bold')
+                    else:
+                        ax.add_patch(patches.Rectangle((ex49_x0, y_row - BAR_H / 2 - 0.05), ex49_x1 - ex49_x0,
+                                                       BAR_H + 0.1, facecolor='none', edgecolor='#8e44ad',
+                                                       linestyle='--', linewidth=1.5, zorder=6))
+                        ax.text(ex49_x0 - 0.004, y_row - BAR_H / 2 - 0.08, 'exon 49 skipped', ha='right',
+                                va='bottom', fontsize=12, color='#8e44ad', fontstyle='italic')
+                if contains:
+                    ax.plot([x_var, x_var], [y_row - BAR_H / 2 - 0.1, y_row + BAR_H / 2 + 0.1], color='red',
+                            linewidth=2.5, zorder=8)
+                    ax.scatter(x_var, y_row - BAR_H / 2 - 0.14, marker='v', s=110, color='red', zorder=9,
+                               edgecolors='black', linewidth=1.2)
+                y += ROW
+            bottom = y - ROW / 2 - 0.02
+            ax.add_patch(FancyBboxPatch((-0.11, top), 1.14, bottom - top, boxstyle='round,pad=0,rounding_size=0.012',
+                                        facecolor=to_rgba(color, 0.07), edgecolor=color, linewidth=2.2, zorder=0,
+                                        mutation_aspect=10))
+            ax.text(-0.105, top - 0.03, label, ha='left', va='bottom', fontsize=13, fontweight='bold', color=color,
+                    zorder=10)
+        # 變異位置貫穿所有列的參考線
+        if first_row_y is not None:
+            ax.plot([x_var, x_var], [0.55, y - ROW / 2], color='red', linewidth=1, linestyle=':', alpha=0.6,
+                    zorder=2)
+        return fig
+
+    def _draw_banded_interval(self, ax, hi: int, lo: int, y: float, h: float) -> None:
+        """把一段連續的外顯子區段依 band 切開上色。"""
+        for band, (b_start, b_end) in BAND_GENOMIC.items():
+            s_hi, s_lo = min(hi, b_start), max(lo, b_end)
+            if s_hi < s_lo:
+                continue
+            x0 = self._normalize_genomic_position(s_hi)
+            x1 = self._normalize_genomic_position(s_lo)
+            ax.add_patch(patches.Rectangle((x0, y - h / 2), max(x1 - x0, 0.0015), h,
+                                           facecolor=TTN_DOMAINS[band]['color'], edgecolor='black',
+                                           linewidth=0.9, alpha=0.85, zorder=3))
+
     def _load_transcript_intervals(self, df: pd.DataFrame) -> Dict[str, List[Tuple[int, int]]]:
         """Load transcript intervals from DataFrame"""
         transcript_data = {}
@@ -140,114 +254,6 @@ class ImageGenerator:
             if intervals:
                 transcript_data[transcript_name] = intervals
         return transcript_data
-    
-    def _plot_transcript_intervals_aligned(
-        self,
-        ax,
-        transcript_name: str,
-        intervals: List[Tuple[int, int]],
-        variant_pos: int
-    ):
-        """
-        Plot transcript intervals aligned with domain overview.
-        Checks if variant_pos lies within any interval before plotting the marker.
-        """
-        # Colors for intervals
-        interval_colors = [
-            '#FF6B6B', '#4ECDC4', '#45B7D1', '#96CEB4',
-            '#FECA57', '#FF9FF3', '#54A0FF', '#48DBFB',
-            '#00D2D3'
-        ]
-        
-        # Use same x-axis range as domain overview (0-1 normalized)
-        ax.set_xlim(-0.05, 1.05)
-        ax.set_ylim(0, 1.0)
-        ax.axis('off')
-        
-        # Transcript name label (Left side)
-        ax.text(
-            -0.03,
-            0.5,
-            f'{transcript_name}',
-            fontsize=20,
-            fontweight='bold',
-            va='center',
-            ha='right',
-            bbox=dict(
-                boxstyle='round,pad=0.4',
-                facecolor='lightblue',
-                edgecolor='navy',
-                alpha=0.8,
-                linewidth=1.5
-            )
-        )
-        
-        # Draw genomic coordinate reference
-        y_pos = 0.5
-        height = 0.15
-        
-        # Background reference line
-        ax.plot([0, 1], [y_pos, y_pos], 'k-', linewidth=0.8, alpha=0.2, zorder=1)
-        
-        # Check if variant is inside any interval of this transcript
-        variant_in_transcript = False
-        
-        # Draw each interval
-        for i, (start, end) in enumerate(intervals):
-            # Normalize positions using same method as domain overview
-            start_norm = self._normalize_genomic_position(start)
-            end_norm = self._normalize_genomic_position(end)
-            
-            # Check overlap logic: intervals can be start>end or end>start depending on strand notation
-            # We use min/max to be safe
-            interval_min = min(start, end)
-            interval_max = max(start, end)
-            
-            if interval_min <= variant_pos <= interval_max:
-                variant_in_transcript = True
-            
-            # Calculate width
-            width = end_norm - start_norm
-            
-            # Use different colors
-            color = interval_colors[i % len(interval_colors)]
-            
-            # Draw interval rectangle
-            rect = FancyBboxPatch(
-                (start_norm, y_pos - height/2),
-                width,
-                height,
-                boxstyle="round,pad=0.002",
-                edgecolor='black',
-                facecolor=color,
-                alpha=0.8,
-                linewidth=1.2,
-                zorder=3
-            )
-            ax.add_patch(rect)
-        
-        # Mark variant position ONLY if it falls within an interval
-        if variant_in_transcript:
-            variant_norm = self._normalize_genomic_position(variant_pos)
-            marker_height = 0.12
-            
-            ax.plot(
-                [variant_norm, variant_norm],
-                [y_pos - height/2 - marker_height, y_pos + height/2 + marker_height],
-                'r-',
-                linewidth=2.5,
-                zorder=5
-            )
-            ax.scatter(
-                variant_norm,
-                y_pos + height/2 + marker_height + 0.03,
-                marker='v',
-                s=120,
-                color='red',
-                zorder=10,
-                edgecolors='black',
-                linewidth=1.5
-            )
     
     def _plot_domain_overview(self, ax, variant_pos):
         """Plot overview of TTN domains"""

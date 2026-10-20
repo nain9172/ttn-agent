@@ -1,0 +1,62 @@
+# TTN 報告網站：web（網站與 API）+ worker（GPU 分析），共用 docker volume。
+#
+#   cp deploy.env.example .env   # 填入 NCBI email、內網網段、資料夾位置
+#   mkdir -p /data/ttn           # 資料夾（TTN_DATA_DIR）要先用執行帳號建立
+#   docker compose build         # 第一次約 30–60 分鐘
+#   docker compose up -d
+#   瀏覽器開 http://<這台機器的 IP>:8080
+#
+# 詳細步驟（含授權資料要放哪裡、從 NAS 套件建立 volume）見 docker_readme/DEPLOY_DOCKER.md。
+name: ttn
+
+services:
+  web:
+    image: ttn-agent:latest
+    build: .
+    command: ["web"]
+    restart: unless-stopped
+    # 以主機帳號身分執行，資料夾裡的檔案就屬於這個帳號（不設定則以 root 執行）
+    user: "${TTN_UID:-0}:${TTN_GID:-0}"
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      TTN_ALLOWED_NETWORKS: ${TTN_ALLOWED_NETWORKS:-127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16}
+      # 讓設定頁顯示主機上的實際路徑（例 /data/ttn/data/HGMD_latest.csv）
+      TTN_HOST_DATA_DIR: ${TTN_DATA_DIR:-}
+    ports:
+      # TTN_BIND_ADDRESS 可以設成這台機器的內網 IP，只在內網介面上開放
+      - "${TTN_BIND_ADDRESS:-0.0.0.0}:${TTN_PORT:-8080}:8080"
+    volumes:
+      # TTN_DATA_DIR 設成主機資料夾（例 /data/ttn）就直接用它；沒設定則用 docker volume ttn-data
+      - ${TTN_DATA_DIR:-ttn-data}:/vol
+      - /etc/localtime:/etc/localtime:ro   # 任務時間與主機時區一致
+
+  worker:
+    image: ttn-agent:latest
+    command: ["worker"]
+    restart: unless-stopped
+    user: "${TTN_UID:-0}:${TTN_GID:-0}"
+    env_file:
+      - path: .env
+        required: false
+    volumes:
+      # TTN_DATA_DIR 設成主機資料夾（例 /data/ttn）就直接用它；沒設定則用 docker volume ttn-data
+      - ${TTN_DATA_DIR:-ttn-data}:/vol
+      - /etc/localtime:/etc/localtime:ro   # 任務時間與主機時區一致
+    # vLLM 需要大量共享記憶體與鎖定記憶體
+    ipc: host
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+volumes:
+  ttn-data:
+    name: ${TTN_VOLUME_NAME:-ttn-data}

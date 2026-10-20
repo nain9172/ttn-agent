@@ -51,6 +51,81 @@ DISEASE_PATTERNS_FOR_INFERENCE: List[Tuple[str, str, str]] = [
     (r'\btitinopath',                                     'Titinopathy',                             'Both'),
 ]
 
+# 報告與網站共用的字型（NTUH 回饋：字型、格式要統一）
+FONT_STACK = ("'Segoe UI', 'Noto Sans', 'Noto Sans TC', 'Microsoft JhengHei', -apple-system, "
+              "BlinkMacSystemFont, Roboto, 'Helvetica Neue', Arial, sans-serif")
+
+# Evo2 分數說明（報告 Evo2 區塊的 ? 提示與說明列、網站 Information 頁共用）
+EVO2_HELP_HTML = (
+    "<b>Evo2</b> is a DNA language model (Evo2-7B) trained on genomes only, never on clinical labels. "
+    "For each variant it reads an 8,192-bp window of the TTN reference sequence centred on the variant:"
+    "<ul>"
+    "<li><b>Ref score</b>: average log-likelihood per base of the reference window "
+    "(how &ldquo;natural&rdquo; the normal sequence looks to the model).</li>"
+    "<li><b>Var score</b>: the same window with the alternate base.</li>"
+    "<li><b>Delta score</b> = Var &minus; Ref. A negative delta means the change makes the sequence less "
+    "likely under the model, which is associated with damaging variants.</li>"
+    "</ul>"
+    "<b>Cutoff:</b> delta &lt; <b>&minus;0.000714</b> &rarr; <b>Pathogenic</b>; otherwise <b>Benign</b>. "
+    "The cutoff was calibrated with Youden&rsquo;s J on ClinVar TTN variants (P/LP vs B/LB). "
+    "This is a research score, not an ACMG classification; values close to the cutoff are uncertain."
+)
+
+# 報告側邊目錄：執行時掃描每個 section 的 h2 產生，舊報告只要注入同一段程式就有目錄
+REPORT_TOC_JS = r"""(function () {
+  var secs = document.querySelectorAll('.container section.section');
+  if (!secs.length || document.querySelector('nav.toc')) return;
+  var nav = document.createElement('nav');
+  nav.className = 'toc';
+  nav.setAttribute('aria-label', 'Contents');
+  var html = '<div class="toc-head">Contents</div><ol>';
+  secs.forEach(function (sec, i) {
+    var h = sec.querySelector('h2');
+    if (!h) return;
+    if (!sec.id) sec.id = 'sec-' + (i + 1);
+    var label = (h.firstChild && h.firstChild.nodeType === 3 ? h.firstChild.nodeValue : h.textContent).trim();
+    html += '<li><a href="#' + sec.id + '">' + label.replace(/[<>&]/g, '') + '</a></li>';
+  });
+  html += '</ol>';
+  if (document.querySelector('.report-nav')) {
+    html += '<a class="toc-info" href="../info.html">&#9432; Information: bands, isoforms, scores</a>';
+  }
+  nav.innerHTML = html;
+  var btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = 'toc-toggle';
+  btn.textContent = '☰ Contents';
+  btn.addEventListener('click', function () { nav.classList.toggle('open'); });
+  nav.addEventListener('click', function (e) { if (e.target.tagName === 'A') nav.classList.remove('open'); });
+  document.body.appendChild(nav);
+  document.body.appendChild(btn);
+  document.body.classList.add('has-toc');
+  if ('IntersectionObserver' in window) {
+    var links = {};
+    nav.querySelectorAll('ol a').forEach(function (a) { links[a.getAttribute('href').slice(1)] = a; });
+    var io = new IntersectionObserver(function (entries) {
+      entries.forEach(function (en) {
+        if (en.isIntersecting) {
+          nav.querySelectorAll('ol a.active').forEach(function (a) { a.classList.remove('active'); });
+          if (links[en.target.id]) links[en.target.id].classList.add('active');
+        }
+      });
+    }, { rootMargin: '-20% 0px -70% 0px' });
+    secs.forEach(function (sec) { io.observe(sec); });
+  }
+})();"""
+
+# Track B 推論區塊最上方的警示（新報告與 backfill 共用）
+INFERENCE_WARNING_HTML = (
+    '<div class="inference-warning"><span class="icon">&#9888;</span><div>'
+    '<b>This section is a model-generated hypothesis, not real patient or database data.</b> '
+    'No published article was found that directly reports this variant. The predicted disease, tissue, '
+    'confidence, differential and rationale (hatched cards below) were <b>inferred</b> by the language model / '
+    'rules from Evo2, the variant&rsquo;s structural band and type, and known pathogenic TTN variants in the same '
+    'region. Use them only to prioritise follow-up; they are <b>not evidence</b> for classification.'
+    '</div></div>'
+)
+
 # Tissue 排序順序（Literature Review 中文獻顯示順序）
 TISSUE_SORT_ORDER = {
     'Cardiac': 0,
@@ -78,6 +153,7 @@ class HTMLReportGenerator:
         aggregated_stats: Optional[Dict] = None, # Kept for older main.py compatibility but ignored below
         mechanistic_result: Optional[Dict] = None,  # Track B：無文獻時的類比推理結果
         db_annotations: Optional[Any] = None,  # HGMD / PubTator 查表命中（DatabaseHits 或 dict）
+        inheritance_result: Optional[Dict] = None,  # 遺傳模式推論（AD / AR），見 utils/inheritance_inference.py
     ) -> Path:
         logger.info("Generating HTML report...")
         
@@ -91,6 +167,7 @@ class HTMLReportGenerator:
             clinvar_info,
             mechanistic_result,
             db_annotations,
+            inheritance_result,
         )
         
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -118,13 +195,14 @@ class HTMLReportGenerator:
         clinvar_info: Optional[Dict] = None,
         mechanistic_result: Optional[Dict] = None,
         db_annotations: Optional[Any] = None,
+        inheritance_result: Optional[Dict] = None,
     ) -> str:
         return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>{REPORT_TITLE} - {variant_info['variant_id']}</title>
+    <title>{REPORT_TITLE} - {self._display(variant_info)['display_id']}</title>
     <style>
         {self._get_css()}
     </style>
@@ -137,9 +215,11 @@ class HTMLReportGenerator:
         {self._generate_evo2_section(evo2_result)}
         {self._generate_image_section(image_base64, variant_info)}
         {self._generate_inference_section(mechanistic_result)}
+        {self._generate_inheritance_section(inheritance_result)}
         {self._generate_pubmed_section(pubmed_results, clinvar_info)}
         {self._generate_footer()}
     </div>
+    <script>{REPORT_TOC_JS}</script>
 </body>
 </html>"""
     
@@ -147,7 +227,7 @@ class HTMLReportGenerator:
         return f"""
         * {{ margin: 0; padding: 0; box-sizing: border-box; }}
         body {{
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            font-family: {FONT_STACK};
             line-height: 1.6;
             color: #333;
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
@@ -174,10 +254,10 @@ class HTMLReportGenerator:
             border-bottom: 3px solid {REPORT_ACCENT_COLOR};
             font-size: 1.8em;
         }}
-        .info-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 20px; margin: 20px 0; }}
+        .info-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; margin: 20px 0; }}
         .info-card {{ background: #f8f9fa; padding: 20px; border-radius: 8px; border-left: 4px solid {REPORT_ACCENT_COLOR}; }}
         .info-card .label {{ font-weight: bold; color: #666; font-size: 0.9em; }}
-        .info-card .value {{ font-size: 1.2em; color: #333; }}
+        .info-card .value {{ font-size: 1.2em; color: #333; overflow-wrap: anywhere; }}
         .prediction-box {{ background: #f8f9fa; padding: 25px; border-radius: 10px; margin: 20px 0; border: 2px solid #ddd; }}
         .prediction-pathogenic {{ border-color: #e74c3c; background: #fee; }}
         .prediction-benign {{ border-color: #27ae60; background: #efe; }}
@@ -214,7 +294,7 @@ class HTMLReportGenerator:
         .alert-info {{ background: #d1ecf1; border-color: #bee5eb; color: #0c5460; }}
         footer {{ background: #f8f9fa; padding: 20px; text-align: center; color: #666; font-size: 0.9em; }}
         /* Track B: mechanistic inference（琥珀色調，明顯區隔於 evidence 軌）*/
-        .inference-section {{ background: #fffdf7; border-left: 8px solid #f0ad4e; }}
+        .inference-section {{ background: #fffdf7; box-shadow: inset 6px 0 0 #f0ad4e; }}
         .inference-section h2 {{ color: #8a5a00; border-bottom-color: #f0ad4e; }}
         .inference-badge {{
             display: inline-block; padding: 3px 10px; border-radius: 4px;
@@ -238,6 +318,114 @@ class HTMLReportGenerator:
         .analog-table tr:nth-child(even) {{ background: #fffbf2; }}
         .analog-table a {{ color: {REPORT_ACCENT_COLOR}; text-decoration: none; }}
         {self._get_database_css()}
+        {self.get_ui_css()}
+        """
+
+    @staticmethod
+    def get_ui_css() -> str:
+        """NTUH 回饋後新增的樣式（字型統一、Evo2 說明、推論標示、側邊目錄）。
+
+        獨立出來讓 backfill_report_ui.py 能注入既有報告。後面的規則會覆蓋前面舊報告裡的同名規則。
+        """
+        return f"""
+        /* ── 字型與標題層級統一 ── */
+        body, button, input, select, textarea {{ font-family: {FONT_STACK}; }}
+        .section h2 {{ font-size: 1.6em; line-height: 1.3; }}
+        .section h3 {{ font-size: 1.25em; }}
+        .section h4 {{ font-size: 1.05em; }}
+        .pubmed-article [style*="monospace"] {{ font-family: inherit !important; }}
+        .inference-rationale p {{ font-style: normal; }}
+        header .coding-strand {{ font-size: 0.85em; opacity: 0.85; }}
+        /* 有色側條的區塊用 inset 陰影，內容與其他區塊左緣對齊 */
+        .inference-section {{ border-left: 0 !important; box-shadow: inset 6px 0 0 #f0ad4e; }}
+        .dbann-section {{ border-left: 0 !important; box-shadow: inset 6px 0 0 #2e7d32; }}
+        .dbann-section-empty {{ box-shadow: inset 6px 0 0 #bdbdbd; }}
+        /* ── 說明「?」提示（類似 SpliceAI 的說明）── */
+        .help {{
+            display: inline-flex; align-items: center; justify-content: center; position: relative;
+            width: 20px; height: 20px; border-radius: 50%; background: {REPORT_ACCENT_COLOR}; color: #fff;
+            font-size: 13px; font-weight: 700; cursor: help; vertical-align: middle; margin-left: 8px;
+        }}
+        .help .tip {{
+            display: none; position: absolute; left: 0; top: 28px; z-index: 50; width: min(520px, 80vw);
+            background: #fff; color: #333; border: 1px solid #cfd8e3; border-radius: 8px; padding: 14px 16px;
+            box-shadow: 0 8px 24px rgba(0,0,0,0.18); font-size: 13.5px; font-weight: 400; line-height: 1.55;
+            text-align: left;
+        }}
+        .help .tip ul {{ margin: 6px 0 6px 18px; }}
+        .help:hover .tip, .help:focus .tip, .help:focus-within .tip {{ display: block; }}
+        .score-caption {{ color: #666; font-size: 0.85em; }}
+        .evo2-note {{
+            margin-top: 14px; padding: 12px 16px; background: #f4f8fc; border: 1px solid #d6e4f0;
+            border-radius: 6px; color: #444; font-size: 0.9em; line-height: 1.6;
+        }}
+        .evo2-note ul {{ margin: 4px 0 4px 20px; }}
+        /* ── 推論／LLM 產生的欄位：明確標示「不是實際資料」── */
+        .ai-tag {{
+            display: inline-block; padding: 1px 7px; border-radius: 3px; margin-left: 6px;
+            font-size: 0.72em; font-weight: 700; letter-spacing: 0.3px; vertical-align: middle;
+            background: #fff3cd; color: #8a5a00; border: 1px dashed #d39e00; text-transform: uppercase;
+        }}
+        .inference-card.llm, .inference-rationale.llm {{
+            background: repeating-linear-gradient(135deg, #fff, #fff 12px, #fff8e8 12px, #fff8e8 24px);
+            border: 1px dashed #e0a44a; border-left: 4px solid #f0ad4e;
+        }}
+        .inference-card.llm .label::after, .inference-rationale.llm .label::after {{
+            content: "INFERRED"; display: inline-block; margin-left: 6px; padding: 0 5px; border-radius: 3px;
+            font-size: 0.78em; line-height: 1.5; background: #fff3cd; color: #8a5a00; border: 1px dashed #d39e00;
+            white-space: nowrap; vertical-align: 1px;
+        }}
+        .inference-warning {{
+            display: flex; gap: 12px; align-items: flex-start; background: #fff4e0; border: 2px solid #f0ad4e;
+            color: #6b4500; padding: 14px 16px; border-radius: 8px; margin-bottom: 18px; font-size: 0.95em;
+        }}
+        .inference-warning .icon {{ font-size: 1.6em; line-height: 1; }}
+        .llm-extract-label {{ font-weight: bold; color: {REPORT_ACCENT_COLOR}; margin-bottom: 5px; }}
+        .extract-note {{ color: #8a5a00; font-size: 0.8em; margin-top: 8px; }}
+        /* ── 沒有直接提到這顆變異的文獻：灰階 1–2 階 ── */
+        .stats-indirect h4, .stats-indirect h4 span, .stats-indirect p {{ color: #8b95a1 !important; }}
+        .stats-indirect .info-card {{ background: #fafbfc; border-left-color: #c9d1d9 !important; }}
+        .stats-indirect .info-card .label, .stats-indirect .info-card .value {{ color: #8b95a1; }}
+        .pubmed-article.indirect {{ background: #fbfbfc; }}
+        .pubmed-article.indirect, .pubmed-article.indirect .article-info-item {{ color: #6f7782; }}
+        .pubmed-article.indirect .article-title, .pubmed-article.indirect .article-title a {{ color: #5d6b7a; }}
+        /* ── 遺傳模式推論 ── */
+        .inherit-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; }}
+        .inherit-evidence {{ margin-top: 14px; font-size: 0.9em; color: #555; }}
+        .inherit-evidence li {{ margin-left: 20px; }}
+        /* ── 側邊目錄 ── */
+        nav.toc {{
+            position: fixed; top: 20px; left: 20px; width: 220px; max-height: calc(100vh - 40px); overflow-y: auto;
+            background: #fff; border-radius: 10px; box-shadow: 0 6px 24px rgba(0,0,0,0.18); padding: 14px 0;
+            font-size: 0.9em; z-index: 40; display: none;
+        }}
+        nav.toc .toc-head {{
+            font-weight: 700; color: #fff; background: {REPORT_HEADER_COLOR}; margin: -14px 0 8px;
+            padding: 10px 16px; border-radius: 10px 10px 0 0;
+        }}
+        nav.toc ol {{ list-style: none; }}
+        nav.toc ol a {{
+            display: block; padding: 6px 16px; color: #34495e; text-decoration: none; border-left: 3px solid transparent;
+        }}
+        nav.toc ol a:hover {{ background: #f1f5f9; }}
+        nav.toc ol a.active {{ border-left-color: {REPORT_ACCENT_COLOR}; background: #eef5fc; color: {REPORT_ACCENT_COLOR}; font-weight: 600; }}
+        nav.toc .toc-info {{
+            display: block; margin: 10px 12px 0; padding: 8px 10px; border-top: 1px solid #eee;
+            color: {REPORT_ACCENT_COLOR}; text-decoration: none; font-size: 0.95em;
+        }}
+        .toc-toggle {{
+            position: fixed; right: 16px; bottom: 16px; z-index: 41; border: 0; border-radius: 20px;
+            background: {REPORT_HEADER_COLOR}; color: #fff; padding: 9px 16px; font-size: 0.95em; cursor: pointer;
+            box-shadow: 0 4px 14px rgba(0,0,0,0.25);
+        }}
+        nav.toc.open {{ display: block; left: auto; right: 16px; top: auto; bottom: 64px; }}
+        section.section {{ scroll-margin-top: 16px; }}
+        @media (min-width: 1260px) {{
+            body.has-toc {{ padding-left: 260px; }}
+            body.has-toc nav.toc {{ display: block; }}
+            body.has-toc .toc-toggle {{ display: none; }}
+            nav.toc.open {{ left: 20px; right: auto; top: 20px; bottom: auto; }}
+        }}
         """
 
     def _get_database_css(self) -> str:
@@ -248,7 +436,7 @@ class HTMLReportGenerator:
         """
         return f"""
         /* Curated database lookup（綠/藍調：查表得到的硬紀錄，區隔於琥珀色的推論）*/
-        .dbann-section {{ background: #f7fbf8; border-left: 8px solid #2e7d32; }}
+        .dbann-section {{ background: #f7fbf8; box-shadow: inset 6px 0 0 #2e7d32; }}
         .dbann-section h2 {{ color: #1b5e20; border-bottom-color: #2e7d32; }}
         .dbann-badge {{
             display: inline-block; padding: 3px 10px; border-radius: 4px;
@@ -260,22 +448,25 @@ class HTMLReportGenerator:
             padding: 14px 16px; border-radius: 6px; margin-bottom: 18px; font-size: 0.95em;
         }}
         /* 兩邊都沒命中時整段轉為中性灰，避免綠色被誤讀成「有紀錄」 */
-        .dbann-section-empty {{ background: #fafafa; border-left-color: #bdbdbd; }}
+        .dbann-section-empty {{ background: #fafafa; box-shadow: inset 6px 0 0 #bdbdbd; }}
         .dbann-section-empty h2 {{ color: #555; border-bottom-color: #bdbdbd; }}
         .dbann-section-empty .dbann-badge {{ background: #9e9e9e; }}
         .dbann-section-empty .dbann-note {{ background: #f5f5f5; border-color: #e0e0e0; color: #555; }}
-        .dbann-headline {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 16px; margin-bottom: 8px; }}
-        .dbann-db {{ background: #fff; padding: 18px; border-radius: 8px; border-left: 6px solid #2e7d32; }}
+        .dbann-headline {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 16px; margin-bottom: 8px; align-items: stretch; }}
+        .dbann-db {{
+            background: #fff; padding: 16px 18px; border-radius: 8px; border-left: 6px solid #2e7d32;
+            display: flex; flex-direction: column; gap: 8px; min-height: 140px;
+        }}
         .dbann-hgmd {{ border-left-color: #2e7d32; }}
         .dbann-pubtator {{ border-left-color: #1565c0; }}
-        .dbann-empty {{ border-left-color: #bdbdbd; background: #fafafa; }}
-        .dbann-db-head {{ font-weight: bold; color: #555; font-size: 0.9em; margin-bottom: 8px; }}
-        .dbann-disease {{ font-size: 1.35em; font-weight: bold; color: #222; line-height: 1.35; }}
-        .dbann-disease.dbann-none {{ color: #9e9e9e; font-weight: normal; }}
-        .dbann-db-meta {{ color: #777; font-size: 0.85em; margin-top: 8px; }}
+        .dbann-empty {{ border-left-color: #bdbdbd; background: #fff; }}
+        .dbann-db-head {{ font-weight: bold; color: #555; font-size: 0.9em; display: flex; align-items: center; justify-content: space-between; gap: 8px; min-height: 24px; }}
+        .dbann-disease {{ font-size: 1.25em; font-weight: bold; color: #222; line-height: 1.35; flex: 1; }}
+        .dbann-disease.dbann-none {{ color: #9e9e9e; font-weight: normal; font-size: 1.1em; }}
+        .dbann-db-meta {{ color: #777; font-size: 0.85em; margin-top: auto; }}
         .dbann-count {{ color: #777; font-size: 0.7em; font-weight: normal; }}
         .dbann-hit {{
-            display: inline-block; padding: 2px 7px; border-radius: 3px; margin-left: 6px;
+            display: inline-block; padding: 2px 7px; border-radius: 3px; margin-left: 6px; white-space: nowrap;
             font-size: 0.85em; background: #2e7d32; color: #fff; letter-spacing: 0.3px;
         }}
         .dbann-pubtator .dbann-hit {{ background: #1565c0; }}
@@ -283,7 +474,7 @@ class HTMLReportGenerator:
         .dbann-pubmind .dbann-hit {{ background: #6a1b9a; }}
         .dbann-level {{ color: #6a1b9a; font-size: 0.85em; }}
         .dbann-miss {{
-            display: inline-block; padding: 2px 7px; border-radius: 3px; margin-left: 6px;
+            display: inline-block; padding: 2px 7px; border-radius: 3px; margin-left: 6px; white-space: nowrap;
             font-size: 0.85em; background: #bdbdbd; color: #fff; letter-spacing: 0.3px;
         }}
         .dbann-subhead {{ color: #1b5e20; margin: 22px 0 8px; }}
@@ -305,8 +496,21 @@ class HTMLReportGenerator:
         .dbann-details summary {{ cursor: pointer; color: #33691e; font-size: 0.9em; padding: 8px 0; }}
         """
 
+    @staticmethod
+    def _display(variant_info: Dict) -> Dict:
+        """對外顯示用的 ID：一律是基因組正股（VCF / ClinVar 慣例），內部 variant_id 是轉錄方向。"""
+        from utils import variant_ids
+
+        return variant_ids.add_display_fields(variant_info)
+
     def _generate_header(self, variant_info: Dict, clinvar_info: Optional[Dict] = None) -> str:
-        variant_id = variant_info['variant_id']
+        d = self._display(variant_info)
+        variant_id = d['display_id']
+        coding = (
+            f'<span class="coding-strand">TTN coding strand: {html.escape(d["ref"])}&gt;{html.escape(d["alt"])}'
+            + (f' · {html.escape(d["hgvs_c_display"])}' if d.get("hgvs_c_display") else '')
+            + '</span><br>'
+        )
         clinvar_url = clinvar_info.get('clinvar_url') if clinvar_info else None
 
         if clinvar_url:
@@ -323,6 +527,7 @@ class HTMLReportGenerator:
             f'<h1>{REPORT_TITLE}</h1>'
             f'<div class="subtitle">'
             f'{variant_display}<br>'
+            f'{coding}'
             f'Generated: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}'
             f'</div>'
             f'</header>'
@@ -330,11 +535,17 @@ class HTMLReportGenerator:
 
     def _generate_summary_section(self, variant_info: Dict, evo2_result: Optional[Dict]) -> str:
         pred = evo2_result['prediction'].upper() if evo2_result and evo2_result.get('success') else "N/A"
+        d = self._display(variant_info)
+        hgvs = d.get("hgvs_c_display") or ""
+        transcript, _, cdot = hgvs.partition(":")
+        coding = html.escape(cdot or f"{d['ref']}>{d['alt']}")
+        coding_label = f"Coding change ({html.escape(transcript)})" if cdot else "Coding change (TTN strand)"
         return f"""<section class="section"><h2>Variant Summary</h2><div class="info-grid">
             <div class="info-card"><div class="label">Chromosome</div><div class="value">{variant_info['chrom']}</div></div>
-            <div class="info-card"><div class="label">Position</div><div class="value">{variant_info['pos']:,}</div></div>
-            <div class="info-card"><div class="label">Ref/Alt</div><div class="value">{variant_info['ref']}/{variant_info['alt']}</div></div>
-            <div class="info-card"><div class="label">Prediction</div><div class="value">{pred}</div></div>
+            <div class="info-card"><div class="label">Position (GRCh38)</div><div class="value">{variant_info['pos']:,}</div></div>
+            <div class="info-card"><div class="label">Ref/Alt (genomic + strand)</div><div class="value">{d['plus_ref']}/{d['plus_alt']}</div></div>
+            <div class="info-card"><div class="label">{coding_label}</div><div class="value">{coding}</div></div>
+            <div class="info-card"><div class="label">Evo2 prediction</div><div class="value">{pred}</div></div>
         </div></section>"""
 
     # ── Curated database annotations (HGMD / PubTator / PubMind) ────────────────────
@@ -579,7 +790,7 @@ class HTMLReportGenerator:
             return f"""
                 <div class="dbann-db dbann-empty">
                     <div class="dbann-db-head">{title} <span class="dbann-miss">NO MATCH</span></div>
-                    <div class="dbann-disease dbann-none">—</div>
+                    <div class="dbann-disease dbann-none">No record</div>
                     <div class="dbann-db-meta">{html.escape(note)}</div>
                 </div>"""
 
@@ -711,14 +922,22 @@ class HTMLReportGenerator:
 
     def _generate_evo2_section(self, evo2_result: Optional[Dict]) -> str:
         if not evo2_result or not evo2_result.get('success'): return ""
-        cls = 'prediction-pathogenic' if evo2_result['prediction'] == 'pathogenic' else 'prediction-benign'
-        return f"""<section class="section"><h2>Evo2 Prediction</h2>
-            <div class="prediction-box {cls}"><div class="prediction-result">{evo2_result['prediction'].upper()}</div>
+        return self.evo2_section_html(
+            evo2_result['prediction'], evo2_result['delta_score'], evo2_result['ref_score'], evo2_result['var_score']
+        )
+
+    @staticmethod
+    def evo2_section_html(prediction: str, delta: float, ref: float, var: float) -> str:
+        """Evo2 區塊；backfill_report_ui.py 也用它從既有報告的分數重畫這一段。"""
+        cls = 'prediction-pathogenic' if prediction == 'pathogenic' else 'prediction-benign'
+        return f"""<section class="section"><h2>Evo2 Prediction<span class="help" tabindex="0" aria-label="What do these scores mean?">?<span class="tip">{EVO2_HELP_HTML}</span></span></h2>
+            <div class="prediction-box {cls}"><div class="prediction-result">{prediction.upper()}</div>
             <div class="score-display">
-                <div><div class="score-value">{evo2_result['delta_score']:.4f}</div><div>Delta Score</div></div>
-                <div><div class="score-value">{evo2_result['ref_score']:.4f}</div><div>Ref Score</div></div>
-                <div><div class="score-value">{evo2_result['var_score']:.4f}</div><div>Var Score</div></div>
-            </div></div></section>"""
+                <div><div class="score-value">{delta:.4f}</div><div>Delta Score</div><div class="score-caption">Var &minus; Ref; cutoff &minus;0.000714</div></div>
+                <div><div class="score-value">{ref:.4f}</div><div>Ref Score</div><div class="score-caption">reference window log-likelihood</div></div>
+                <div><div class="score-value">{var:.4f}</div><div>Var Score</div><div class="score-caption">window with the alternate base</div></div>
+            </div></div>
+            <div class="evo2-note">{EVO2_HELP_HTML}</div></section>"""
 
     def _generate_image_section(self, image_base64: str, variant_info: Dict) -> str:
         if not image_base64: return ""
@@ -770,7 +989,7 @@ class HTMLReportGenerator:
             items = " · ".join(html.escape(str(d)) for d in differential if str(d).strip())
             if items:
                 differential_html = (
-                    f'<div class="inference-card"><div class="label">Differential</div>'
+                    f'<div class="inference-card llm"><div class="label">Differential</div>'
                     f'<div class="value">{items}</div></div>'
                 )
 
@@ -832,17 +1051,13 @@ class HTMLReportGenerator:
 
         return f"""
         <section class="section inference-section">
-            <h2>Mechanistic Inference <span class="inference-badge">INFERENCE · NO DIRECT LITERATURE</span></h2>
-            <div class="inference-note">
-                No published article was found that directly reports this variant.
-                The following is an <b>analogy-based hypothesis</b> derived from Evo2, the variant's structural
-                band and type, and known pathogenic TTN variants in the same region — <b>not evidence-based</b>.
-            </div>
+            <h2>Mechanistic Inference <span class="inference-badge">INFERENCE · NOT OBSERVED DATA</span></h2>
+            {INFERENCE_WARNING_HTML}
             {exact_banner}
             <div class="inference-grid">
-                <div class="inference-card" style="border-left-width:6px;"><div class="label">Predicted Disease (inference)</div><div class="value" style="font-weight:bold;">{disease}</div></div>
-                <div class="inference-card"><div class="label">Predicted Tissue</div><div class="value">{tissue}</div></div>
-                <div class="inference-card"><div class="label">Confidence</div><div class="value">{confidence}</div></div>
+                <div class="inference-card llm" style="border-left-width:6px;"><div class="label">Predicted Disease (inference)</div><div class="value" style="font-weight:bold;">{disease}</div></div>
+                <div class="inference-card llm"><div class="label">Predicted Tissue</div><div class="value">{tissue}</div></div>
+                <div class="inference-card llm"><div class="label">Confidence</div><div class="value">{confidence}</div></div>
                 {differential_html}
             </div>
             <div class="inference-grid">
@@ -852,7 +1067,7 @@ class HTMLReportGenerator:
                 <div class="inference-card"><div class="label">Affected Isoforms</div><div class="value">{isoforms}</div></div>
             </div>
             {f'<div class="inference-note" style="margin:0 0 12px;"><b>Isoform → tissue:</b> {iso_hint_text}</div>' if iso_hint_text else ''}
-            <div class="inference-rationale">
+            <div class="inference-rationale llm">
                 <div class="label">Rationale</div>
                 <p>{rationale}</p>
             </div>
@@ -860,6 +1075,60 @@ class HTMLReportGenerator:
             {prior_line}
             <p style="color:#999; font-size:0.8em; margin-top:12px;">Inference source: {source}</p>
         </section>"""
+
+    def _generate_inheritance_section(self, result: Optional[Dict]) -> str:
+        """遺傳模式（AD / AR）推論。與 Track B 同樣用琥珀色 + 斜紋卡片標成推論。"""
+        if not result:
+            return ""
+        esc = lambda v: html.escape(str(v if v is not None else ""))  # noqa: E731
+        ev = result.get("evidence") or {}
+        items = []
+        for r in ev.get("recorded") or []:
+            items.append(f"<li><b>{esc(r.get('source'))} record</b> for this variant: {esc(r.get('disease'))} "
+                         f"&rarr; {esc(r.get('mode'))} ({esc(r.get('note'))})</li>")
+        for r in ev.get("literature") or []:
+            items.append(f"<li><b>Article PMID {esc(r.get('pmid'))}</b> (LLM-extracted): {esc(r.get('text'))}</li>")
+        if ev.get("disease_mode"):
+            items.append(f"<li><b>Disease</b>: {esc(ev.get('predicted_disease'))} is usually "
+                         f"{esc(ev.get('disease_mode'))}</li>")
+        if ev.get("mechanism"):
+            items.append(f"<li><b>Mechanism</b>: {esc(ev.get('mechanism'))}</li>")
+        analogs = ev.get("analogs") or []
+        if analogs:
+            cells = ", ".join(f"{esc(a.get('variant'))} ({esc(a.get('disease'))}, {esc(a.get('mode'))})" for a in analogs)
+            items.append(f"<li><b>Nearest known HGMD variants</b> (same exon / band and type): {cells}</li>")
+        evidence = f'<ul class="inherit-evidence">{"".join(items)}</ul>' if items else ""
+        rule = result.get("rule") or {}
+        rule_line = ""
+        if rule and str(result.get("source", "")).startswith("LLM"):
+            rule_line = (f'<p class="inherit-evidence">Rule-based estimate for comparison: '
+                         f'<b>{esc(rule.get("inheritance"))}</b> ({esc(rule.get("confidence"))}).</p>')
+        return f"""
+        <section class="section inference-section inherit-section">
+            <h2>Mode of Inheritance <span class="inference-badge">INFERENCE · NOT OBSERVED DATA</span></h2>
+            <div class="inference-warning"><span class="icon">&#9888;</span><div>
+                <b>Inferred, not recorded.</b> Whether this variant acts as autosomal dominant (one allele is enough)
+                or autosomal recessive (needs a second pathogenic allele in trans) is inferred from the variant type,
+                exon usage in heart and skeletal muscle (PSI), the associated disease and known HGMD variants nearby.
+                TTN causes both; the call can be wrong and must be confirmed by segregation / phasing.
+                (HGMD&rsquo;s own &ldquo;expected inheritance&rdquo; field is AD for every TTN entry, a gene-level
+                default, so it is not used.)</div></div>
+            <div class="inference-grid">
+                <div class="inference-card llm" style="border-left-width:6px;"><div class="label">Inferred inheritance</div><div class="value" style="font-weight:bold;">{esc(result.get('inheritance'))}</div></div>
+                <div class="inference-card llm"><div class="label">Confidence</div><div class="value">{esc(result.get('confidence'))}</div></div>
+                <div class="inference-card"><div class="label">Method</div><div class="value">{esc(result.get('source'))}</div></div>
+            </div>
+            <div class="inference-rationale llm"><div class="label">Rationale</div><p>{esc(result.get('rationale'))}</p></div>
+            {evidence}
+            {rule_line}
+        </section>"""
+
+    @staticmethod
+    def ai_tag(reasoning: str) -> str:
+        """文獻 AI Analysis 的標示：LLM 擷取的要提醒核對原文；確定性比對（沒找到變異別名）不是 LLM 產生的。"""
+        if "deterministic" in str(reasoning or "").lower():
+            return '<span class="ai-tag" style="background:#eef1f6;color:#55637a;border-color:#b9c2cf;">automated text match</span>'
+        return '<span class="ai-tag">LLM-generated &middot; verify against the article</span>'
 
     # Removed _generate_clinical_stats_section completely.
 
@@ -998,7 +1267,7 @@ class HTMLReportGenerator:
             if reasoning or evidence:
                 ai_block = f"""
                 <div style="margin-top: 15px; padding: 15px; background: white; border-radius: 5px; border: 1px solid #eee;">
-                    <div style="font-weight: bold; color: {REPORT_ACCENT_COLOR}; margin-bottom: 5px;">AI Analysis</div>
+                    <div class="llm-extract-label">AI Analysis {self.ai_tag(reasoning)}</div>
                     <div style="font-style: italic; color: #555; margin-bottom: 8px;">"{html.escape(reasoning)}"</div>
                     {f'<div style="background: #eef; padding: 5px 10px; border-radius: 4px; font-family: monospace; font-size: 0.9em; color: #333;">Evidence: "{html.escape(evidence)}"</div>' if evidence else ''}
                 </div>
@@ -1022,7 +1291,7 @@ class HTMLReportGenerator:
                 disease_display = f'{html.escape(final_disease)} <span style="color:#888; font-size:0.85em;">(inferred from article)</span>'
             
             html_out += f"""
-            <div class="pubmed-article" style="border-left-color: {border_color};">
+            <div class="pubmed-article{'' if mention else ' indirect'}" style="border-left-color: {border_color};">
                 <div class="article-title">{idx}. <a href="{article['pubmed_link']}" target="_blank">{html.escape(article['title'])}</a>{source_badge}{mention_badge}</div>
                 <div class="article-meta">{html.escape(str(article['journal']))} ({article['year']}) | PMID: {article['pmid']}</div>
                 
@@ -1032,6 +1301,7 @@ class HTMLReportGenerator:
                     <div class="article-info-item"><div class="article-info-label">Age</div><div>{html.escape(str(age))}</div></div>
                     <div class="article-info-item"><div class="article-info-label">Inheritance</div><div>{html.escape(str(inheritance))}</div></div>
                 </div>
+                {'<div class="extract-note">Disease, tissue, age and inheritance were extracted from this article by the language model (LLM); check the article before relying on them.</div>' if mention else ''}
                 {ai_block}
             </div>
             """
@@ -1085,11 +1355,11 @@ class HTMLReportGenerator:
         if stats['total_articles'] == 0:
             return """<div class="alert alert-info">No articles available for tissue statistics.</div>"""
         
-        def _row(title: str, subtitle: str, bucket: Dict) -> str:
+        def _row(title: str, subtitle: str, bucket: Dict, cls: str = "") -> str:
             total = bucket['total']
             if total == 0:
                 return f"""
-                <div style="margin-bottom: 12px;">
+                <div class="stats-row {cls}" style="margin-bottom: 12px;">
                     <h4 style="color: {REPORT_HEADER_COLOR}; margin-bottom: 8px;">{title}</h4>
                     <p style="color: #999; font-style: italic;">{subtitle} — No articles in this category.</p>
                 </div>
@@ -1099,7 +1369,7 @@ class HTMLReportGenerator:
                 return (n / total * 100) if total > 0 else 0
             
             return f"""
-            <div style="margin-bottom: 16px;">
+            <div class="stats-row {cls}" style="margin-bottom: 16px;">
                 <h4 style="color: {REPORT_HEADER_COLOR}; margin-bottom: 6px;">{title} <span style="font-weight: normal; color: #666;">— {total} articles</span></h4>
                 <p style="color: #777; font-size: 0.9em; margin-bottom: 10px;">{subtitle}</p>
                 <div class="info-grid">
@@ -1132,6 +1402,7 @@ class HTMLReportGenerator:
             'Articles that do NOT directly mention the input variant',
             'Disease / tissue inferred from the main topic discussed in the article.',
             stats['not_mentioned'],
+            'stats-indirect',
         )
         
         return f"""

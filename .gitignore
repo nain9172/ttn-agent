@@ -156,3 +156,6 @@ research/experiments/exp3_cases_*.csv
 # 輸出內含 HGMD 紀錄的 notebook
 research/exp2_medgemma_vs_gemma4.ipynb
 research/exp3_hallucination_guards.ipynb
+
+# 遺傳模式驗證與回填結果：含 HGMD 衍生的變異與疾病紀錄（授權資料，不能進 git）
+research/experiments/inheritance_*.json

@@ -330,13 +330,16 @@ fi
 if want site; then
     say "9/9 打包網頁"
     activate_env
-    if command -v go >/dev/null 2>&1 || [[ -x $HOME/.local/go/bin/go ]]; then
+    if [[ ${TTN_SERVER_MODE:-} == 1 ]]; then
+        :  # docker 服務：網站由 web 容器提供，不需要 Windows 啟動程式
+    elif command -v go >/dev/null 2>&1 || [[ -x $HOME/.local/go/bin/go ]]; then
         PATH="$HOME/.local/go/bin:$PATH" launcher/build.sh >/dev/null && info "已編譯 TTN-Site.exe"
     else
         info "沒有 Go，略過 Windows 版 TTN-Site.exe（安裝 https://go.dev/dl/ 後重跑 --only site）"
     fi
     python build_site.py || die "網頁打包失敗"
-    info "完成：$ROOT/site/index.html（Windows 使用者雙擊 site/TTN-Site.exe）"
+    if [[ ${TTN_SERVER_MODE:-} == 1 ]]; then info "完成：網站已更新（重新整理瀏覽器即可）"
+    else info "完成：$ROOT/site/index.html（Windows 使用者雙擊 site/TTN-Site.exe）"; fi
 fi
 
 say "全部完成。記錄：$LOG"
