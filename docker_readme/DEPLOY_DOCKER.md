@@ -84,7 +84,7 @@ docker compose ps                 # web、worker 都應該是 running
 
 > 報告中含有 HGMD（授權資料庫）的紀錄，網站只能開放給授權範圍內的使用者。
 
-## 5. 準備資料夾裡的資料
+## 5. 準備資料夾裡的資料(放在nas 下載放進資料夾)
 
 資料夾（`TTN_DATA_DIR`，例如 `/data/ttn`）的結構如下。容器裡看到的路徑是 `/vol/...`，對應到主機的 `/data/ttn/...`：
 
