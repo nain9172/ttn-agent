@@ -107,7 +107,7 @@ docker compose ps                 # web、worker 都應該是 running
 
 ### 方式 A：使用提供的完整套件（不用重算）
 
-完整套件 `ttn-full-1021.tar`（約 6.5 GB）就是一個準備好的資料夾，內部結構與 `TTN_DATA_DIR` 相同：
+完整套件 `ttn-full-20261021.tar`（約 6.5 GB）就是一個準備好的資料夾，內部結構與 `TTN_DATA_DIR` 相同：
 
 ```
 ttn-full-<日期>.tar
@@ -119,9 +119,9 @@ ttn-full-<日期>.tar
 模型權重（約 43 GB）沒有放進套件，第一次啟動後由網站下載。
 
 ```bash
-sha256sum -c ttn-full-1021.tar.sha256          # 確認傳輸沒有損壞（套件與 .sha256 放在同一個目錄）
+sha256sum -c ttn-full-20261021.tar.sha256          # 確認傳輸沒有損壞（套件與 .sha256 放在同一個目錄）
 mkdir -p /data/ttn
-tar -xf ttn-full-1021.tar -C /data/ttn       # 用執行 docker 的帳號解壓縮，檔案就屬於這個帳號
+tar -xf ttn-full-20261021.tar -C /data/ttn       # 用執行 docker 的帳號解壓縮，檔案就屬於這個帳號
 ```
 
 解壓縮後照第 3 節啟動服務（`docker compose build`、`docker compose up -d`），用瀏覽器開 `http://<伺服器 IP>:8080`：
