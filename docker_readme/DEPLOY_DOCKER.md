@@ -105,34 +105,30 @@ docker compose ps                 # web、worker 都應該是 running
 設定頁 `/setup` 會逐項列出哪些檔案已經有、哪些還缺，並顯示每個檔案在主機上應該放的完整路徑。
 有三種方式建立資料，**有 NAS 套件的話用方式 A 最快**。
 
-### 方式 A：使用提供的資料套件（不用重算）
+### 方式 A：使用提供的完整套件（解開就能用）
 
-資料套件 `ttn-data-<日期>.tar` 的內部結構就是這個資料夾的結構，直接解壓縮到 `TTN_DATA_DIR` 即可：
+完整套件 `ttn-full-<日期>.tar`（約 50 GB）就是一個準備好的資料夾，內部結構與 `TTN_DATA_DIR` 相同：
 
 ```
-ttn-data-<日期>.tar
+ttn-full-<日期>.tar
 ├── data/        參考序列、轉錄本模型、ClinVar、PubMind、PubTator、HGMD、cardiodb、外顯子 PSI
-└── outputs/     7,792 份 HTML 報告、Evo2 分數、PubTator 快取
+├── outputs/     7,792 份 HTML 報告、Evo2 分數、PubTator 快取
+├── models/      Evo2-7B 與 Gemma 4 權重（約 43 GB）
+└── site/        已打包好的網站
 ```
 
 ```bash
+sha256sum -c ttn-full-<日期>.tar.sha256          # 確認傳輸沒有損壞（套件與 .sha256 放在同一個目錄）
 mkdir -p /data/ttn
-tar -xf ttn-data-<日期>.tar -C /data/ttn       # 解壓後是 /data/ttn/data、/data/ttn/outputs
+tar -xf ttn-full-<日期>.tar -C /data/ttn       # 用執行 docker 的帳號解壓縮，檔案就屬於這個帳號
 ```
 
-解壓縮後再啟動服務（第 3 節的 `docker compose up -d`），然後在 `/setup` 依序：
+解壓縮後照第 3 節啟動服務（`docker compose build`、`docker compose up -d`），用瀏覽器開 `http://<伺服器 IP>:8080`
+就會看到全部報告，也可以直接送出新的變異分析，不需要再下載或重建任何東西。
 
-1. 按 **Download public data and models**。資料都已經有了，只會下載 Evo2 與 Gemma 4 權重（約 43 GB，約 1 小時）。
-2. 下載完成後，按 **Rebuild the website from existing results**，用這些報告打包網站（約 10–20 分鐘）。
-
-完成後首頁就會列出全部報告，也可以送出新的變異分析。
-
-若資料在 NAS 上已經是解開的資料夾（例如 `/mnt/nas/ttn`），改用複製：
-
-```bash
-cp -a /mnt/nas/ttn/data/. /data/ttn/data/
-cp -a /mnt/nas/ttn/outputs/. /data/ttn/outputs/
-```
+> 只有資料與報告、沒有模型與網站的套件（`ttn-data-<日期>.tar`）也是同樣解壓縮到 `/data/ttn`；
+> 之後在 `/setup` 依序按 **Download public data and models**（下載模型，約 1 小時）與
+> **Rebuild the website from existing results**（約 10–20 分鐘）。
 
 ### 方式 B：從零開始（網頁操作）
 
