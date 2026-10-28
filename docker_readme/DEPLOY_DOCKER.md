@@ -186,7 +186,7 @@ cp HGMD_latest.csv HGMD_TTN_processed.xlsx cardiodb.xlsx /data/ttn/data/
 | 更新程式 | `git pull && docker compose build && docker compose up -d`（資料夾不受影響） |
 | 備份 | `tar -C /data/ttn -cf /backup/ttn-$(date +%F).tar data outputs`（模型與快取可以重新下載，不必備份） |
 
-- 送出分析：在網站首頁的 **Analyze variants** 區塊輸入變異，一行一個，GRCh38 基因組正股寫法，例如 `2-178527245-T-G`；TTN 轉錄方向的寫法也接受。
+- 送出分析：在網站首頁的 **Analyze variants** 區塊輸入變異，一行一個，GRCh38 位置加 TTN 轉錄方向的鹼基（與 c. 寫法同一股），例如 c.107909C>T 輸入 `2-178527079-C-T`；基因組正股（VCF）寫法 `2-178527079-G-A` 會被拒絕。
 - 取消任務：任務列表裡的 **Cancel**。
 
 ## 8. 疑難排解

@@ -83,8 +83,9 @@ def load_sequence() -> str:
 def validate(raw: str, seq: str) -> tuple[Optional[str], Optional[str]]:
     """回傳 (內部 variant_id, 錯誤原因)。目前只支援 TTN 上的單鹼基變異。
 
-    輸入可用基因組正股（VCF / ClinVar 慣例）或 TTN 轉錄方向的鹼基，依參考序列自動判斷；
-    回傳的是內部（轉錄方向）ID，因為 outputs/ 的報告檔名用它。對外顯示時再轉回正股（summarize）。
+    輸入必須是 TTN 轉錄方向（與 c. 寫法同一股，例如 c.107909C>T → 2-178527079-C-T）；
+    基因組 + 股（VCF / ClinVar）寫法會被拒絕，並告知對應的轉錄方向寫法。
+    回傳的是內部（轉錄方向）ID，outputs/ 的報告檔名與網站顯示都用它。
     """
     text = raw.strip()
     m = VARIANT_RE.match(text)
@@ -98,12 +99,13 @@ def validate(raw: str, seq: str) -> tuple[Optional[str], Optional[str]]:
                       f"(chr2:{config.TTN_SEQUENCE_END:,}-{config.TTN_SEQUENCE_START:,})")
     # sequence.fasta 是負股（轉錄方向）
     tx = seq[config.TTN_SEQUENCE_START - pos]
-    if ref == variant_ids.complement(tx):  # 正股寫法（標準）
-        return f"2-{pos}-{tx}-{variant_ids.complement(alt)}", None
-    if ref == tx:  # 轉錄方向寫法
+    if ref == tx:  # 轉錄方向寫法（與 c. 寫法同一股）
         return f"2-{pos}-{ref}-{alt}", None
-    return None, (f"reference base at chr2:{pos:,} is {variant_ids.complement(tx)} "
-                  f"(GRCh38 + strand), not {ref}")
+    if ref == variant_ids.complement(tx):  # 基因組 + 股寫法：不接受，避免同一顆變異被當成兩種寫法
+        tx_id = f"2-{pos}-{tx}-{variant_ids.complement(alt)}"
+        return None, (f"this is the genomic (+ strand) form of {tx_id}; "
+                      f"enter the TTN coding-strand bases (same as c. HGVS), e.g. {tx_id}")
+    return None, f"reference base at chr2:{pos:,} is {tx} (TTN coding strand), not {ref}"
 
 
 def read_job(job_dir: Path) -> Dict:
@@ -132,7 +134,7 @@ def summarize(job_dir: Path) -> Dict:
     if job.get("kind") == "setup":
         return job
     job["completed"] = completed_variants(job_dir)
-    # job.json 存內部（轉錄方向）ID；回給網頁的一律是正股寫法
+    # job.json 存內部（轉錄方向）ID，網頁也照樣顯示
     for key in ("variants", "completed", "failed_variants"):
         if job.get(key):
             job[key] = [variant_ids.to_display(v) for v in job[key]]

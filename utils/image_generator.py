@@ -34,6 +34,7 @@ BAND_GENOMIC = {
 # exon 49（LRG / meta-transcript 編號，hg38 178,741,921–178,739,141）：N2BA、N2B 含有，N2A 跳過
 EXON49 = (178741921, 178739141)
 EXON49_ROWS = ("N2BA", "N2B", "N2A")
+EXON49_ALPHA = 0.35  # 心肌 isoform 上 exon 49 方框的不透明度
 ISOFORM_GROUPS = (
     ("Reference (meta-transcript)", "#7f8c8d", ("Meta",)),
     ("Cardiac isoforms", "#e74c3c", ("N2BA", "N2B")),
@@ -112,8 +113,8 @@ class ImageGenerator:
         d = variant_ids.add_display_fields(variant_info)
         return (
             f'TTN Variant Location: {d["display_id"]}\n'
-            f'chr{variant_info["chrom"]}:{int(variant_info["pos"]):,} {d["plus_ref"]}>{d["plus_alt"]} (GRCh38 + strand)'
-            f'  ·  TTN coding strand {variant_info["ref"]}>{variant_info["alt"]}'
+            f'chr{variant_info["chrom"]}:{int(variant_info["pos"]):,} {variant_info["ref"]}>{variant_info["alt"]} (TTN coding strand)'
+            + (f'  ·  {d["hgvs_c_display"]}' if d.get("hgvs_c_display") else '')
         )
 
     def _plot_isoform_panel(self, variant_info: Dict, intervals_by_tx: Dict[str, List[Tuple[int, int]]]):
@@ -140,8 +141,29 @@ class ImageGenerator:
         ROW = 0.62        # 每列間距（座標單位）
         BAR_H = 0.30
         GROUP_GAP = 0.55  # 組與組之間（含組名）
+        LABEL_PAD = 0.24  # 組內第一列上方有 exon 49 文字時，外框往上多留的空間（文字不壓到框線）
+
+        # exon 49 文字：同一組只寫一次（心肌組的 N2BA、N2B 共用一個「exon 49」），跳過的列寫「exon 49 skipped」
+        ex49 = (EXON49[0], EXON49[1])
+
+        def has_exon49(name: str) -> bool:
+            return any(min(a, b) <= ex49[1] and ex49[0] <= max(a, b) for a, b in intervals_by_tx[name])
+
+        label_rows = set()
+        for _, _, names in groups:
+            shown = False
+            for name in names:
+                if name not in EXON49_ROWS:
+                    continue
+                if not has_exon49(name):
+                    label_rows.add(name)
+                elif not shown:
+                    label_rows.add(name)
+                    shown = True
+        padded_groups = sum(1 for g in groups if g[2][0] in label_rows)
+
         n_rows = sum(len(g[2]) for g in groups)
-        total_h = 2.0 + n_rows * ROW + len(groups) * GROUP_GAP + 0.3
+        total_h = 2.0 + n_rows * ROW + len(groups) * GROUP_GAP + padded_groups * LABEL_PAD + 0.3
 
         fig, ax = plt.subplots(figsize=(18, 1.6 + total_h * 1.05))
         fig.subplots_adjust(left=0.10, right=0.98, top=1 - 1.25 / (1.6 + total_h * 1.05), bottom=0.02)
@@ -176,13 +198,13 @@ class ImageGenerator:
 
         # ── 各 isoform
         y = 2.0
-        ex49 = (EXON49[0], EXON49[1])
         ex49_x0 = self._normalize_genomic_position(ex49[0])
         ex49_x1 = self._normalize_genomic_position(ex49[1])
         first_row_y = None
         for label, color, names in groups:
-            y += GROUP_GAP
-            top = y - ROW / 2 + 0.02
+            pad = LABEL_PAD if names[0] in label_rows else 0.0
+            y += GROUP_GAP + pad
+            top = y - ROW / 2 + 0.02 - pad
             for name in names:
                 y_row = y
                 if first_row_y is None:
@@ -198,18 +220,27 @@ class ImageGenerator:
                     has49 |= lo <= ex49[1] and ex49[0] <= hi
                     self._draw_banded_interval(ax, hi, lo, y_row, BAR_H)
                 if name in EXON49_ROWS:
+                    # 文字標在方框正上方（y 軸是反向的：值越小越上面）。變異剛好落在 exon 49 時，
+                    # 方框正上方是紅色箭頭，文字改放在箭頭左上方，避免重疊
+                    label_y, label_va = y_row - BAR_H / 2 - 0.08, 'bottom'
+                    if ex49[1] <= pos <= ex49[0]:
+                        label_x, label_ha = ex49_x0 - 0.008, 'right'
+                    else:
+                        label_x, label_ha = (ex49_x0 + ex49_x1) / 2, 'center'
                     if has49:
+                        # 半透明，看得到底下外顯子的 band 顏色
                         ax.add_patch(patches.Rectangle((ex49_x0, y_row - BAR_H / 2 - 0.05), ex49_x1 - ex49_x0,
-                                                       BAR_H + 0.1, facecolor='#8e44ad', edgecolor='#4a235a',
-                                                       linewidth=1.5, zorder=6))
-                        ax.text(ex49_x0 - 0.004, y_row - BAR_H / 2 - 0.08, 'exon 49', ha='right', va='bottom',
-                                fontsize=12, color='#4a235a', fontweight='bold')
+                                                       BAR_H + 0.1, facecolor=to_rgba('#8e44ad', EXON49_ALPHA),
+                                                       edgecolor='#4a235a', linewidth=1.5, zorder=6))
+                        if name in label_rows:
+                            ax.text(label_x, label_y, 'exon 49', ha=label_ha, va=label_va,
+                                    fontsize=12, color='#4a235a', fontweight='bold', zorder=10)
                     else:
                         ax.add_patch(patches.Rectangle((ex49_x0, y_row - BAR_H / 2 - 0.05), ex49_x1 - ex49_x0,
                                                        BAR_H + 0.1, facecolor='none', edgecolor='#8e44ad',
                                                        linestyle='--', linewidth=1.5, zorder=6))
-                        ax.text(ex49_x0 - 0.004, y_row - BAR_H / 2 - 0.08, 'exon 49 skipped', ha='right',
-                                va='bottom', fontsize=12, color='#8e44ad', fontstyle='italic')
+                        ax.text(label_x, label_y, 'exon 49 skipped', ha=label_ha,
+                                va=label_va, fontsize=12, color='#8e44ad', fontstyle='italic', zorder=10)
                 if contains:
                     ax.plot([x_var, x_var], [y_row - BAR_H / 2 - 0.1, y_row + BAR_H / 2 + 0.1], color='red',
                             linewidth=2.5, zorder=8)

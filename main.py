@@ -361,9 +361,9 @@ def _any_article_mentions_variant(pubmed_results) -> bool:
 def _parse_variant_input(raw: str, logger) -> dict:
     """接受 `2-178612477-T-A`，也接受文獻慣用的 HGVS（c./p./g.）。
 
-    chr-pos-ref-alt 正股（VCF / ClinVar 慣例）與舊的轉錄方向寫法都接受，由
-    utils/variant_ids 用參考序列判斷。回傳的 variant_info 內部一律是轉錄方向
-    （variant_id、ref、alt），另附 display_id / plus_ref / plus_alt 給報告顯示。
+    chr-pos-ref-alt 用轉錄方向（與 c. 寫法同一股）；基因組正股（VCF）寫法也能解析，會自動轉換。
+    由 utils/variant_ids 用參考序列判斷。回傳的 variant_info 一律是轉錄方向
+    （variant_id、ref、alt），另附 display_id / vcf_id / hgvs_c_display 給報告顯示。
     HGVS 由 utils/hgvs_resolver 用 TTN 轉錄本外顯子模型離線換算成 GRCh38 座標。
     """
     from utils import variant_ids
@@ -374,10 +374,8 @@ def _parse_variant_input(raw: str, logger) -> dict:
             v = variant_ids.normalize(raw)
         except variant_ids.VariantIdError as e:
             raise VariantParseError(str(e)) from e
-        if v["orientation"] == "transcript":
-            logger.warning(
-                f"輸入 {raw} 是 TTN 轉錄方向的寫法；標準（基因組正股）寫法為 {v['display_id']}，已自動轉換"
-            )
+        if v["orientation"] == "plus":
+            logger.warning(f"輸入 {raw} 是基因組正股（VCF）寫法；已轉成 TTN 轉錄方向 {v['internal_id']}")
         info = {
             "chrom": v["chrom"], "pos": v["pos"], "ref": v["tx_ref"], "alt": v["tx_alt"],
             "variant_id": v["internal_id"], "input_orientation": v["orientation"],

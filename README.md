@@ -53,7 +53,7 @@ PUBMED_API_KEY=your_ncbi_api_key
 1. 填入 Spark 的 IP(140.xxx.xxx.xxx) 和你的使用者名稱，按 **Save & test connection**。
 2. 第一次連線時，把畫面上顯示的指紋和在 Spark 上執行 `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` 的結果比對，一致後按 **Trust this Spark**。
 3. 如果還沒有 SSH 金鑰，按 **Set up SSH key…** 並輸入一次 Spark 密碼。TTN-Site 會建立 `%USERPROFILE%\.ssh\id_ed25519` 並安裝到 Spark 上，密碼不會被儲存。
-4. 以 `2-<position>-<ref>-<alt>` 格式輸入變異（GRCh38 基因組正股，與 VCF / ClinVar 相同；TTN 轉錄方向的寫法也接受，會自動轉換），一行一個，也可以載入 CSV 或文字檔，然後按 **Run on Spark**。
+4. 以 `2-<position>-<ref>-<alt>` 格式輸入變異（GRCh38 位置，鹼基用 TTN 轉錄方向，與 c. 寫法同一股，例如 c.107909C>T 輸入 `2-178527079-C-T`；基因組 + 股寫法 `2-178527079-G-A` 會被拒絕，並提示對應的寫法），一行一個，也可以載入 CSV 或文字檔，然後按 **Run on Spark**。
    已經有報告的變異只會顯示連結；勾選 **Re-run variants already in this site** 可以對它們重新跑完整 pipeline。
    新報告會取代舊報告；如果重跑失敗，舊報告會保留。
 
@@ -73,7 +73,7 @@ PUBMED_API_KEY=your_ncbi_api_key
 ### 單一變異
 
 ```bash
-python main.py 2-178527121-A-G                    # chr-pos-ref-alt（GRCh38 基因組正股，與 VCF / ClinVar 相同；轉錄方向寫法也接受）
+python main.py 2-178527121-T-C                    # chr-pos-ref-alt（GRCh38 位置，鹼基用 TTN 轉錄方向，與 c. 寫法同一股；基因組正股寫法也能解析）
 python main.py "NM_001267550.2:c.29800T>C"         # 也接受 HGVS c./p./g.
 python main.py 2-178527121-A-G --skip-evo2         # 跳過 Evo2（較快）
 python main.py 2-178527121-A-G --skip-clinical-extraction   # 不用 LLM；Track B 改用規則式推論
@@ -125,10 +125,10 @@ conda activate gm4
 | `setup_env.sh` | 只建立 conda 環境（`environment.yml`、flash-attn wheel、環境檢查） |
 | `score_evo2_for_variants.py`、`backfill_evo2_scores.py` | 批次計算 Evo2 分數，並寫回以 `--skip-evo2` 產生的報告 |
 | `backfill_database_annotations.py` | 不重跑 pipeline，直接重新產生既有報告的資料庫比對區塊 |
-| `backfill_report_ui.py` | 不重跑 pipeline，把報告改版（正股 ID、Evo2 說明、isoform 示意圖、推論標示、遺傳模式、側邊目錄）套到既有報告 |
+| `backfill_report_ui.py` | 不重跑 pipeline，把報告改版（轉錄方向 ID、Evo2 說明、isoform 示意圖、推論標示、遺傳模式、側邊目錄）套到既有報告 |
 | `init_evo2_table.sh`、`precompute_evo2_table.py` | 一次性預先計算 TTN 上所有 SNV 的 Evo2 分數 |
 | `build_ttn_transcript_model.py` | 建立 `data/ttn_transcript_model.json`（HGVS ↔ 基因組座標用的 RefSeq 外顯子模型） |
 | `config.py` | 所有設定：模型、門檻、資料路徑、功能開關 |
-| `utils/` | pipeline 的各個模組（`variant_ids.py`：正股／轉錄方向 ID 互轉；`inheritance_inference.py`：AD / AR 推論） |
+| `utils/` | pipeline 的各個模組（`variant_ids.py`：轉錄方向 ID 與基因組正股（VCF）寫法互轉；`inheritance_inference.py`：AD / AR 推論） |
 | `scripts/data_prep/` | 輸入資料：下載 ClinVar TTN、PubTator harvest 與新文獻檢查、ClinVar 標註、HGMD ↔ ClinVar ID |
 | `research/` | 評估、實驗、論文與簡報圖表、notebook；pipeline 不會用到 |

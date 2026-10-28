@@ -3,7 +3,7 @@
 
 每份報告會：
   - 換成新版樣式（字型統一、資料庫卡片對齊、推論標示、側邊目錄）並加上目錄程式
-  - 標題、header、Variant Summary 改用基因組正股 ID，加上轉錄本 c. 寫法
+  - 標題、header、Variant Summary 用轉錄方向 ID（與 c. 寫法同一股），header 只列變異 ID
   - Evo2 區塊加上分數說明與 cutoff
   - 重畫 isoform 示意圖（心肌／骨骼肌 isoform 框、exon 49）
   - Track B 推論區塊與文獻 LLM 欄位標成推論、沒直接提到變異的文獻改灰
@@ -200,10 +200,7 @@ def transform(path_str: str, inheritance: Optional[Dict], rerender: bool, dry_ru
         url = mm.group(1)
         link = (f'<a href="{url}" target="_blank" rel="noopener" class="clinvar-link">{vi["display_id"]}</a>'
                 if url else vi["display_id"])
-        coding = (f'<span class="coding-strand">TTN coding strand: {ref}&gt;{alt}'
-                  + (f' · {html.escape(vi["hgvs_c_display"])}' if vi.get("hgvs_c_display") else "")
-                  + "</span><br>")
-        return f"Variant: {link}<br>{coding}"
+        return f"Variant: {link}<br>"
 
     out = RE_HEADER_VARIANT.sub(_header, out, count=1)
 
@@ -233,6 +230,7 @@ def transform(path_str: str, inheritance: Optional[Dict], rerender: bool, dry_ru
     # Track B：標成推論
     out = out.replace("INFERENCE · NO DIRECT LITERATURE", "INFERENCE · NOT OBSERVED DATA")
     out = RE_OLD_INF_NOTE.sub(lambda _: INFERENCE_WARNING_HTML, out, count=1)
+    out = out.replace("rationale (hatched cards below) were", "rationale (cards marked INFERRED below) were")
     for label in ("Predicted Tissue", "Confidence", "Differential"):
         out = out.replace(f'<div class="inference-card"><div class="label">{label}</div>',
                           f'<div class="inference-card llm"><div class="label">{label}</div>')
@@ -241,8 +239,9 @@ def transform(path_str: str, inheritance: Optional[Dict], rerender: bool, dry_ru
     out = out.replace('<div class="inference-rationale">', '<div class="inference-rationale llm">')
 
     # 遺傳模式：放在文獻區塊前（沒有文獻區塊就放 footer 前）
-    out = RE_INHERIT.sub("", out)
+    # 沒有新的推論結果（--no-inheritance）時保留報告裡原本的區塊，不要刪掉
     if inheritance:
+        out = RE_INHERIT.sub("", out)
         section = gen._generate_inheritance_section(inheritance)
         anchor = out.find('<section class="section"><h2>Literature Review')
         if anchor < 0:
@@ -287,7 +286,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--outputs", type=Path, default=OUTPUT_DIR)
     ap.add_argument("--llm", action="store_true", help="infer inheritance with the LLM (vLLM) instead of rules")
-    ap.add_argument("--no-inheritance", action="store_true", help="skip the inheritance section")
+    ap.add_argument("--no-inheritance", action="store_true", help="do not (re)compute inheritance; existing sections are kept")
     ap.add_argument("--no-image", action="store_true", help="keep the existing schematics")
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--only", nargs="*", help="only these report file names")

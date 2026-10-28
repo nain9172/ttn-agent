@@ -137,9 +137,9 @@ class Handler(SimpleHTTPRequestHandler):
         self.wfile.write(body)
 
     def end_headers(self) -> None:
-        # 索引與本機報告清單會隨分析結果更新，不要被瀏覽器快取
-        path = urlparse(self.path).path
-        if path in ("/", "/index.html") or path.startswith("/data/"):
+        # 網站內容會隨分析結果與改版更新：一律要求瀏覽器每次向伺服器確認（沒變時回 304，不會重新下載），
+        # 避免新的 index.html 配到快取裡舊版的 CSS / JS
+        if not self._headers_buffer or b"Cache-Control" not in b"".join(self._headers_buffer):
             self.send_header("Cache-Control", "no-cache")
         self.send_header("X-Content-Type-Options", "nosniff")
         super().end_headers()

@@ -236,10 +236,10 @@ def parse_report(path: Path) -> Optional[Dict]:
     if len(parts) != 4 or not parts[1].isdigit():
         logger.warning("skipping %s (unexpected variant id %r)", path.name, internal_id)
         return None
-    # outputs/ 檔名是內部（TTN 轉錄方向）ID；網站上一律顯示基因組正股（VCF / ClinVar 慣例）
+    # outputs/ 檔名是內部（TTN 轉錄方向）ID，網站也照樣顯示；vcf_id 是基因組正股寫法，只用來搜尋與擋下錯誤輸入
     chrom, pos, tx_ref, tx_alt = parts
     variant_id = variant_ids.to_display(internal_id)
-    ref, alt = variant_ids.complement(tx_ref), variant_ids.complement(tx_alt)
+    ref, alt = tx_ref, tx_alt
 
     evo2: Dict = {}
     box = RE_PREDICTION_BOX.search(source)
@@ -285,6 +285,7 @@ def parse_report(path: Path) -> Optional[Dict]:
     return {
         "variant_id": variant_id,
         "internal_id": internal_id,
+        "vcf_id": variant_ids.to_vcf(internal_id),
         "model": model,
         "chrom": chrom,
         "pos": int(pos),
@@ -376,8 +377,17 @@ def make_nav(meta: Dict, prev: Optional[Dict], nxt: Optional[Dict]) -> str:
     )
 
 
+# 「Analyze variants」的批次上傳範本。網頁只從檔案中抓出 2-pos-ref-alt，其他欄位與文字都忽略，
+# 所以說明欄裡不能出現變異 ID 樣式的字串
+VARIANT_TEMPLATE_CSV = """variant,note
+2-178527079-C-T,"Example (c.107909C>T). One variant per row: chr2 position (GRCh38) + TTN coding-strand ref and alt, the same bases as c. HGVS."
+2-178612477-T-A,"Example (c.50048T>A). Replace these rows with your own variants; only the variant column is read."
+"""
+
+
 def report_filename(meta: Dict) -> str:
-    return f"{meta['variant_id']}__{meta['model']}.html"
+    # 檔名用 TTN 轉錄方向 ID（鹼基與 data/gene.fna、c. 寫法同一股），與送出分析時的輸入一致
+    return f"{meta['internal_id']}__{meta['model']}.html"
 
 
 # ── static assets ────────────────────────────────────────────────────────────
@@ -526,24 +536,38 @@ main { max-width: 1400px; margin: 0 auto; padding: 22px 24px 60px; }
 .toolbar button.reset:hover { color: var(--ink); border-color: var(--muted); }
 .result-count { color: var(--muted); font-size: 0.9em; margin: 14px 0 8px; }
 
-/* 欄位多，窄螢幕改成左右捲動而不是把右邊的欄位切掉 */
-.table-wrap { background: #fff; border-radius: 12px; box-shadow: 0 6px 20px rgba(31, 45, 68, 0.07); overflow-x: auto; }
-table { width: 100%; border-collapse: collapse; font-size: 0.92em; }
+/* 固定欄寬：表格永遠等於容器寬度，內容在欄內換行，不需要左右捲動。窄螢幕改成卡片（見下方 @media） */
+.table-wrap { background: #fff; border-radius: 12px; box-shadow: 0 6px 20px rgba(31, 45, 68, 0.07); }
+table { width: 100%; border-collapse: collapse; font-size: 0.92em; table-layout: fixed; }
+col.c-variant { width: 17%; }
+col.c-evo2 { width: 11%; }
+col.c-lit { width: 18%; }
+col.c-db { width: 17%; }
+col.c-inf { width: 18%; }
+col.c-dis { width: 19%; }
 thead th {
     background: #f7f9fc; color: var(--muted); text-align: left;
-    padding: 11px 10px; font-size: 0.82em; text-transform: uppercase;
-    letter-spacing: 0.04em; border-bottom: 1px solid var(--line); white-space: nowrap;
+    padding: 11px 10px; font-size: 0.8em; text-transform: uppercase;
+    letter-spacing: 0.04em; border-bottom: 1px solid var(--line); line-height: 1.5;
 }
-thead th.sortable { cursor: pointer; user-select: none; }
-thead th.sortable:hover { color: var(--ink); }
-thead th .arrow { opacity: 0; margin-left: 4px; }
-thead th.sorted .arrow { opacity: 1; }
-tbody td { padding: 10px 10px; border-bottom: 1px solid #f1f4f8; vertical-align: middle; }
+thead th:first-child { border-top-left-radius: 12px; }
+thead th:last-child { border-top-right-radius: 12px; }
+thead .sortable { cursor: pointer; user-select: none; white-space: nowrap; display: inline-block; }
+thead .sortable:hover { color: var(--ink); }
+thead .sep { opacity: 0.5; margin: 0 2px; }
+thead .arrow { display: none; margin-left: 3px; }
+thead .sorted { color: var(--ink); }
+thead .sorted .arrow { display: inline; }
+tbody td { padding: 10px 10px; border-bottom: 1px solid #f1f4f8; vertical-align: top; overflow-wrap: anywhere; }
 tbody tr:hover { background: #f9fbff; }
 tbody tr:last-child td { border-bottom: none; }
 td.variant a { font-weight: 700; text-decoration: none; white-space: nowrap; font-variant-numeric: tabular-nums; }
 td.variant a:hover { text-decoration: underline; }
 td.variant .sub { display: block; color: var(--muted); font-size: 0.85em; font-family: inherit; }
+td.variant .model { font-size: 0.78em; opacity: 0.85; }
+.evo2-cell .delta { display: block; margin-top: 4px; font-size: 0.85em; color: var(--muted); font-variant-numeric: tabular-nums; }
+.lit-counts { font-size: 0.88em; margin-bottom: 5px; }
+.lit-counts b { font-variant-numeric: tabular-nums; }
 td.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
 
 .pill { display: inline-block; padding: 2px 9px; border-radius: 999px; font-size: 0.8em; font-weight: 700; white-space: nowrap; }
@@ -558,43 +582,57 @@ td.num { text-align: right; font-variant-numeric: tabular-nums; white-space: now
 .pill.db-pubtator { background: #e3f0fc; color: #10508f; }
 .pill.db-pubmind { background: #f3e8fd; color: #6a1b9a; }
 .pill.db-miss { background: #f2f4f8; color: #a5aeba; font-weight: 600; }
-.db-cell { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; max-width: 220px; }
+.db-cell { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }
 .db-cell .db-disease {
     flex: 1 1 100%; color: var(--muted); font-size: 0.82em;
     white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 .pill.conf-high { background: #e8f8ef; color: #1e8449; }
-.pill.conf-medium { background: #fff6e0; color: #b9770e; }
+.pill.conf-medium, .pill.conf-moderate { background: #fff6e0; color: #b9770e; }
 .pill.conf-low { background: #eef1f6; color: var(--muted); }
 
-.bar { display: flex; height: 9px; border-radius: 999px; overflow: hidden; background: #f1f4f8; min-width: 96px; }
+.bar { display: flex; height: 9px; border-radius: 999px; overflow: hidden; background: #f1f4f8; }
 .bar span { display: block; }
 .bar .cardiac { background: var(--cardiac); }
 .bar .skeletal { background: var(--skeletal); }
 .bar .both { background: var(--both); }
 .bar .not_specified { background: var(--none); }
-.bar-legend { font-size: 0.8em; color: var(--muted); margin-top: 3px; white-space: nowrap; }
+.bar-legend { font-size: 0.8em; color: var(--muted); margin-top: 3px; }
 .legend { display: flex; gap: 14px; flex-wrap: wrap; font-size: 0.85em; color: var(--muted); margin: 10px 0 0; }
 .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 5px; }
 
 .mention-strong { font-weight: 700; color: #1e8449; }
 .mention-zero { color: var(--muted); }
 .diseases {
-    color: var(--muted); font-size: 0.88em; min-width: 140px; max-width: 240px;
-    /* 這一欄常被擠窄，不夾行會把整列拉得很高 */
-    display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+    color: var(--muted); font-size: 0.88em;
+    /* 最多三行，完整清單在滑鼠提示 */
+    display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden;
 }
-.inference-cell { font-size: 0.88em; min-width: 140px; max-width: 220px; }
+.inference-cell { font-size: 0.88em; }
+.inference-cell .pill { margin: 3px 3px 0 0; }
 .pill.inh { background: #fff3cd; color: #8a5a00; border: 1px dashed #d39e00; }
 .inference-cell .dis { display: block; color: #8a5a00; font-weight: 600; }
 .empty { padding: 60px 20px; text-align: center; color: var(--muted); }
 footer.site { max-width: 1400px; margin: 0 auto; padding: 0 24px 40px; color: var(--muted); font-size: 0.85em; }
-@media (max-width: 1300px) {
-    .hide-md { display: none; }
-}
 @media (max-width: 900px) {
     .stats { margin-top: 16px; }
-    .hide-sm { display: none; }
+    /* 窄螢幕：每一列變成一張卡片，欄位兩兩並排，排序鍵留在上方 */
+    .table-wrap table, .table-wrap tbody, .table-wrap tr, .table-wrap td { display: block; width: 100%; }
+    .table-wrap colgroup { display: none; }
+    .table-wrap thead, .table-wrap thead tr { display: block; }
+    .table-wrap thead tr { display: flex; flex-wrap: wrap; gap: 4px 14px; background: #f7f9fc; padding: 10px 14px; border-radius: 12px 12px 0 0; }
+    .table-wrap thead th { display: inline; padding: 0; border: 0; background: none; }
+    .table-wrap thead th:not(:has(.sortable)) { display: none; }
+    .table-wrap tbody tr { display: grid; grid-template-columns: 1fr 1fr; gap: 10px 16px; padding: 14px; border-bottom: 1px solid var(--line); }
+    .table-wrap tbody td { padding: 0; border: 0; }
+    .table-wrap tbody td.variant { grid-column: 1 / -1; }
+    .table-wrap tbody td[data-label]::before {
+        content: attr(data-label); display: block; margin-bottom: 2px; color: var(--muted);
+        font-size: 0.72em; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em;
+    }
+}
+@media (max-width: 520px) {
+    .table-wrap tbody tr { grid-template-columns: 1fr; }
 }
 /* ── Analyze new variants（TTN-Site 啟動程式提供）─────────────────────────── */
 .pill.local { background: #fff4e5; color: #b26a00; }
@@ -618,7 +656,8 @@ footer.site { max-width: 1400px; margin: 0 auto; padding: 0 24px 40px; color: va
 }
 .analyze button.secondary { background: #fff; color: var(--brand); }
 .analyze button:disabled { opacity: 0.5; cursor: default; }
-.analyze label.file { font-size: 0.9em; color: var(--brand); font-weight: 600; cursor: pointer; }
+.analyze label.file, .analyze a.file { font-size: 0.9em; color: var(--brand); font-weight: 600; cursor: pointer; text-decoration: none; }
+.analyze a.file:hover { text-decoration: underline; }
 .analyze label.file input { display: none; }
 .analyze label.an-check { font-size: 0.9em; color: var(--ink); display: flex; align-items: center; gap: 5px; cursor: pointer; }
 .an-msg { font-size: 0.88em; }
@@ -628,6 +667,7 @@ footer.site { max-width: 1400px; margin: 0 auto; padding: 0 24px 40px; color: va
 .an-box code { font-size: 0.95em; word-break: break-all; }
 .an-preview { font-size: 0.85em; margin-top: 8px; color: var(--muted); }
 .an-preview a { font-weight: 600; }
+.an-preview .err { color: #c0392b; }
 .an-jobs { width: 100%; border-collapse: collapse; margin-top: 14px; font-size: 0.88em; }
 .an-jobs th { text-align: left; color: var(--muted); font-size: 0.85em; text-transform: uppercase; letter-spacing: 0.04em; padding: 6px 8px; border-bottom: 1px solid var(--line); }
 .an-jobs td { padding: 7px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
@@ -672,7 +712,7 @@ SITE_JS = r"""(function () {
   mergeReports(window.__TTN_LOCAL_REPORTS__ || []);
 
   function prepare(r) {
-    var bits = [r.variant_id, r.internal_id, r.hgvs_c, r.model, r.ref + '>' + r.alt, String(r.pos), r.clinvar_id];
+    var bits = [r.variant_id, r.vcf_id, r.hgvs_c, r.model, r.ref + '>' + r.alt, String(r.pos), r.clinvar_id];
     bits = bits.concat(r.diseases || []);
     if (r.inference) bits.push(r.inference.disease, r.inference.tissue, r.inference.band, r.inference.differential);
     if (r.band) bits.push(r.band);
@@ -725,7 +765,7 @@ SITE_JS = r"""(function () {
     count: document.getElementById('count'),
     body: document.getElementById('rows'),
     stats: document.getElementById('stats'),
-    head: document.querySelectorAll('th.sortable')
+    head: document.querySelectorAll('thead .sortable')
   };
 
   function esc(s) {
@@ -816,7 +856,7 @@ SITE_JS = r"""(function () {
 
   function tissueBar(r) {
     var total = TISSUES.reduce(function (s, k) { return s + (r.tissue[k] || 0); }, 0);
-    if (!total) return '<span class="bar-legend">no articles</span>';
+    if (!total) return r.n_articles ? '' : '<span class="bar-legend">no articles</span>';
     var segs = TISSUES.map(function (k) {
       var n = r.tissue[k] || 0;
       return n ? '<span class="' + k + '" style="width:' + (n / total * 100).toFixed(2) + '%" title="' +
@@ -874,7 +914,7 @@ SITE_JS = r"""(function () {
     var pred = evo2.prediction
       ? '<span class="pill ' + evo2.prediction + '">' + evo2.prediction.toUpperCase() + '</span>'
       : '<span class="pill na">N/A</span>';
-    var delta = evo2.delta != null ? evo2.delta.toFixed(4) : '—';
+    var delta = evo2.delta != null ? evo2.delta.toFixed(4) : '';
     var inf = '<span class="mention-zero">—</span>';
     var inh = '';
     if (r.inheritance && r.inheritance.mode) {
@@ -892,20 +932,23 @@ SITE_JS = r"""(function () {
     var mention = r.n_mention
       ? '<span class="mention-strong">' + r.n_mention + '</span>'
       : '<span class="mention-zero">0</span>';
+    var nArt = r.n_articles || 0;
+    var lit = nArt
+      ? '<div class="lit-counts"><b>' + nArt + '</b> article' + (nArt === 1 ? '' : 's') + ' · ' + mention + ' mention</div>'
+      : '';
+    var diseases = (r.diseases || []).length
+      ? '<div class="diseases" title="' + esc(r.diseases.join('\n')) + '">' + esc(r.diseases.slice(0, 4).join(' · ')) + '</div>'
+      : '<span class="mention-zero">—</span>';
     return '<tr>' +
       '<td class="variant"><a href="reports/' + esc(r.file) + '">' + esc(r.variant_id) + '</a>' +
         (r.local ? ' <span class="pill local" title="Analyzed on your DGX Spark">Spark</span>' : '') +
-      '<span class="sub">' + (r.hgvs_c ? esc(r.hgvs_c) : 'chr' + esc(r.chrom) + ':' + r.pos.toLocaleString()) + '</span></td>' +
-      '<td class="hide-sm hide-md"><span class="pill model" title="' + esc(r.model) + '">' + esc(r.model) + '</span></td>' +
-      '<td>' + pred + '</td>' +
-      '<td class="num">' + delta + '</td>' +
-      '<td class="num">' + r.n_articles + '</td>' +
-      '<td class="num">' + mention + '</td>' +
-      '<td>' + tissueBar(r) + '</td>' +
-      '<td>' + dbCell(r) + '</td>' +
-      '<td class="hide-sm">' + inf + '</td>' +
-      '<td class="diseases hide-sm" title="' + esc((r.diseases || []).join('\n')) + '">' +
-      esc((r.diseases || []).slice(0, 3).join(' · ')) + '</td>' +
+      '<span class="sub">' + (r.hgvs_c ? esc(r.hgvs_c) : 'chr' + esc(r.chrom) + ':' + r.pos.toLocaleString()) + '</span>' +
+      '<span class="sub model" title="Language model used for this report">' + esc(r.model) + '</span></td>' +
+      '<td class="evo2-cell" data-label="Evo2">' + pred + (delta ? '<span class="delta">&Delta; ' + delta + '</span>' : '') + '</td>' +
+      '<td data-label="Literature">' + lit + tissueBar(r) + '</td>' +
+      '<td data-label="Databases">' + dbCell(r) + '</td>' +
+      '<td data-label="Inference">' + inf + '</td>' +
+      '<td data-label="Top diseases">' + diseases + '</td>' +
       '</tr>';
   }
 
@@ -1030,7 +1073,7 @@ SITE_JS = r"""(function () {
       : 'Showing ' + rows.length + ' of ' + DATA.length + ' reports';
     els.body.innerHTML = rows.length
       ? rows.map(row).join('')
-      : '<tr><td colspan="10" class="empty">No report matches these filters.</td></tr>';
+      : '<tr><td colspan="6" class="empty">No report matches these filters.</td></tr>';
     syncHead();
     writeHash();
   }
@@ -1077,10 +1120,10 @@ SITE_JS = r"""(function () {
   // 給 assets/launcher.js 用：合併新報告後重畫表格
   window.TTN = {
     addReports: function (records) { mergeReports(records); render(); },
-    // 正股或轉錄方向寫法都找得到（同一位置只有一種寫法的 ref 對得上參考序列，不會混淆）
+    // 轉錄方向或基因組正股寫法都找得到（送出分析時由 preview 擋下基因組正股寫法）
     find: function (id) {
       for (var i = 0; i < DATA.length; i++) {
-        if (DATA[i].variant_id === id || DATA[i].internal_id === id) return DATA[i];
+        if (DATA[i].variant_id === id || DATA[i].internal_id === id || DATA[i].vcf_id === id) return DATA[i];
       }
       return null;
     }
@@ -1210,9 +1253,13 @@ LAUNCHER_JS = r"""(function () {
   function preview() {
     var vs = parseVariants($('an-variants').value);
     var rerun = $('an-rerun').checked;
-    var have = [], todo = [], fresh = 0;
+    var have = [], todo = [], reverse = [], fresh = 0;
     vs.forEach(function (v) {
       var r = window.TTN && window.TTN.find(v);
+      // 只接受 TTN 轉錄方向（與 c. 寫法同一股）；對上的是基因組 + 股 ID 就不送出（不在網站裡的由 Spark 端用參考序列判斷）
+      if (r && r.variant_id !== v && r.internal_id !== v) {
+        reverse.push(esc(v) + ' is the genomic (+ strand) form of ' + esc(r.variant_id)); return;
+      }
       if (r) have.push('<a href="reports/' + esc(r.file) + '">' + esc(v) + '</a>');
       if (!r) fresh++;
       if (!r || rerun) todo.push(v);
@@ -1222,6 +1269,9 @@ LAUNCHER_JS = r"""(function () {
     if (have.length) {
       parts.push((rerun ? have.length + ' already in this site will be re-run: '
                         : 'already in this site (tick “Re-run” to analyze again): ') + have.join(', '));
+    }
+    if (reverse.length) {
+      parts.push('<span class="err">not accepted (enter TTN coding-strand bases, as in c. HGVS): ' + reverse.join('; ') + '</span>');
     }
     $('an-preview').innerHTML = parts.join(' · ');
     $('an-submit').disabled = !todo.length;
@@ -1285,7 +1335,10 @@ LAUNCHER_JS = r"""(function () {
     if (j.merge_error) return '<span class="an-msg err">' + esc(j.merge_error) + '</span>';
     if (!j.merged) return '—';
     var links = (j.reports || []).map(function (f) {
-      return '<a href="reports/' + esc(f) + '">' + esc(f.split('__')[0]) + '</a>';
+      // 舊任務記的是改名前的檔名（基因組正股 ID），用目前網站上的同一顆變異連結
+      var r = window.TTN && window.TTN.find(f.split('__')[0]);
+      return r ? '<a href="reports/' + esc(r.file) + '">' + esc(r.variant_id) + '</a>'
+               : '<a href="reports/' + esc(f) + '">' + esc(f.split('__')[0]) + '</a>';
     });
     var failed = (j.failed_variants || []).length
       ? ' <span class="an-msg err">no report: ' + esc(j.failed_variants.join(', ')) + '</span>' : '';
@@ -1394,7 +1447,7 @@ INDEX_HTML = """<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>__TITLE__</title>
-<link rel="stylesheet" href="assets/site.css">
+<link rel="stylesheet" href="assets/site.css?v=__V_CSS__">
 </head>
 <body>
 <header class="site">
@@ -1451,10 +1504,12 @@ INDEX_HTML = """<!DOCTYPE html>
                 </div>
             </div>
         </details>
-        <textarea id="an-variants" placeholder="One variant per line, GRCh38 genomic (+) strand as in VCF / ClinVar, e.g.&#10;2-178527098-G-A&#10;2-178612477-A-T&#10;(TTN coding-strand alleles are also accepted and converted automatically)"></textarea>
+        <textarea id="an-variants" placeholder="One variant per line, GRCh38 position with the TTN coding-strand bases (same as c. HGVS), e.g.&#10;2-178527079-C-T  (c.107909C&gt;T)&#10;2-178527098-C-T&#10;(genomic + strand alleles as in VCF / ClinVar are not accepted)"></textarea>
         <div class="an-preview" id="an-preview"></div>
         <div class="an-actions">
             <label class="file">Load CSV / text file…<input type="file" id="an-file" accept=".csv,.txt,.tsv"></label>
+            <a class="file" href="assets/variant-template.csv" download="TTN-variant-template.csv"
+               title="Example file: one variant per row in the “variant” column; other columns are ignored">Download template</a>
             <label class="an-check" title="Variants that already have a report are normally just linked. Tick this to run the full pipeline on them again; the new report replaces the old one in this site.">
                 <input type="checkbox" id="an-rerun"> Re-run variants already in this site</label>
             <button type="button" id="an-submit">Run on Spark</button>
@@ -1523,18 +1578,15 @@ INDEX_HTML = """<!DOCTYPE html>
 
     <div class="table-wrap">
         <table>
+            <colgroup><col class="c-variant"><col class="c-evo2"><col class="c-lit"><col class="c-db"><col class="c-inf"><col class="c-dis"></colgroup>
             <thead>
                 <tr>
-                    <th class="sortable" data-sort="pos">Variant<span class="arrow"></span></th>
-                    <th class="sortable hide-sm hide-md" data-sort="model">Model<span class="arrow"></span></th>
-                    <th class="sortable" data-sort="pred">Evo2<span class="arrow"></span></th>
-                    <th class="sortable num" data-sort="delta" title="Evo2 delta score; sorted by absolute value">&Delta; score<span class="arrow"></span></th>
-                    <th class="sortable num" data-sort="articles">Articles<span class="arrow"></span></th>
-                    <th class="sortable num" data-sort="mention">Mention<span class="arrow"></span></th>
-                    <th class="sortable" data-sort="tissue">Tissue split<span class="arrow"></span></th>
-                    <th class="sortable" data-sort="db" title="Curated database record for this exact variant">Databases<span class="arrow"></span></th>
-                    <th class="hide-sm">Inference</th>
-                    <th class="hide-sm">Top diseases</th>
+                    <th><span class="sortable" data-sort="pos">Variant<span class="arrow"></span></span></th>
+                    <th><span class="sortable" data-sort="pred">Evo2<span class="arrow"></span></span><span class="sep">/</span><span class="sortable" data-sort="delta" title="Evo2 delta score; sorted by absolute value">&Delta;<span class="arrow"></span></span></th>
+                    <th><span class="sortable" data-sort="articles">Articles<span class="arrow"></span></span><span class="sep">/</span><span class="sortable" data-sort="mention">Mention<span class="arrow"></span></span><span class="sep">/</span><span class="sortable" data-sort="tissue">Tissue<span class="arrow"></span></span></th>
+                    <th><span class="sortable" data-sort="db" title="Curated database record for this exact variant">Databases<span class="arrow"></span></span></th>
+                    <th>Inference</th>
+                    <th>Top diseases</th>
                 </tr>
             </thead>
             <tbody id="rows"></tbody>
@@ -1557,8 +1609,8 @@ window.__TTN_REPORTS__ = JSON.parse(document.getElementById('report-data').textC
 window.__TTN_META__ = __META__;
 </script>
 <script src="data/local-reports.js"></script>
-<script src="assets/site.js"></script>
-<script src="assets/launcher.js"></script>
+<script src="assets/site.js?v=__V_JS__"></script>
+<script src="assets/launcher.js?v=__V_LAUNCHER__"></script>
 </body>
 </html>
 """
@@ -1620,7 +1672,7 @@ def select_reports(outputs: Path, include: str) -> List[Path]:
 
 
 INDEX_FIELDS = (
-    "variant_id", "internal_id", "model", "chrom", "pos", "ref", "alt", "tx_ref", "tx_alt", "hgvs_c", "generated",
+    "variant_id", "internal_id", "vcf_id", "model", "chrom", "pos", "ref", "alt", "tx_ref", "tx_alt", "hgvs_c", "generated",
     "clinvar_id", "evo2", "n_articles", "n_mention", "tissue",
     "mention_tissue", "dominant_tissue", "diseases", "inference", "inheritance", "db", "pubmind", "band",
     "file",
@@ -1663,6 +1715,10 @@ def build_patch(report_paths: List[Path], patch_dir: Path,
         json.dumps(records, ensure_ascii=False, separators=(",", ":")), encoding="utf-8"
     )
     return records
+
+
+def _short_hash(text: str) -> str:
+    return hashlib.sha1(text.encode("utf-8")).hexdigest()[:10]
 
 
 def prune_stale(site: Path, current: set) -> int:
@@ -1754,6 +1810,7 @@ def build(outputs: Path, site: Path, include: str, inline_images: bool,
     (assets_dir / "site.css").write_text(SITE_CSS, encoding="utf-8")
     (assets_dir / "site.js").write_text(SITE_JS, encoding="utf-8")
     (assets_dir / "launcher.js").write_text(LAUNCHER_JS, encoding="utf-8")
+    (assets_dir / "variant-template.csv").write_text(VARIANT_TEMPLATE_CSV, encoding="utf-8", newline="\r\n")
     if SERVER_MODE:
         # docker 服務：Spark 任務的報告都已在 outputs/，這次建站已經收進索引，本機清單歸零
         (data_dir / "local-reports.json").write_text("[]", encoding="utf-8")
@@ -1792,6 +1849,10 @@ def build(outputs: Path, site: Path, include: str, inline_images: bool,
         .replace("__N_REPORTS__", str(len(parsed)))
         .replace("__DATA__", payload.replace("</", "<\\/"))
         .replace("__META__", json.dumps(site_meta, ensure_ascii=False))
+        # 版本參數：內容一改，網址就不同，瀏覽器不會拿快取裡的舊 CSS / JS 配新的 index.html
+        .replace("__V_CSS__", _short_hash(SITE_CSS))
+        .replace("__V_JS__", _short_hash(SITE_JS))
+        .replace("__V_LAUNCHER__", _short_hash(LAUNCHER_JS))
     )
     (site / "index.html").write_text(index_html, encoding="utf-8")
 

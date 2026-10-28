@@ -55,7 +55,7 @@ DISEASE_PATTERNS_FOR_INFERENCE: List[Tuple[str, str, str]] = [
 FONT_STACK = ("'Segoe UI', 'Noto Sans', 'Noto Sans TC', 'Microsoft JhengHei', -apple-system, "
               "BlinkMacSystemFont, Roboto, 'Helvetica Neue', Arial, sans-serif")
 
-# Evo2 分數說明（報告 Evo2 區塊的 ? 提示與說明列、網站 Information 頁共用）
+# Evo2 分數說明（報告 Evo2 區塊的 ? 提示、網站 Information 頁共用）
 EVO2_HELP_HTML = (
     "<b>Evo2</b> is a DNA language model (Evo2-7B) trained on genomes only, never on clinical labels. "
     "For each variant it reads an 8,192-bp window of the TTN reference sequence centred on the variant:"
@@ -120,7 +120,7 @@ INFERENCE_WARNING_HTML = (
     '<div class="inference-warning"><span class="icon">&#9888;</span><div>'
     '<b>This section is a model-generated hypothesis, not real patient or database data.</b> '
     'No published article was found that directly reports this variant. The predicted disease, tissue, '
-    'confidence, differential and rationale (hatched cards below) were <b>inferred</b> by the language model / '
+    'confidence, differential and rationale (cards marked INFERRED below) were <b>inferred</b> by the language model / '
     'rules from Evo2, the variant&rsquo;s structural band and type, and known pathogenic TTN variants in the same '
     'region. Use them only to prioritise follow-up; they are <b>not evidence</b> for classification.'
     '</div></div>'
@@ -355,11 +355,6 @@ class HTMLReportGenerator:
         .help .tip ul {{ margin: 6px 0 6px 18px; }}
         .help:hover .tip, .help:focus .tip, .help:focus-within .tip {{ display: block; }}
         .score-caption {{ color: #666; font-size: 0.85em; }}
-        .evo2-note {{
-            margin-top: 14px; padding: 12px 16px; background: #f4f8fc; border: 1px solid #d6e4f0;
-            border-radius: 6px; color: #444; font-size: 0.9em; line-height: 1.6;
-        }}
-        .evo2-note ul {{ margin: 4px 0 4px 20px; }}
         /* ── 推論／LLM 產生的欄位：明確標示「不是實際資料」── */
         .ai-tag {{
             display: inline-block; padding: 1px 7px; border-radius: 3px; margin-left: 6px;
@@ -367,8 +362,7 @@ class HTMLReportGenerator:
             background: #fff3cd; color: #8a5a00; border: 1px dashed #d39e00; text-transform: uppercase;
         }}
         .inference-card.llm, .inference-rationale.llm {{
-            background: repeating-linear-gradient(135deg, #fff, #fff 12px, #fff8e8 12px, #fff8e8 24px);
-            border: 1px dashed #e0a44a; border-left: 4px solid #f0ad4e;
+            background: #fff; border: 1px dashed #e0a44a; border-left: 4px solid #f0ad4e;
         }}
         .inference-card.llm .label::after, .inference-rationale.llm .label::after {{
             content: "INFERRED"; display: inline-block; margin-left: 6px; padding: 0 5px; border-radius: 3px;
@@ -498,7 +492,7 @@ class HTMLReportGenerator:
 
     @staticmethod
     def _display(variant_info: Dict) -> Dict:
-        """對外顯示用的 ID：一律是基因組正股（VCF / ClinVar 慣例），內部 variant_id 是轉錄方向。"""
+        """對外顯示用的欄位：ID 用轉錄方向（與 c. 寫法同一股），另附基因組正股的 vcf_id 供對照。"""
         from utils import variant_ids
 
         return variant_ids.add_display_fields(variant_info)
@@ -506,11 +500,6 @@ class HTMLReportGenerator:
     def _generate_header(self, variant_info: Dict, clinvar_info: Optional[Dict] = None) -> str:
         d = self._display(variant_info)
         variant_id = d['display_id']
-        coding = (
-            f'<span class="coding-strand">TTN coding strand: {html.escape(d["ref"])}&gt;{html.escape(d["alt"])}'
-            + (f' · {html.escape(d["hgvs_c_display"])}' if d.get("hgvs_c_display") else '')
-            + '</span><br>'
-        )
         clinvar_url = clinvar_info.get('clinvar_url') if clinvar_info else None
 
         if clinvar_url:
@@ -527,7 +516,6 @@ class HTMLReportGenerator:
             f'<h1>{REPORT_TITLE}</h1>'
             f'<div class="subtitle">'
             f'{variant_display}<br>'
-            f'{coding}'
             f'Generated: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}'
             f'</div>'
             f'</header>'
@@ -543,7 +531,7 @@ class HTMLReportGenerator:
         return f"""<section class="section"><h2>Variant Summary</h2><div class="info-grid">
             <div class="info-card"><div class="label">Chromosome</div><div class="value">{variant_info['chrom']}</div></div>
             <div class="info-card"><div class="label">Position (GRCh38)</div><div class="value">{variant_info['pos']:,}</div></div>
-            <div class="info-card"><div class="label">Ref/Alt (genomic + strand)</div><div class="value">{d['plus_ref']}/{d['plus_alt']}</div></div>
+            <div class="info-card"><div class="label">Ref/Alt (TTN coding strand)</div><div class="value">{d['ref']}/{d['alt']}</div></div>
             <div class="info-card"><div class="label">{coding_label}</div><div class="value">{coding}</div></div>
             <div class="info-card"><div class="label">Evo2 prediction</div><div class="value">{pred}</div></div>
         </div></section>"""
@@ -936,8 +924,7 @@ class HTMLReportGenerator:
                 <div><div class="score-value">{delta:.4f}</div><div>Delta Score</div><div class="score-caption">Var &minus; Ref; cutoff &minus;0.000714</div></div>
                 <div><div class="score-value">{ref:.4f}</div><div>Ref Score</div><div class="score-caption">reference window log-likelihood</div></div>
                 <div><div class="score-value">{var:.4f}</div><div>Var Score</div><div class="score-caption">window with the alternate base</div></div>
-            </div></div>
-            <div class="evo2-note">{EVO2_HELP_HTML}</div></section>"""
+            </div></div></section>"""
 
     def _generate_image_section(self, image_base64: str, variant_info: Dict) -> str:
         if not image_base64: return ""
@@ -1077,7 +1064,7 @@ class HTMLReportGenerator:
         </section>"""
 
     def _generate_inheritance_section(self, result: Optional[Dict]) -> str:
-        """遺傳模式（AD / AR）推論。與 Track B 同樣用琥珀色 + 斜紋卡片標成推論。"""
+        """遺傳模式（AD / AR）推論。與 Track B 同樣用琥珀色邊框卡片標成推論。"""
         if not result:
             return ""
         esc = lambda v: html.escape(str(v if v is not None else ""))  # noqa: E731
