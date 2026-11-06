@@ -124,6 +124,7 @@ conda activate gm4
 | `setup_and_run.sh` | 一鍵完成安裝設定與完整執行（見「快速開始」） |
 | `setup_env.sh` | 只建立 conda 環境（`environment.yml`、flash-attn wheel、環境檢查） |
 | `score_evo2_for_variants.py`、`backfill_evo2_scores.py` | 批次計算 Evo2 分數，並寫回以 `--skip-evo2` 產生的報告 |
+| `reproduce_evo2.sh` | 重現 Evo2 分數：建環境、下載參考序列與 ClinVar TTN 變異、對全部變異計分，並以 ClinVar 標籤評估（AUROC、敏感度、特異度） |
 | `backfill_database_annotations.py` | 不重跑 pipeline，直接重新產生既有報告的資料庫比對區塊 |
 | `backfill_report_ui.py` | 不重跑 pipeline，把報告改版（轉錄方向 ID、Evo2 說明、isoform 示意圖、推論標示、遺傳模式、側邊目錄）套到既有報告 |
 | `init_evo2_table.sh`、`precompute_evo2_table.py` | 一次性預先計算 TTN 上所有 SNV 的 Evo2 分數 |
