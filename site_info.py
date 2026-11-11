@@ -154,15 +154,25 @@ dt {{ font-weight: 700; }}
 
 <section id="ids">
     <h2>Variant IDs and strand</h2>
-    <p>TTN lies on the <b>minus strand</b> of chromosome 2. Variant IDs on this site are written
-    <code>chr-position-ref-alt</code> with the GRCh38 position and the bases of the <b>TTN coding strand</b>,
-    the same bases as the HGVS <code>c.</code> notation on NM_001267550.2 and as the TTN reference sequence
-    (NCBI <code>NC_000002.12:c178807423-178525989</code>).</p>
-    <p class="note">Example: <code>2-178527079-C-T</code> is <code>NM_001267550.2:c.107909C&gt;T</code>.
-    VCF files, ClinVar and gnomAD write the same variant on the genomic plus strand with complementary bases
-    (A&harr;T, C&harr;G): <code>2-178527079-G-A</code>. Each report header gives that form too, for
-    cross-referencing. When you <b>submit variants</b> for analysis, use the coding-strand form; the genomic
-    plus-strand form is detected from the reference sequence and not accepted.</p>
+    <p>TTN lies on the <b>minus strand</b> of chromosome 2. Variant IDs on this site use the standard
+    <b>GRCh38 genomic plus-strand</b> notation <code>chr-position-ref-alt</code>, the same as VCF files, ClinVar
+    and gnomAD. Each report also gives the change on the TTN coding strand as HGVS <code>c.</code> notation on
+    NM_001267550.2, where the bases are complementary (A&harr;T, C&harr;G).</p>
+    <p class="note">Example: ClinVar <a href="https://www.ncbi.nlm.nih.gov/clinvar/variation/332662/">332662</a>
+    is <code>2-178525997-T-C</code> on this site and <code>NM_001267550.2:c.*1015A&gt;G</code> on the coding
+    strand. When you <b>submit variants</b> for analysis, use the plus-strand form; the coding-strand form
+    (<code>2-178525997-A-G</code>) is detected from the reference sequence and not accepted.</p>
+    <p>Accepted input formats (single-nucleotide variants; the same variant shown in each form):</p>
+    <ul>
+        <li><code>2-178525997-T-C</code> or <code>chr2:178525997:T:C</code>: GRCh38 genomic plus strand</li>
+        <li><code>NC_000002.12:g.178525997T&gt;C</code>: HGVS g. (plus strand; GRCh37 positions are converted)</li>
+        <li><code>NM_001267550.2:c.*1015A&gt;G</code>: HGVS c. on any TTN RefSeq transcript, also the ClinVar form
+            <code>NM_001267550.2(TTN):c.*1015A&gt;G</code>; without a transcript the meta-transcript numbering is tried first</li>
+        <li><code>rs72629798</code>: dbSNP rsID (needs internet access; every single-nucleotide allele is analyzed)</li>
+    </ul>
+    <p class="note">Not accepted: protein (p.) notation, because one amino-acid change can come from different
+    nucleotide changes, and insertions or deletions. HGVS and rsID inputs are converted on the server; the
+    resulting genomic IDs are shown after you submit.</p>
 </section>
 
 <section id="bands">

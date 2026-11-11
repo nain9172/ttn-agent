@@ -6,10 +6,10 @@ gnomAD 等外部工具的 `chr-pos-ref-alt` 一律是基因組正股。兩者位
 
     內部（轉錄方向） 2-178526348-G-T   ⇔   對外（正股，VCF） 2-178526348-C-A
 
-規則：使用者看到的與內部計算一律用轉錄方向（display_id == internal_id，鹼基與 data/gene.fna、
-c. 寫法同一股）；基因組正股寫法只當作對照 VCF / ClinVar 的 vcf_id。
+規則：使用者看到的一律是基因組正股寫法（display_id，與 VCF / ClinVar 相同）；內部計算照舊用
+轉錄方向（internal_id，鹼基與 data/sequence.fasta、c. 寫法同一股）。
 normalize() 兩種都能解析，用參考序列判斷：同一位置的正股鹼基與其互補一定不同，所以 ref 只會
-符合其中一種，不會誤判（網站送出分析時只接受轉錄方向，見 spark_job.validate）。
+符合其中一種，不會誤判（網站送出分析時只接受正股，見 spark_job.validate）。
 
 只用標準函式庫（建站、啟動程式的 Spark 端都會 import），參考序列第一次用到時才讀。
 """
@@ -57,8 +57,8 @@ def to_vcf(internal_id: str) -> str:
 
 
 def to_display(internal_id: str) -> str:
-    """對外顯示的 ID：與內部 ID 相同（轉錄方向）。"""
-    return internal_id
+    """對外顯示的 ID：基因組正股（與 VCF / ClinVar 相同）。"""
+    return to_vcf(internal_id)
 
 
 def normalize(text: str) -> Dict[str, object]:

@@ -113,7 +113,7 @@ class ImageGenerator:
         d = variant_ids.add_display_fields(variant_info)
         return (
             f'TTN Variant Location: {d["display_id"]}\n'
-            f'chr{variant_info["chrom"]}:{int(variant_info["pos"]):,} {variant_info["ref"]}>{variant_info["alt"]} (TTN coding strand)'
+            f'chr{variant_info["chrom"]}:{int(variant_info["pos"]):,} {d["plus_ref"]}>{d["plus_alt"]} (GRCh38 + strand)'
             + (f'  ·  {d["hgvs_c_display"]}' if d.get("hgvs_c_display") else '')
         )
 

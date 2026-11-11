@@ -236,10 +236,10 @@ def parse_report(path: Path) -> Optional[Dict]:
     if len(parts) != 4 or not parts[1].isdigit():
         logger.warning("skipping %s (unexpected variant id %r)", path.name, internal_id)
         return None
-    # outputs/ 檔名是內部（TTN 轉錄方向）ID，網站也照樣顯示；vcf_id 是基因組正股寫法，只用來搜尋與擋下錯誤輸入
+    # outputs/ 檔名是內部（TTN 轉錄方向）ID；網站上一律顯示基因組正股（VCF / ClinVar 慣例）
     chrom, pos, tx_ref, tx_alt = parts
     variant_id = variant_ids.to_display(internal_id)
-    ref, alt = tx_ref, tx_alt
+    ref, alt = variant_ids.complement(tx_ref), variant_ids.complement(tx_alt)
 
     evo2: Dict = {}
     box = RE_PREDICTION_BOX.search(source)
@@ -379,15 +379,21 @@ def make_nav(meta: Dict, prev: Optional[Dict], nxt: Optional[Dict]) -> str:
 
 # 「Analyze variants」的批次上傳範本。網頁只從檔案中抓出 2-pos-ref-alt，其他欄位與文字都忽略，
 # 所以說明欄裡不能出現變異 ID 樣式的字串
-VARIANT_TEMPLATE_CSV = """variant,note
-2-178527079-C-T,"Example (c.107909C>T). One variant per row: chr2 position (GRCh38) + TTN coding-strand ref and alt, the same bases as c. HGVS."
-2-178612477-T-A,"Example (c.50048T>A). Replace these rows with your own variants; only the variant column is read."
+VARIANT_TEMPLATE_CSV = """variant,format,note
+2-178525997-T-C,"chr-position-ref-alt on the GRCh38 genomic plus strand (same as VCF / ClinVar)","Every row is the same variant (ClinVar 332662) in a different accepted format. Replace the rows with your own variants, one per row; only the variant column is read."
+chr2:178525997:T:C,"VCF-style coordinates; the separators - : _ all work",
+NC_000002.12:g.178525997T>C,"HGVS g. on the genomic plus strand (GRCh37 g. positions are converted)",
+NM_001267550.2:c.*1015A>G,"HGVS c. on the TTN meta-transcript (coding-strand bases); the ClinVar form NM_001267550.2(TTN):c.*1015A>G also works",
+NM_133378.4:c.*1015A>G,"HGVS c. on another TTN RefSeq transcript (here N2A)",
+c.*1015A>G,"HGVS c. without a transcript (NM_001267550.2 numbering is tried first)",
+rs72629798,"dbSNP rsID (needs internet access; every single-nucleotide allele of the rsID is analyzed)",
 """
+# 不接受：轉錄方向的 chr-pos-ref-alt（例如 2-178525997-A-G）、p. 寫法、indel 等非單鹼基變異
 
 
 def report_filename(meta: Dict) -> str:
-    # 檔名用 TTN 轉錄方向 ID（鹼基與 data/gene.fna、c. 寫法同一股），與送出分析時的輸入一致
-    return f"{meta['internal_id']}__{meta['model']}.html"
+    # 檔名用基因組正股 ID（VCF / ClinVar 慣例），與網站顯示、送出分析時的輸入一致
+    return f"{meta['variant_id']}__{meta['model']}.html"
 
 
 # ── static assets ────────────────────────────────────────────────────────────
@@ -712,7 +718,7 @@ SITE_JS = r"""(function () {
   mergeReports(window.__TTN_LOCAL_REPORTS__ || []);
 
   function prepare(r) {
-    var bits = [r.variant_id, r.vcf_id, r.hgvs_c, r.model, r.ref + '>' + r.alt, String(r.pos), r.clinvar_id];
+    var bits = [r.variant_id, r.internal_id, r.hgvs_c, r.model, r.ref + '>' + r.alt, String(r.pos), r.clinvar_id];
     bits = bits.concat(r.diseases || []);
     if (r.inference) bits.push(r.inference.disease, r.inference.tissue, r.inference.band, r.inference.differential);
     if (r.band) bits.push(r.band);
@@ -1120,10 +1126,17 @@ SITE_JS = r"""(function () {
   // 給 assets/launcher.js 用：合併新報告後重畫表格
   window.TTN = {
     addReports: function (records) { mergeReports(records); render(); },
-    // 轉錄方向或基因組正股寫法都找得到（送出分析時由 preview 擋下基因組正股寫法）
+    // 正股或轉錄方向寫法都找得到（送出分析時由 preview 擋下轉錄方向寫法）
     find: function (id) {
       for (var i = 0; i < DATA.length; i++) {
         if (DATA[i].variant_id === id || DATA[i].internal_id === id || DATA[i].vcf_id === id) return DATA[i];
+      }
+      return null;
+    },
+    // meta-transcript（NM_001267550.2）的 c. 寫法，例如 c.107909C>T
+    findHgvs: function (c) {
+      for (var i = 0; i < DATA.length; i++) {
+        if (DATA[i].hgvs_c && DATA[i].hgvs_c.toUpperCase() === c.toUpperCase()) return DATA[i];
       }
       return null;
     }
@@ -1144,7 +1157,9 @@ LAUNCHER_JS = r"""(function () {
   if (!panel) return;
   if (location.protocol === 'file:') { offline.hidden = false; return; }
 
-  var VARIANT_RE = /(?:chr)?2-\d+-[ACGT]-[ACGT]/gi;
+  // 2-pos-ref-alt（分隔符號 - : _ 皆可）在網頁直接比對；HGVS c./g./p. 與 rsID 送到伺服器換算
+  var ID_FIND = /(?:chr)?2[-:_]\d+[-:_][ACGT][-:_>][ACGT](?![A-Za-z])/i;
+  var NOTATION_RE = /^(?:rs\d+|(?:[A-Z]{2}_\d+(?:\.\d+)?(?:\([^)]*\))?:)?[cgnp]\.\S+)$/i;
   var $ = function (id) { return document.getElementById(id); };
   var FIELDS = { host: 'an-host', user: 'an-user', port: 'an-port', key_path: 'an-key', repo: 'an-repo', python: 'an-python' };
   var known = {};      // job_id -> 是否已合併（用來偵測「剛完成」）
@@ -1240,38 +1255,87 @@ LAUNCHER_JS = r"""(function () {
   });
 
   // ── 輸入變異 ──
+  function normId(v) { return v.replace(/^chr/i, '').toUpperCase().split(/[-:_>]/).join('-'); }
+  // CSV / TSV 的一列（支援雙引號）
+  function splitRow(line) {
+    var sep = line.indexOf('\t') >= 0 ? '\t' : ',', out = [], cur = '', q = false;
+    for (var i = 0; i < line.length; i++) {
+      var ch = line.charAt(i);
+      if (ch === '"') { if (q && line.charAt(i + 1) === '"') { cur += '"'; i++; } else q = !q; }
+      else if (ch === sep && !q) { out.push(cur); cur = ''; }
+      else cur += ch;
+    }
+    out.push(cur);
+    return out.map(function (f) { return f.trim(); });
+  }
+  // 一行一個變異；檔案有 variant（或 input）欄名就讀那一欄，否則讀第一欄。
+  // 回傳 { variants, bad }：bad 是看不懂的行
   function parseVariants(text) {
-    var seen = {}, out = [];
-    (text.match(VARIANT_RE) || []).forEach(function (v) {
-      v = v.replace(/^chr/i, '').toUpperCase();
-      if (!seen[v]) { seen[v] = true; out.push(v); }
+    var lines = String(text).split(/\r?\n/), col = 0;
+    var head = splitRow(lines[0] || '').map(function (f) { return f.toLowerCase(); });
+    var hi = head.indexOf('variant') >= 0 ? head.indexOf('variant') : head.indexOf('input');
+    if (hi >= 0) { col = hi; lines = lines.slice(1); }
+    var seen = {}, out = [], bad = [];
+    lines.forEach(function (line) {
+      if (!line.trim() || /^\s*#/.test(line)) return;
+      var field = splitRow(line)[col] || '', v = null, m;
+      if ((m = field.match(ID_FIND))) v = normId(m[0]);
+      else {
+        var tok = field.split(/\s+/)[0];  // ClinVar 標題「NM_…(TTN):c.…C>T (p.…)」只取第一段
+        if (NOTATION_RE.test(tok)) v = tok;
+        else if ((m = line.match(ID_FIND))) v = normId(m[0]);  // ID 在其他欄位的舊檔案
+        else bad.push(field || line.trim());
+      }
+      if (v && !seen[v]) { seen[v] = true; out.push(v); }
     });
-    return out;
+    return { variants: out, bad: bad };
+  }
+  // 網站裡已有的變異：ID 直接找；meta-transcript 的 c. 寫法用報告的 hgvs_c 找
+  function findExisting(v) {
+    if (!window.TTN) return null;
+    if (ID_FIND.test(v)) return window.TTN.find(v);
+    var m = v.match(/^(?:NM_001267550\.2(?:\([^)]*\))?:)?(c\.\S+)$/i);
+    return m ? window.TTN.findHgvs(m[1]) : null;
   }
 
   // 已在 site 裡的變異預設只給連結；勾選「Re-run」時也一併送出重新分析
   function preview() {
-    var vs = parseVariants($('an-variants').value);
+    var parsed = parseVariants($('an-variants').value), vs = parsed.variants;
     var rerun = $('an-rerun').checked;
-    var have = [], todo = [], reverse = [], fresh = 0;
+    var have = [], todo = [], reverse = [], prot = [], fresh = 0, convert = 0;
     vs.forEach(function (v) {
-      var r = window.TTN && window.TTN.find(v);
-      // 只接受 TTN 轉錄方向（與 c. 寫法同一股）；對上的是基因組 + 股 ID 就不送出（不在網站裡的由 Spark 端用參考序列判斷）
-      if (r && r.variant_id !== v && r.internal_id !== v) {
-        reverse.push(esc(v) + ' is the genomic (+ strand) form of ' + esc(r.variant_id)); return;
+      // p. 只定到胺基酸，決定不了核苷酸變化
+      if (/^(?:[A-Z]{2}_\d+(?:\.\d+)?(?:\([^)]*\))?:)?p\./i.test(v)) { prot.push(esc(v)); return; }
+      var isId = ID_FIND.test(v), r = findExisting(v);
+      // 只接受基因組正股；對上的是轉錄方向（c. 寫法的鹼基）ID 就不送出（不在網站裡的由 Spark 端用參考序列判斷）
+      if (r && isId && r.variant_id !== v) {
+        reverse.push(esc(v) + ' is the TTN coding-strand (c.) form of ' + esc(r.variant_id)); return;
       }
       if (r) have.push('<a href="reports/' + esc(r.file) + '">' + esc(v) + '</a>');
-      if (!r) fresh++;
+      if (!r) { fresh++; if (!isId) convert++; }
       if (!r || rerun) todo.push(v);
     });
     var parts = [];
-    if (fresh) parts.push(fresh + ' new variant(s) will be analyzed');
+    if (fresh) {
+      parts.push(convert
+        ? fresh + ' new input(s) will be analyzed (' + convert + ' in HGVS / rsID notation are converted to genomic IDs ' +
+          'on the server; the same variant written in several forms is analyzed once)'
+        : fresh + ' new variant(s) will be analyzed');
+    }
     if (have.length) {
       parts.push((rerun ? have.length + ' already in this site will be re-run: '
                         : 'already in this site (tick “Re-run” to analyze again): ') + have.join(', '));
     }
     if (reverse.length) {
-      parts.push('<span class="err">not accepted (enter TTN coding-strand bases, as in c. HGVS): ' + reverse.join('; ') + '</span>');
+      parts.push('<span class="err">not accepted (enter GRCh38 plus-strand IDs, as in VCF / ClinVar): ' + reverse.join('; ') + '</span>');
+    }
+    if (prot.length) {
+      parts.push('<span class="err">not accepted (protein p. notation cannot fix the nucleotide change; use c. or g.): ' +
+                 prot.join('; ') + '</span>');
+    }
+    if (parsed.bad.length) {
+      parts.push('<span class="err">not recognized: ' + parsed.bad.map(esc).join('; ') +
+                 ' (see “Download template” for the accepted formats)</span>');
     }
     $('an-preview').innerHTML = parts.join(' · ');
     $('an-submit').disabled = !todo.length;
@@ -1287,9 +1351,11 @@ LAUNCHER_JS = r"""(function () {
     reader.onload = function () {
       var found = parseVariants(String(reader.result));
       var box = $('an-variants');
-      box.value = (box.value.trim() ? box.value.trim() + '\n' : '') + found.join('\n');
+      box.value = (box.value.trim() ? box.value.trim() + '\n' : '') + found.variants.join('\n');
       preview();
-      msg('an-submit-msg', found.length + ' variant(s) read from ' + file.name, found.length ? 'ok' : 'err');
+      msg('an-submit-msg', found.variants.length + ' variant(s) read from ' + file.name +
+          (found.bad.length ? '; ' + found.bad.length + ' line(s) not recognized: ' + found.bad.slice(0, 5).join('; ') : ''),
+          found.variants.length && !found.bad.length ? 'ok' : 'err');
     };
     reader.readAsText(file);
     e.target.value = '';
@@ -1307,7 +1373,10 @@ LAUNCHER_JS = r"""(function () {
       var rejected = ((res.ok && res.job ? res.job.rejected : res.rejected) || [])
         .map(function (r) { return r.variant + ' (' + r.reason + ')'; });
       if (res.ok) {
+        // HGVS / rsID 換算成哪些 ID，讓使用者確認
+        var conv = (res.job.resolved || []).map(function (x) { return x.input + ' → ' + x.variants.join(', '); });
         msg('an-submit-msg', 'Queued ' + res.job.variants.length + ' variant(s)' + (rerun ? ' (re-run)' : '') + '.' +
+          (conv.length ? ' Converted: ' + conv.join('; ') + '.' : '') +
           (rejected.length ? ' Skipped: ' + rejected.join('; ') : ''), rejected.length ? 'err' : 'ok');
         $('an-variants').value = '';
         preview();
@@ -1504,12 +1573,12 @@ INDEX_HTML = """<!DOCTYPE html>
                 </div>
             </div>
         </details>
-        <textarea id="an-variants" placeholder="One variant per line, GRCh38 position with the TTN coding-strand bases (same as c. HGVS), e.g.&#10;2-178527079-C-T  (c.107909C&gt;T)&#10;2-178527098-C-T&#10;(genomic + strand alleles as in VCF / ClinVar are not accepted)"></textarea>
+        <textarea id="an-variants" placeholder="One variant per line, e.g. ClinVar 332662 as any of&#10;2-178525997-T-C  (GRCh38 + strand, as in VCF / ClinVar)&#10;NC_000002.12:g.178525997T&gt;C · NM_001267550.2:c.*1015A&gt;G · rs72629798&#10;Not accepted: coding-strand IDs (2-178525997-A-G) and p. notation. See “Download template”."></textarea>
         <div class="an-preview" id="an-preview"></div>
         <div class="an-actions">
             <label class="file">Load CSV / text file…<input type="file" id="an-file" accept=".csv,.txt,.tsv"></label>
             <a class="file" href="assets/variant-template.csv" download="TTN-variant-template.csv"
-               title="Example file: one variant per row in the “variant” column; other columns are ignored">Download template</a>
+               title="Example file with every accepted format: one variant per row in the “variant” column; other columns are ignored">Download template</a>
             <label class="an-check" title="Variants that already have a report are normally just linked. Tick this to run the full pipeline on them again; the new report replaces the old one in this site.">
                 <input type="checkbox" id="an-rerun"> Re-run variants already in this site</label>
             <button type="button" id="an-submit">Run on Spark</button>

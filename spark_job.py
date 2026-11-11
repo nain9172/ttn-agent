@@ -53,6 +53,9 @@ JOBS_DIR = config.OUTPUT_DIR / "site_jobs"
 SITE_DIR = Path(os.environ["TTN_SITE_DIR"]) if os.environ.get("TTN_SITE_DIR") else None
 LOCK_PATH = JOBS_DIR / "worker.lock"
 VARIANT_RE = re.compile(r"^(?:chr)?2-(\d+)-([ACGT])-([ACGT])$", re.IGNORECASE)
+RSID_RE = re.compile(r"^rs\d+$", re.IGNORECASE)
+NOTATION_HELP = ("use 2-<position>-<ref>-<alt> on the GRCh38 plus strand, HGVS c. or g. notation, "
+                 "or a dbSNP rsID")
 JOB_ID_RE = re.compile(r"^\d{8}-\d{6}-[0-9a-f]{6}$")
 MAX_VARIANTS_PER_JOB = 200
 # 開始前要空出多少記憶體：Gemma 4 由 vLLM 一次預留「總量 × LLM_GPU_MEMORY_UTILIZATION」，
@@ -83,9 +86,9 @@ def load_sequence() -> str:
 def validate(raw: str, seq: str) -> tuple[Optional[str], Optional[str]]:
     """回傳 (內部 variant_id, 錯誤原因)。目前只支援 TTN 上的單鹼基變異。
 
-    輸入必須是 TTN 轉錄方向（與 c. 寫法同一股，例如 c.107909C>T → 2-178527079-C-T）；
-    基因組 + 股（VCF / ClinVar）寫法會被拒絕，並告知對應的轉錄方向寫法。
-    回傳的是內部（轉錄方向）ID，outputs/ 的報告檔名與網站顯示都用它。
+    輸入必須是 GRCh38 基因組正股（VCF / ClinVar 慣例，例如 ClinVar 332662 → 2-178525997-T-C）；
+    TTN 轉錄方向（c. 寫法的鹼基）會被拒絕，並告知對應的正股寫法。
+    回傳的是內部（轉錄方向）ID，因為 outputs/ 的報告檔名用它；對外顯示時再轉回正股（summarize）。
     """
     text = raw.strip()
     m = VARIANT_RE.match(text)
@@ -99,13 +102,68 @@ def validate(raw: str, seq: str) -> tuple[Optional[str], Optional[str]]:
                       f"(chr2:{config.TTN_SEQUENCE_END:,}-{config.TTN_SEQUENCE_START:,})")
     # sequence.fasta 是負股（轉錄方向）
     tx = seq[config.TTN_SEQUENCE_START - pos]
-    if ref == tx:  # 轉錄方向寫法（與 c. 寫法同一股）
-        return f"2-{pos}-{ref}-{alt}", None
-    if ref == variant_ids.complement(tx):  # 基因組 + 股寫法：不接受，避免同一顆變異被當成兩種寫法
-        tx_id = f"2-{pos}-{tx}-{variant_ids.complement(alt)}"
-        return None, (f"this is the genomic (+ strand) form of {tx_id}; "
-                      f"enter the TTN coding-strand bases (same as c. HGVS), e.g. {tx_id}")
-    return None, f"reference base at chr2:{pos:,} is {tx} (TTN coding strand), not {ref}"
+    plus = variant_ids.complement(tx)
+    if ref == plus:  # 基因組正股寫法（VCF / ClinVar）
+        return f"2-{pos}-{tx}-{variant_ids.complement(alt)}", None
+    if ref == tx:  # 轉錄方向（c. 寫法的鹼基）：不接受，避免同一顆變異被當成兩種寫法
+        plus_id = f"2-{pos}-{plus}-{variant_ids.complement(alt)}"
+        return None, (f"this is the TTN coding-strand (c. HGVS) form of {plus_id}; "
+                      f"enter the GRCh38 plus-strand form as in VCF / ClinVar, e.g. {plus_id}")
+    return None, f"reference base at chr2:{pos:,} is {plus} (GRCh38 + strand), not {ref}"
+
+
+def resolve_notation(raw: str, seq: str, resolver) -> tuple[List[str], Optional[str]]:
+    """2-pos-ref-alt 以外的寫法 → (內部 variant_id 清單, 錯誤原因)。
+
+    - chr2:pos:ref:alt 等分隔符號不同的座標寫法：同 validate，只接受正股
+    - HGVS c.（任一 TTN RefSeq 轉錄本；ClinVar 標題寫法也可）與 g.（正股，GRCh37 座標會換算）
+    - dbSNP rsID：查 dbSNP（需要連網），一個 rsID 的每個單鹼基 alt allele 都收
+    p. 只能定到胺基酸、不能決定核苷酸變化，不接受。
+    """
+    from utils.hgvs_resolver import HgvsResolveError, fetch_rsid_alleles, parse_hgvs
+
+    text = raw.strip()
+    m = variant_ids.ID_RE.match(text)
+    if m:
+        vid, err = validate(f"{m.group(1)}-{m.group(2)}-{m.group(3)}-{m.group(4)}", seq)
+        return ([vid] if vid else []), err
+    if RSID_RE.match(text):
+        alleles = fetch_rsid_alleles(text)
+        if alleles is None:
+            return [], f"{text}: dbSNP lookup failed (needs internet access); enter the variant itself instead"
+        ids = [vid for pos, r, a in alleles if len(r) == 1 and len(a) == 1
+               for vid in [validate(f"2-{pos}-{r}-{a}", seq)[0]] if vid]
+        if not ids:
+            return [], f"{text}: not found in dbSNP, or not a single-nucleotide variant inside TTN on GRCh38"
+        return list(dict.fromkeys(ids)), None
+    try:
+        parsed = parse_hgvs(text)
+    except HgvsResolveError:
+        return [], f"cannot read this notation; {NOTATION_HELP}"
+    try:
+        res = resolver.resolve(text)
+    except HgvsResolveError:
+        # 寫法看得懂，但對不上 TTN（例如 c. 的參考鹼基與任何 TTN 轉錄本都不符）
+        return [], "this position and reference base do not match any TTN transcript; check the transcript, position and bases"
+    if parsed.kind == "p":
+        return [], ("protein (p.) notation cannot be analyzed: one amino-acid change can come from different "
+                    "nucleotide changes; use c. or g. notation")
+    if not (res.ref and res.alt and len(res.ref) == 1 and len(res.alt) == 1):
+        return [], "only single-nucleotide variants are supported"
+    if not (config.TTN_SEQUENCE_END <= res.pos <= config.TTN_SEQUENCE_START):
+        return [], "position is outside TTN"
+    tx = seq[config.TTN_SEQUENCE_START - res.pos]
+    plus = variant_ids.complement(tx)
+    if parsed.kind == "g" and (parsed.ref or "").upper() != plus:
+        # g. 是基因組正股；寫成轉錄方向鹼基的同樣擋下
+        good = f"NC_000002.12:g.{res.pos}{plus}>{variant_ids.complement(res.alt)}"
+        if (parsed.ref or "").upper() == tx:
+            return [], f"g. notation is on the genomic plus strand; this is the coding-strand form of {good}"
+        return [], f"reference base at chr2:{res.pos:,} is {plus} (GRCh38 + strand), not {parsed.ref}"
+    if res.ref != tx:
+        return [], f"reference base does not match TTN at chr2:{res.pos:,}"
+    vid, err = validate(f"2-{res.pos}-{plus}-{variant_ids.complement(res.alt)}", seq)
+    return ([vid] if vid else []), err
 
 
 def read_job(job_dir: Path) -> Dict:
@@ -134,7 +192,7 @@ def summarize(job_dir: Path) -> Dict:
     if job.get("kind") == "setup":
         return job
     job["completed"] = completed_variants(job_dir)
-    # job.json 存內部（轉錄方向）ID，網頁也照樣顯示
+    # job.json 存內部（轉錄方向）ID；回給網頁的一律是正股寫法
     for key in ("variants", "completed", "failed_variants"):
         if job.get(key):
             job[key] = [variant_ids.to_display(v) for v in job[key]]
@@ -204,13 +262,26 @@ def submit_job(raw: List, rerun: bool = False, client: str = "") -> Dict:
         return {"ok": False, "error": "the TTN reference sequence is not installed yet; finish the data setup first"}
 
     seq = load_sequence()
-    accepted, rejected = [], []
+    accepted, rejected, resolved = [], [], []
+    resolver = None
     for item in raw:
-        vid, err = validate(str(item), seq)
+        text = str(item).strip()
+        if VARIANT_RE.match(text):
+            vid, err = validate(text, seq)
+            vids = [vid] if vid else []
+        else:
+            if resolver is None:
+                from utils.hgvs_resolver import HgvsResolver
+                resolver = HgvsResolver(model_path=config.TTN_TRANSCRIPT_MODEL_PATH,
+                                        fasta_path=config.REFERENCE_GENOME_PATH)
+            vids, err = resolve_notation(text, seq, resolver)
+            if vids:
+                resolved.append({"input": text, "variants": [variant_ids.to_display(v) for v in vids]})
         if err:
-            rejected.append({"variant": str(item), "reason": err})
-        elif vid not in accepted:
-            accepted.append(vid)
+            rejected.append({"variant": text, "reason": err})
+        accepted.extend(v for v in vids if v not in accepted)
+    if len(accepted) > MAX_VARIANTS_PER_JOB:
+        return {"ok": False, "error": f"at most {MAX_VARIANTS_PER_JOB} variants per job"}
     if not accepted:
         return {"ok": False, "error": "no valid variants", "rejected": rejected}
 
@@ -221,6 +292,8 @@ def submit_job(raw: List, rerun: bool = False, client: str = "") -> Dict:
         writer.writerows([v] for v in accepted)
     write_job(job_dir, {
         "job_id": job_dir.name, "kind": "variants", "state": "queued", "variants": accepted, "rejected": rejected,
+        # HGVS / rsID 等寫法換算成哪些正股 ID（網頁送出後顯示給使用者確認）
+        "resolved": resolved,
         # rerun：即使 outputs/ 已有報告也重跑整個 pipeline（使用者在網頁勾選重新分析）
         "rerun": bool(rerun),
         "client": str(client or ""), "created": now(),

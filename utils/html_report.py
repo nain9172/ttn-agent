@@ -492,7 +492,7 @@ class HTMLReportGenerator:
 
     @staticmethod
     def _display(variant_info: Dict) -> Dict:
-        """對外顯示用的欄位：ID 用轉錄方向（與 c. 寫法同一股），另附基因組正股的 vcf_id 供對照。"""
+        """對外顯示用的欄位：ID 一律是基因組正股（VCF / ClinVar 慣例），內部 variant_id 是轉錄方向。"""
         from utils import variant_ids
 
         return variant_ids.add_display_fields(variant_info)
@@ -531,7 +531,7 @@ class HTMLReportGenerator:
         return f"""<section class="section"><h2>Variant Summary</h2><div class="info-grid">
             <div class="info-card"><div class="label">Chromosome</div><div class="value">{variant_info['chrom']}</div></div>
             <div class="info-card"><div class="label">Position (GRCh38)</div><div class="value">{variant_info['pos']:,}</div></div>
-            <div class="info-card"><div class="label">Ref/Alt (TTN coding strand)</div><div class="value">{d['ref']}/{d['alt']}</div></div>
+            <div class="info-card"><div class="label">Ref/Alt (GRCh38 + strand)</div><div class="value">{d['plus_ref']}/{d['plus_alt']}</div></div>
             <div class="info-card"><div class="label">{coding_label}</div><div class="value">{coding}</div></div>
             <div class="info-card"><div class="label">Evo2 prediction</div><div class="value">{pred}</div></div>
         </div></section>"""

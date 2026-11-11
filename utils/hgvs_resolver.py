@@ -130,6 +130,9 @@ def _norm_text(text: str) -> str:
     s = s.replace("→", ">").replace("＞", ">").replace("∗", "*")
     s = re.sub(r"\(Expired\)", "", s, flags=re.IGNORECASE)
     s = re.sub(r"\s+", "", s)
+    # ClinVar 標題寫法：NM_001267550.2(TTN):c.107909C>T(p.Thr35970Ile) → NM_001267550.2:c.107909C>T
+    s = re.sub(r"^([A-Z]{2}_\d+(?:\.\d+)?)\([A-Za-z0-9-]+\)(?=:)", r"\1", s)
+    s = re.sub(r"(?<=.)\(p\.[^)]*\)$", "", s)
     # 文獻常見的千分位逗號：c.104,515C>T → c.104515C>T
     s = re.sub(r"(?<=\d),(?=\d{3}(?!\d))", "", s)
     return s
@@ -950,28 +953,9 @@ class HgvsResolver:
 
     @staticmethod
     def _fetch_rsid(rsid: str) -> Optional[List[Any]]:
-        """回傳 (pos, plus_ref, plus_alt)；查不到回 None。"""
-        import urllib.request
-
-        url = f"https://api.ncbi.nlm.nih.gov/variation/v0/refsnp/{rsid[2:]}"
-        try:
-            with urllib.request.urlopen(url, timeout=60) as resp:
-                data = json.loads(resp.read())
-        except Exception as e:  # noqa: BLE001
-            logger.debug(f"dbSNP 查詢失敗 {rsid}: {e}")
-            return None
-        snap = data.get("primary_snapshot_data") or {}
-        for placement in snap.get("placements_with_allele", []):
-            seq_id = str(placement.get("seq_id") or "")
-            if not seq_id.startswith("NC_000002."):
-                continue
-            for allele in placement.get("alleles", []):
-                spdi = allele.get("allele", {}).get("spdi") or {}
-                deleted, inserted = spdi.get("deleted_sequence"), spdi.get("inserted_sequence")
-                if deleted and inserted and deleted != inserted:
-                    # SPDI position 為 0-based → +1 轉成 1-based genomic
-                    return [int(spdi["position"]) + 1, deleted, inserted]
-        return None
+        """回傳第一個 alt allele 的 (pos, plus_ref, plus_alt)；查不到回 None。"""
+        alleles = fetch_rsid_alleles(rsid)
+        return list(alleles[0]) if alleles else None
 
     # -- 類型（無法轉譯時的規則） -------------------------------------------
 
@@ -1007,6 +991,42 @@ class HgvsResolver:
 
 
 # ── HGMD 索引（可選的加速 / 校準來源）───────────────────────────────────────
+
+
+def fetch_rsid_alleles(rsid: str) -> Optional[List[Tuple[int, str, str]]]:
+    """dbSNP（NCBI Variation Services）在 GRCh38 chr2（NC_000002.12）上的所有 alt allele。
+
+    回傳 [(pos, plus_ref, plus_alt), ...]，pos 為 1-based、鹼基為正股；一個 rsID 可能有多個 alt。
+    查詢失敗（例如沒有網路）回 None，查得到但不在 GRCh38 chr2 上回 []。
+    """
+    import urllib.error
+    import urllib.request
+
+    url = f"https://api.ncbi.nlm.nih.gov/variation/v0/refsnp/{str(rsid).lower().removeprefix('rs')}"
+    try:
+        with urllib.request.urlopen(url, timeout=60) as resp:
+            data = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        if e.code in (404, 410):  # dbSNP 沒有這個（或已撤銷的）rsID
+            return []
+        logger.debug(f"dbSNP 查詢失敗 {rsid}: {e}")
+        return None
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"dbSNP 查詢失敗 {rsid}: {e}")
+        return None
+    out: List[Tuple[int, str, str]] = []
+    snap = data.get("primary_snapshot_data") or {}
+    for placement in snap.get("placements_with_allele", []):
+        # 只用 GRCh38；NC_000002.11 是 GRCh37，座標不同
+        if str(placement.get("seq_id") or "") != "NC_000002.12":
+            continue
+        for allele in placement.get("alleles", []):
+            spdi = allele.get("allele", {}).get("spdi") or {}
+            deleted, inserted = spdi.get("deleted_sequence"), spdi.get("inserted_sequence")
+            if deleted and inserted and deleted != inserted:
+                # SPDI position 為 0-based → +1 轉成 1-based genomic
+                out.append((int(spdi["position"]) + 1, deleted, inserted))
+    return out
 
 
 def build_hgmd_hgvs_index(kb_rows: List[Dict[str, Any]]) -> Dict[str, Tuple[int, str, str]]:
